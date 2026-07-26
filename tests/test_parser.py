@@ -239,7 +239,7 @@ def test_agn_trailing_content_with_no_notes_label_is_still_captured(rules):
     the last recognized field (here, "Occu:")."""
     job = extract_job(load("agn_no_notes_label_trailing_content.txt"), rules)
     assert job.notes.value == "K?"
-    assert "no Notes: label found" in job.notes.reason
+    assert "captured verbatim after the last recognized field" in job.notes.reason
 
 
 def test_lucky_trailing_content_with_no_notes_label_is_still_captured(rules):
@@ -252,4 +252,25 @@ def test_agn_notes_label_still_takes_priority_when_present(rules):
     otherwise change behavior) when a real "Notes:" label exists."""
     job = extract_job(load("agn_clean.txt"), rules)
     assert job.notes.value == "Honda Civic 2020"
-    assert "parsed verbatim from the last Notes:" in job.notes.reason
+    assert "captured verbatim after the last recognized field" in job.notes.reason
+
+
+def test_two_distinct_notes_sections_both_preserved(rules):
+    """Confirmed 2026-07-27 from a real Lucky job: unlike the earlier
+    empty-label-then-content pattern, here BOTH "Notes:" occurrences carry
+    real, different content ("2018 ford f250" before the first, "npg, pls
+    call" after the second). Collapsing to only the last label would have
+    dropped the vehicle info -- it must be preserved."""
+    job = extract_job(load("lucky_two_distinct_notes_sections.txt"), rules)
+    assert "2018 ford f250" in job.notes.value
+    assert "npg, pls call" in job.notes.value
+
+
+def test_unrecognized_field_before_empty_notes_label_is_preserved(rules):
+    """Confirmed 2026-07-27 from a real AGN job: an "Appt:" line (a
+    scheduled appointment time -- operationally critical) appeared between
+    "Occu:" and an empty "Notes:" label. Previously silently dropped
+    entirely: not in any field, not anywhere. Must now be preserved."""
+    job = extract_job(load("agn_appt_field_empty_notes.txt"), rules)
+    assert job.notes.value is not None
+    assert "Appt: 07/26 at 08:00 AM UTC" in job.notes.value

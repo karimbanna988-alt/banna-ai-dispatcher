@@ -293,34 +293,42 @@ def _last_recognized_field_end(raw_text: str) -> Optional[int]:
 
 def extract_notes(raw_text: str, source: Source) -> FieldValue:
     if source in (Source.AGN, Source.LUCKY):
-        # Quo sometimes repeats an empty "Notes:" label before the one that
-        # actually carries content (confirmed 2026-07-27, a real Lucky job:
-        # "Notes:\n\nNotes:\nCX IS AT BEST BUY") -- use the LAST occurrence
-        # so the real content isn't preceded by a redundant empty label.
-        # (a single greedy/DOTALL "Notes:.*" pattern would consume to the
-        # end of the string on its first match, so finding all *label*
-        # positions first is necessary to locate the last one.)
-        label_positions = list(re.finditer(r"Notes:", raw_text))
-        if label_positions:
-            val = raw_text[label_positions[-1].end():].strip()
-            if not val:
-                return FieldValue(None, 0, "Notes: field present but empty")
-            return FieldValue(val, 85, "parsed verbatim from the last Notes: label in the message")
-
-        # No "Notes:" label at all -- confirmed 2026-07-27 by a real AGN job
-        # that ended in a bare "K?" with no label whatsoever. Without a
-        # fallback, that content was silently dropped: not in any field, not
-        # anywhere. Anchor on whichever recognized field (PDL/N/Ph/Addr/
-        # Desc/Occu) occurs last in the message and capture anything after
-        # it, so trailing content is never lost just because Quo omitted
-        # the "Notes:" label this time.
+        # Always anchor on the last recognized field (PDL/N/Ph/Addr/Desc/
+        # Occu) and capture everything after it -- covers messages with no
+        # "Notes:" label at all (confirmed 2026-07-27: a real AGN job ended
+        # in a bare "K?"), an unrecognized labeled field like "Appt:" with
+        # only an empty "Notes:" after it (confirmed 2026-07-27: a real
+        # appointment-time line was otherwise silently dropped), and normal
+        # "Notes:"-labeled content, all with one rule instead of branching
+        # on whether "Notes:" happens to be present.
         anchor = _last_recognized_field_end(raw_text)
         if anchor is None:
-            return FieldValue(None, 0, "no Notes: field or other recognized field found to anchor trailing notes")
-        tail = raw_text[anchor:].strip()
-        if not tail:
-            return FieldValue(None, 0, "no Notes: field found, and no trailing content after the last recognized field")
-        return FieldValue(tail, 70, "no Notes: label found -- captured trailing content after the last recognized field")
+            return FieldValue(None, 0, "no recognized field found to anchor trailing content")
+
+        tail = raw_text[anchor:]
+
+        # Quo sometimes repeats an empty "Notes:" label before the one that
+        # actually carries content (confirmed 2026-07-27: "Notes:\n\nNotes:
+        # \nCX IS AT BEST BUY"). Collapse up through the LAST "Notes:" label
+        # only when everything before it (aside from other "Notes:" labels)
+        # is blank. If there's real, unrecognized content before it instead
+        # -- e.g. an "Appt:" line, or two genuinely different notes each
+        # after their own "Notes:" label (confirmed 2026-07-27: "2018 ford
+        # f250" before one "Notes:", "npg, pls call" after a second) --
+        # keep everything rather than risk dropping it.
+        label_matches = list(re.finditer(r"Notes:", tail))
+        if label_matches:
+            before_last_label = re.sub(r"Notes:", "", tail[: label_matches[-1].start()]).strip()
+            if not before_last_label:
+                tail = tail[label_matches[-1].end():]
+
+        val = tail.strip()
+        if not val:
+            return FieldValue(None, 0, "no content found after the last recognized field")
+        return FieldValue(
+            val, 80,
+            "captured verbatim after the last recognized field (redundant empty Notes: label, if any, collapsed)",
+        )
 
     # Main Leads doesn't reliably separate the freeform vehicle/notes tail
     # from the structured fields with a blank line -- confirmed 2026-07-27
