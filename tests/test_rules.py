@@ -6,7 +6,7 @@ import pytest
 from dispatcher.companies import agn, lucky
 from dispatcher.models import ExtractedJob, ExtractionStatus, FieldValue, Source
 from dispatcher.parser import extract_job, load_vehicle_rules
-from dispatcher.rules import Verdict, decide
+from dispatcher.rules import Verdict, decide, force_handle_manually
 from dispatcher.rules.daily import parse_daily_rules
 from dispatcher.rules.service_areas import ServiceAreaRecord
 
@@ -183,3 +183,14 @@ def test_needs_review_when_confidence_below_threshold():
     decision = decide(synthetic, agn.PROFILE, [confirmed_area()], clean_daily_rules(now), now=now)
     assert decision.verdict == Verdict.NEEDS_REVIEW
     assert decision.confidence == 65
+
+
+def test_force_handle_manually_escalates_an_accept(vehicle_rules):
+    job = extract_job(load("agn_clean.txt"), vehicle_rules)
+    now = datetime(2026, 1, 1, 8, 0, 0)
+    decision = decide(job, agn.PROFILE, [confirmed_area()], clean_daily_rules(now), now=now)
+    assert decision.verdict == Verdict.ACCEPT
+
+    escalated = force_handle_manually(decision, "anomalous classification, review by hand")
+    assert escalated.verdict == Verdict.HANDLE_MANUALLY
+    assert escalated.reasons[0] == "anomalous classification, review by hand"

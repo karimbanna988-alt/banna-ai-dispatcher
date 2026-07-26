@@ -75,6 +75,22 @@ def test_agn_field_extraction(rules):
     assert job.status == ExtractionStatus.OK
 
 
+def test_agn_with_bare_n_label_extracts_name(rules):
+    """AGN doesn't always omit a name -- confirmed 2026-07-27 via a real
+    AGN job using a bare 'N:' label. Must not be missed just because
+    earlier samples never had one."""
+    job = extract_job(load("agn_with_name.txt"), rules)
+    assert job.source == Source.AGN
+    assert job.ticket_number.value == "FAKE5"
+    assert job.customer_name.value == "JOHN TESTMAN"
+    assert job.phone.value == "1-555-010-7000"
+    assert job.extension.value == "593"
+    assert job.city.value == "Faketown"
+    assert job.state.value == "VA"
+    assert job.service_type.value == "House Change/Fix Locks"
+    assert job.notes.value is not None and "IDENTIFY AS TEST BRAND VETERANS" in job.notes.value
+
+
 def test_lucky_field_extraction(rules):
     job = extract_job(load("lucky_clean.txt"), rules)
     assert job.ticket_number.value == "FAKE2"

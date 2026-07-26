@@ -45,6 +45,18 @@ class Decision:
     quo_reply_suggestion: Optional[str] = None
 
 
+def force_handle_manually(decision: Decision, reason: str) -> Decision:
+    """Escalate an already-computed Decision to HANDLE_MANUALLY, prepending
+    `reason`. For cross-cutting overrides decided outside decide()'s own
+    area/vehicle/daily-rule checks -- e.g. the orchestration layer forces
+    this when storage.classify_incoming() reports a closing arriving with
+    no prior dispatch for its ticket (an anomaly that must never be treated
+    as a normal accept/pass job)."""
+    decision.verdict = Verdict.HANDLE_MANUALLY
+    decision.reasons = [reason] + decision.reasons
+    return decision
+
+
 def _missing_and_conflicting(job: ExtractedJob):
     fields = job.all_fields()
     missing = [name for name in REQUIRED_FIELDS if fields[name].is_missing]

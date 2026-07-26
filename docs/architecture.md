@@ -37,11 +37,13 @@ see section 4 for the full list of those placeholders.
                         ticket/PDL in SQLite              │
                               │                           │
                               ▼                           ▼
-                     MessageType: DUPLICATE /       MessageType: NEW
-                     CORRECTION / UPDATE_REQUEST /
-                     STATUS / CLOSING / CANCELLATION /
-                     UNRECOGNIZED
-                              │                           │
+                     MessageType: DUPLICATE /       MessageType: NEW, or
+                     CORRECTION / UPDATE_REQUEST /   CLOSING_WITHOUT_DISPATCH
+                     STATUS / CLOSING / CANCELLATION /  if a closing-looking
+                     UNRECOGNIZED                    message has no prior
+                              │                      record for its ticket
+                              │                      (forces HANDLE_MANUALLY
+                              │                      via force_handle_manually)
                               └───────────┬───────────────┘
                                           ▼
                                    companies.get_company_profile(job.source)
@@ -134,6 +136,7 @@ Three side flows use the same core modules but enter the pipeline differently
 | `src/dispatcher/formatter.py` | Convert `ExtractedJob` into the Luxor Locksmith-branded technician message (V1 rule) | `ExtractedJob` | technician message (string) | **DONE** |
 | `src/dispatcher/updates.py` | Map a technician's confirmed status text to the standard short company reply | freeform tech status text | `StandardReply` | **DONE** |
 | `src/dispatcher/storage.py` | SQLite job records; classify incoming messages against existing records; append-only audit log | `ExtractedJob` + every stage's output + human actions | persisted rows | **DONE** |
+| `src/dispatcher/rules/__init__.py::force_handle_manually` | Escalate an already-computed `Decision` to `HANDLE_MANUALLY` for cross-cutting overrides decided outside `decide()`'s own checks | `Decision`, reason | mutated `Decision` | **DONE** |
 | `app.py` | Streamlit UI; orchestrates every module above; Approve/Edit/Reject/Handle Manually + Daily Rules/Status/Closing/Audit tabs | dispatcher input | approval screen + writes to storage | **DONE** |
 | `tests/test_*.py` | Regression coverage across all of the above | — | — | **DONE** (69 tests passing) |
 
@@ -226,7 +229,8 @@ class ClassifyResult:
 These are safe, editable, and clearly marked as TODO — none of them silently guess a business fact:
 
 - **`rules/service_areas.yaml`**: the 12 named areas are in the file, but every `dispatch_group`/`closing_group` is `null` ("unconfirmed"). This means **every job today, in every one of those areas, currently resolves to `HANDLE_MANUALLY`** until you fill in real group names — see the file's own TODO comments. Several city names (Arlington, Augusta, Columbia, Greenville, Chicago, Vancouver) are ambiguous across multiple US states, so `state` was left blank for those rather than guessed; only "Charlotte, NC" had an explicit state.
-- **AGN's closing format**: per your correction, it now uses the same `SHARED_CLOSING_TEMPLATE` as Lucky (only the header line differs), on the assumption that AGN's real format matches. This is still based on zero real AGN closing examples — see `src/dispatcher/companies/agn.py`'s comment. If a real example shows otherwise, give AGN its own `ClosingTemplate`.
+- **AGN's closing format**: **confirmed 2026-07-27** against a real AGN closing example (ticket UQ9DI, `$690 Cash`) — same repeat-fields + "Closed" + amount + payment-method shape as Lucky's, just a different payment method ("Cash" vs "CC") and no parts, both already handled generically by `ClosingInput`. No template change was needed; this validates the shared-template design. See `tests/test_closing.py::test_agn_closing_against_real_confirmed_shape`.
+- **AGN name field**: a related real bug was caught from that same example — AGN sometimes provides a customer name via a bare `N:` label, which the parser didn't look for at all (it had hardcoded "AGN/Lucky never have a name" from a single earlier sample). Fixed in `parser.py`: `NAME_RE` now matches `Name:` or `N:`, and name extraction is attempted for every source rather than skipped for non-Main-Leads.
 - **Luxor Locksmith technician message template**: implements your Version 1 rule exactly (strip source branding, preserve every field verbatim, clean spacing only). It has not been visually reviewed by you yet — treat the current field order/labels in `src/dispatcher/formatter.py` as a first draft you can adjust.
 - **`NEEDS_REVIEW_CONFIDENCE_THRESHOLD = 80`** in `src/dispatcher/rules/__init__.py`: an engineering placeholder distinguishing a clean `ACCEPT`/`PASS` from one that's technically decidable but worth a second look. Adjustable in one place; not based on a business rule you specified.
 - **Daily rules default shift length**: 12 hours (`DEFAULT_SHIFT_HOURS` in `src/dispatcher/rules/daily.py`), extendable via `DailyRules.extend()`. You didn't specify an exact shift length, so this is a placeholder.

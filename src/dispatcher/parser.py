@@ -33,7 +33,11 @@ _MAKES_PATTERN = "|".join(re.escape(m) for m in MAKES)
 # matches newlines, which would let an empty field silently swallow the
 # line break and bleed into the next labeled line.
 TICKET_RE = re.compile(r"^(?:Ticket|PDL):[ \t]*(?P<val>\S+)", re.MULTILINE)
-NAME_RE = re.compile(r"^Name:[ \t]*(?P<val>.*)$", re.MULTILINE)
+# AGN sometimes provides a customer name via a bare "N:" label (confirmed
+# 2026-07-27 from a real AGN job) even though earlier samples never had one
+# -- don't assume a source structurally lacks a name field just because one
+# past example omitted it.
+NAME_RE = re.compile(r"^(?:Name|N):[ \t]*(?P<val>.*)$", re.MULTILINE)
 PHONE_RE = re.compile(
     r"^(?:Phone|Ph):[ \t]*(?P<phone>[\d()+\-. ]*\d)?[ \t]*(?:\(Job Ext:[ \t]*(?P<ext>\d+)\))?[ \t]*$",
     re.MULTILINE,
@@ -274,11 +278,11 @@ def extract_job(raw_text: str, rules: Optional[dict] = None) -> ExtractedJob:
 
     source, source_confidence, source_reason = detect_source(raw_text)
     ticket = extract_ticket(raw_text)
-    name = (
-        extract_name(raw_text)
-        if source == Source.MAIN_LEADS
-        else FieldValue(None, 0, "source does not provide a customer name field")
-    )
+    # Attempt name extraction regardless of source -- AGN and Lucky don't
+    # always include one, but AGN has been seen to provide it via "N:"
+    # (2026-07-27), so never assume a source structurally lacks a field
+    # just because one past example omitted it.
+    name = extract_name(raw_text)
     phone, extension = extract_phone_and_extension(raw_text)
     addr = extract_address(raw_text)
     service_type = extract_service_type(raw_text)

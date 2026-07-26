@@ -76,6 +76,18 @@ def test_closing_message_is_classified_as_closing(conn, vehicle_rules):
     assert result2.message_type == MessageType.CLOSING
 
 
+def test_closing_with_no_prior_dispatch_is_anomalous_not_new(conn, vehicle_rules):
+    """A ticket is always dispatched before it can be closed -- a
+    closing-looking message with no prior record for its ticket must never
+    be treated as a normal new job."""
+    raw = load("agn_clean.txt") + "\nClosed\n$500 CC\n"
+    job = extract_job(raw, vehicle_rules)
+    result = storage.classify_incoming(conn, job)
+    assert result.message_type == MessageType.CLOSING_WITHOUT_DISPATCH
+    assert result.existing_job_id is None
+    assert "handle manually" in result.reason.lower()
+
+
 def test_cancellation_message_is_classified(conn, vehicle_rules):
     raw = load("agn_clean.txt")
     job = extract_job(raw, vehicle_rules)

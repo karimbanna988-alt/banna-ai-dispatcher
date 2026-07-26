@@ -21,7 +21,7 @@ from dispatcher.companies import get_company_profile
 from dispatcher.formatter import format_technician_message
 from dispatcher.models import ExtractionStatus
 from dispatcher.parser import extract_job, load_vehicle_rules
-from dispatcher.rules import decide
+from dispatcher.rules import Verdict, decide, force_handle_manually
 from dispatcher.rules.daily import parse_daily_rules
 from dispatcher.rules.service_areas import load_service_areas
 from dispatcher.storage import ClassifyResult, MessageType
@@ -80,6 +80,8 @@ with tab_process:
         classify_result = storage.classify_incoming(conn, job)
         profile = get_company_profile(job.source)
         decision = decide(job, profile, service_areas, st.session_state.daily_rules)
+        if classify_result.message_type == MessageType.CLOSING_WITHOUT_DISPATCH:
+            decision = force_handle_manually(decision, classify_result.reason)
         luxor_message = format_technician_message(job)
 
         st.session_state.current_job = job

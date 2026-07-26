@@ -38,6 +38,7 @@ class MessageType(str, Enum):
     STATUS = "STATUS"
     CLOSING = "CLOSING"
     CANCELLATION = "CANCELLATION"
+    CLOSING_WITHOUT_DISPATCH = "CLOSING_WITHOUT_DISPATCH"
     UNRECOGNIZED = "UNRECOGNIZED"
 
 
@@ -108,6 +109,10 @@ def _current_fields(job: ExtractedJob) -> dict:
     return {name: fv.value for name, fv in job.all_fields().items()}
 
 
+def _looks_like_closing(raw_text: str) -> bool:
+    return bool(re.search(r"\bclosed\b", raw_text.lower()) and re.search(r"\$\s*\d", raw_text))
+
+
 def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyResult:
     ticket = job.ticket_number.value
     if not ticket:
@@ -120,6 +125,16 @@ def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyRe
         "SELECT id, latest_fields_json FROM jobs WHERE ticket_number = ?", (ticket,)
     ).fetchone()
     if row is None:
+        # In real dispatching, every ticket is dispatched before it can be
+        # closed -- a closing-looking message with no prior record for this
+        # ticket is anomalous (e.g. out-of-order delivery, a typo'd ticket
+        # number) and must never be silently treated as a normal new job.
+        if _looks_like_closing(job.raw_text):
+            return ClassifyResult(
+                MessageType.CLOSING_WITHOUT_DISPATCH, None, [],
+                "message looks like a closing, but no prior dispatch exists for this ticket "
+                "-- handle manually, do not process as a normal new job",
+            )
         return ClassifyResult(MessageType.NEW, None, [], "no existing job found for this ticket/PDL")
 
     job_id, latest_fields_json = row
@@ -136,7 +151,7 @@ def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyRe
     if "cancel" in text_lower:
         return ClassifyResult(MessageType.CANCELLATION, job_id, [], "message mentions cancellation")
 
-    if re.search(r"\bclosed\b", text_lower) and re.search(r"\$\s*\d", job.raw_text):
+    if _looks_like_closing(job.raw_text):
         return ClassifyResult(MessageType.CLOSING, job_id, [], "message contains 'Closed' plus a dollar amount")
 
     if "update" in text_lower and "?" in job.raw_text:

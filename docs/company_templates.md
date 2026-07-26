@@ -39,11 +39,27 @@ Occu: Locksmith
 Notes:
 ```
 
+Sometimes AGN includes a customer name via a bare `N:` label (confirmed 2026-07-27 from a real job):
+
+```
+Ref: AGN Locksmith Services
+PDL: XXXXX
+N: <Customer Name>
+Ph: 1-555-010-3000 (Job Ext: 123)
+Addr: <Street>, <City>, <ST>, <ZIP>
+Desc: <Service Type> [<internal code>]
+Occu: Locksmith
+
+Notes:
+<freeform special instructions, e.g. an alternate brand name to identify as on-site>
+```
+
 Notes:
 - Detect via: `Ref: AGN Locksmith Services` and/or a `PDL:` field.
-- No customer name field.
+- Customer name is sometimes absent, sometimes present via `N:` — don't assume either way; always attempt to extract it.
 - Phone is often a company routing number plus `(Job Ext: NNN)` — pass both through unchanged, never invent an extension if one isn't given.
 - Vehicle info, when present, is embedded inside `Desc:` or `Notes:` (e.g. "Car Lockout - Honda Civic 2020"), not a separate field.
+- `Notes:` can carry important special instructions (e.g. "IDENTIFY AS <BRAND> VETERANS!!!" — an alternate name the technician should give the customer for that specific job) — always preserved verbatim, never summarized or dropped.
 - No price field.
 
 ## Lucky Locksmith LLC

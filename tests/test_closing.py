@@ -67,6 +67,19 @@ def test_agn_closing_uses_shared_template_with_its_own_header(rules):
     assert "$500 CC" in result.text
 
 
+def test_agn_closing_against_real_confirmed_shape(rules):
+    """Confirmed 2026-07-27 against a real AGN closing example: same
+    field-repeat + 'Closed' + amount + payment method shape as Lucky's,
+    just with a non-CC payment method ('Cash') and no parts -- both
+    already handled generically, no template change needed."""
+    job = extract_job(load("agn_with_name.txt"), rules)
+    result = render_closing(job, ClosingInput(amount="$690", payment_method="Cash"))
+    assert result.supported is True
+    assert "PDL: FAKE5" in result.text
+    assert "$690 Cash" in result.text
+    assert "parts" not in result.text
+
+
 def test_main_leads_closing_is_not_applicable(rules):
     job = extract_job(load("main_leads_clean.txt"), rules)
     result = render_closing(job, ClosingInput(amount="$0", payment_method="CC"))
