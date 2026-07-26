@@ -157,3 +157,35 @@ def test_second_phone_is_extracted_when_provided(rules):
     part of the original required-field list."""
     job = extract_job(load("main_leads_with_second_phone.txt"), rules)
     assert job.second_phone.value == "(555) 010-9000"
+
+
+def test_year_from_two_digits_pivot():
+    from dispatcher.parser import year_from_two_digits
+
+    assert year_from_two_digits("12") == 2012
+    assert year_from_two_digits("69") == 2069
+    assert year_from_two_digits("70") == 1970
+    assert year_from_two_digits("99") == 1999
+    assert year_from_two_digits("00") == 2000
+
+
+def test_two_digit_year_shorthand_still_triggers_restriction_when_over_cap(rules):
+    """A 2-digit year shouldn't just be recognized -- it must actually be
+    used for restriction math, e.g. a BMW newer than the 2014 cap."""
+    from dispatcher.parser import check_vehicle_restriction
+
+    status, reason = check_vehicle_restriction("bmw x5 16", rules)
+    assert status == "restricted"
+    assert "2016" in reason
+
+
+def test_two_digit_vehicle_year_shorthand_is_recognized(rules):
+    """Confirmed 2026-07-27 from a real AGN job: "honda accord 12" means a
+    2012 Accord. Without this, the missing year wrongly forced
+    HANDLE_MANUALLY even though a human would trivially read the year."""
+    job = extract_job(load("agn_two_digit_year_vehicle.txt"), rules)
+    assert job.vehicle.value == "honda accord 12"
+    assert job.vehicle.confidence == 78
+    assert "2012" in job.vehicle.reason
+    assert job.vehicle_restriction_status == "allowed"
+    assert job.status == ExtractionStatus.OK

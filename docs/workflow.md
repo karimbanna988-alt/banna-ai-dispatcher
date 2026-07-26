@@ -45,7 +45,7 @@ Main Leads gives the customer's real phone number directly. AGN/Lucky sometimes 
 - Full address
 - City, state, ZIP
 - Service type
-- Vehicle info (make/model/year), if present
+- Vehicle info (make/model/year), if present. Year may be written as a 2-digit shorthand (e.g. "Accord 12" meaning 2012) — recognized via the convention 00-69 → 20XX, 70-99 → 19XX (confirmed 2026-07-27), not treated as missing.
 - Price or company range — **never extracted as a number to act on**; if present in text it's surfaced as raw text only, and any price question always escalates to the human (Phase 1 has no pricing logic at all)
 - Notes / special instructions
 

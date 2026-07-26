@@ -54,7 +54,7 @@ ADDRESS_TAIL_RE = re.compile(
 )
 VEHICLE_RE = re.compile(
     rf"\b(?:(?P<year1>(?:19|20)\d{{2}})\s+)?(?P<make>{_MAKES_PATTERN})\b"
-    rf"\s*(?P<model>[A-Za-z0-9]+)?\s*(?P<year2>(?:19|20)\d{{2}})?",
+    rf"\s*(?P<model>[A-Za-z0-9]+)?\s*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
     re.IGNORECASE,
 )
 NOTES_LABEL_RE = re.compile(r"Notes:\s*(?P<val>.*)", re.DOTALL)
@@ -178,18 +178,39 @@ def extract_service_type(raw_text: str) -> FieldValue:
     return FieldValue(val, 90, "parsed from Desc: field")
 
 
+def year_from_two_digits(two_digits: str) -> int:
+    """Common vehicle-year shorthand convention: 00-69 -> 20XX, 70-99 -> 19XX
+    (confirmed useful 2026-07-27 from a real "honda accord 12" job -- means
+    a 2012 Accord). Locksmith car-key jobs essentially never involve
+    pre-1995 vehicles (transponder keys didn't exist yet), so this pivot is
+    a standard, safe interpretation of shorthand notation, not a guess of
+    an otherwise-unknown fact."""
+    n = int(two_digits)
+    return 2000 + n if n <= 69 else 1900 + n
+
+
 def extract_vehicle(raw_text: str) -> FieldValue:
     m = VEHICLE_RE.search(raw_text)
     if not m:
         return FieldValue(None, 0, "no vehicle make recognized in message")
 
-    year1, year2, model = m.group("year1"), m.group("year2"), m.group("model")
-    if not year1 and not year2 and model and model.isdigit() and len(model) == 4 and model[:2] in ("19", "20"):
-        year2 = model
+    year1, year2, year2_2d, model = m.group("year1"), m.group("year2"), m.group("year2_2d"), m.group("model")
+    if not year1 and not year2 and not year2_2d and model and model.isdigit():
+        if len(model) == 4 and model[:2] in ("19", "20"):
+            year2 = model
+        elif len(model) == 2:
+            year2_2d = model
 
     value = m.group(0).strip()
     if year1 or year2:
         return FieldValue(value, 85, "vehicle make/model/year matched directly in message text")
+    if year2_2d:
+        interpreted = year_from_two_digits(year2_2d)
+        return FieldValue(
+            value, 78,
+            f"vehicle year inferred from 2-digit shorthand '{year2_2d}' as {interpreted} "
+            "(convention: 00-69 -> 20XX, 70-99 -> 19XX)",
+        )
     return FieldValue(value, 55, "vehicle make found but no model year nearby — treat with caution")
 
 
@@ -207,7 +228,11 @@ def check_vehicle_restriction(vehicle_text: Optional[str], rules: dict) -> Tuple
             return "restricted", f"{make} is an excluded make"
 
     year_match = re.search(r"(?:19|20)\d{2}", vehicle_text)
-    year = int(year_match.group()) if year_match else None
+    if year_match:
+        year = int(year_match.group())
+    else:
+        two_digit_match = re.search(r"\b(\d{2})\b", vehicle_text)
+        year = year_from_two_digits(two_digit_match.group(1)) if two_digit_match else None
 
     for make, cap_year in rules.get("make_year_caps", {}).items():
         if make.lower() in text_lower:
