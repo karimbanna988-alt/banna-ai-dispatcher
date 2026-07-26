@@ -230,3 +230,26 @@ def test_main_leads_notes_do_not_swallow_structured_fields_without_a_blank_line(
     assert "FAKE8-TEST" not in job.notes.value
     assert "Testerson" not in job.notes.value
     assert "Faketown" not in job.notes.value
+
+
+def test_agn_trailing_content_with_no_notes_label_is_still_captured(rules):
+    """Confirmed 2026-07-27 from a real AGN job ending in a bare "K?" with
+    no "Notes:" label anywhere -- previously silently dropped entirely
+    (not in any field, not anywhere). Must now be captured, anchored on
+    the last recognized field (here, "Occu:")."""
+    job = extract_job(load("agn_no_notes_label_trailing_content.txt"), rules)
+    assert job.notes.value == "K?"
+    assert "no Notes: label found" in job.notes.reason
+
+
+def test_lucky_trailing_content_with_no_notes_label_is_still_captured(rules):
+    job = extract_job(load("lucky_no_notes_label_trailing_content.txt"), rules)
+    assert job.notes.value == "please call before arriving"
+
+
+def test_agn_notes_label_still_takes_priority_when_present(rules):
+    """Regression guard: the new no-label fallback must not kick in (or
+    otherwise change behavior) when a real "Notes:" label exists."""
+    job = extract_job(load("agn_clean.txt"), rules)
+    assert job.notes.value == "Honda Civic 2020"
+    assert "parsed verbatim from the last Notes:" in job.notes.reason

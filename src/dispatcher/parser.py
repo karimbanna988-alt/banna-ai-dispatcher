@@ -48,6 +48,7 @@ SECOND_PHONE_RE = re.compile(
     r"^2nd Phone\s*#?:[ \t]*(?P<phone>[\d()+\-. ]*\d)?[ \t]*$", re.MULTILINE,
 )
 DESC_RE = re.compile(r"^Desc:[ \t]*(?P<val>.*)$", re.MULTILINE)
+OCCU_RE = re.compile(r"^Occu:[ \t]*.*$", re.MULTILINE)
 ADDRESS_LINE_RE = re.compile(r"^(?:Address|Addr):[ \t]*(?P<line>.*)$", re.MULTILINE)
 ADDRESS_TAIL_RE = re.compile(
     r"(?P<city>[A-Za-z][A-Za-z .'-]*?),\s*(?P<state>[A-Z]{2})\s*,?\s*(?P<zip>\d{5})?\s*$"
@@ -275,6 +276,21 @@ def check_vehicle_restriction(vehicle_text: Optional[str], rules: dict) -> Tuple
     return "allowed", "no matching restriction found for this vehicle"
 
 
+_AGN_LUCKY_FIELD_PATTERNS = (TICKET_RE, NAME_RE, PHONE_RE, ADDRESS_LINE_RE, DESC_RE, OCCU_RE)
+
+
+def _last_recognized_field_end(raw_text: str) -> Optional[int]:
+    """End position of whichever known AGN/Lucky field label occurs latest
+    in the message -- used to anchor trailing content when there's no
+    "Notes:" label to anchor on instead."""
+    end = None
+    for pattern in _AGN_LUCKY_FIELD_PATTERNS:
+        matches = list(pattern.finditer(raw_text))
+        if matches and (end is None or matches[-1].end() > end):
+            end = matches[-1].end()
+    return end
+
+
 def extract_notes(raw_text: str, source: Source) -> FieldValue:
     if source in (Source.AGN, Source.LUCKY):
         # Quo sometimes repeats an empty "Notes:" label before the one that
@@ -285,12 +301,26 @@ def extract_notes(raw_text: str, source: Source) -> FieldValue:
         # end of the string on its first match, so finding all *label*
         # positions first is necessary to locate the last one.)
         label_positions = list(re.finditer(r"Notes:", raw_text))
-        if not label_positions:
-            return FieldValue(None, 0, "no Notes: field found")
-        val = raw_text[label_positions[-1].end():].strip()
-        if not val:
-            return FieldValue(None, 0, "Notes: field present but empty")
-        return FieldValue(val, 85, "parsed verbatim from the last Notes: label in the message")
+        if label_positions:
+            val = raw_text[label_positions[-1].end():].strip()
+            if not val:
+                return FieldValue(None, 0, "Notes: field present but empty")
+            return FieldValue(val, 85, "parsed verbatim from the last Notes: label in the message")
+
+        # No "Notes:" label at all -- confirmed 2026-07-27 by a real AGN job
+        # that ended in a bare "K?" with no label whatsoever. Without a
+        # fallback, that content was silently dropped: not in any field, not
+        # anywhere. Anchor on whichever recognized field (PDL/N/Ph/Addr/
+        # Desc/Occu) occurs last in the message and capture anything after
+        # it, so trailing content is never lost just because Quo omitted
+        # the "Notes:" label this time.
+        anchor = _last_recognized_field_end(raw_text)
+        if anchor is None:
+            return FieldValue(None, 0, "no Notes: field or other recognized field found to anchor trailing notes")
+        tail = raw_text[anchor:].strip()
+        if not tail:
+            return FieldValue(None, 0, "no Notes: field found, and no trailing content after the last recognized field")
+        return FieldValue(tail, 70, "no Notes: label found -- captured trailing content after the last recognized field")
 
     # Main Leads doesn't reliably separate the freeform vehicle/notes tail
     # from the structured fields with a blank line -- confirmed 2026-07-27
