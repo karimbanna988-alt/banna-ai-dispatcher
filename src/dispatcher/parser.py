@@ -57,9 +57,6 @@ VEHICLE_RE = re.compile(
     rf"\s*(?P<model>[A-Za-z0-9]+)?\s*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
     re.IGNORECASE,
 )
-MAIN_LEADS_LABEL_PREFIXES = (
-    "Power By", "Ticket:", "Name:", "Phone:", "2nd Phone", "Address:", "Desc:",
-)
 
 
 def load_vehicle_rules(path: Optional[Path] = None) -> dict:
@@ -295,13 +292,21 @@ def extract_notes(raw_text: str, source: Source) -> FieldValue:
             return FieldValue(None, 0, "Notes: field present but empty")
         return FieldValue(val, 85, "parsed verbatim from the last Notes: label in the message")
 
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", raw_text.strip()) if b.strip()]
-    if len(blocks) < 2:
-        return FieldValue(None, 0, "no trailing freeform notes block found")
-    last = blocks[-1]
-    if last.startswith(MAIN_LEADS_LABEL_PREFIXES) or last == blocks[0]:
-        return FieldValue(None, 0, "no trailing freeform notes block found")
-    return FieldValue(last, 70, "trailing freeform paragraph treated as notes verbatim")
+    # Main Leads doesn't reliably separate the freeform vehicle/notes tail
+    # from the structured fields with a blank line -- confirmed 2026-07-27
+    # by a real job with zero blank lines after "Desc:" at all (an earlier
+    # blank-line-block-splitting heuristic wrongly swallowed the entire
+    # message -- ticket, name, phone, address -- into "notes" here). The
+    # one thing that's consistent across every real sample seen is that
+    # "Desc:" is followed immediately by the vehicle/notes content, so
+    # anchor on it directly instead.
+    desc_matches = list(DESC_RE.finditer(raw_text))
+    if not desc_matches:
+        return FieldValue(None, 0, "no Desc: field found to anchor trailing notes")
+    tail = raw_text[desc_matches[-1].end():].strip()
+    if not tail:
+        return FieldValue(None, 0, "no content after Desc: field")
+    return FieldValue(tail, 75, "everything after Desc: taken verbatim (may include vehicle info and freeform notes)")
 
 
 def _compute_status(job: ExtractedJob) -> None:

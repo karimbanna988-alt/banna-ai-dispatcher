@@ -25,6 +25,8 @@ Notes:
 - Vehicle info appears as its own line after `Desc:`, not inside a labeled field.
 - Real customer phone number — no extension involved.
 - `2nd Phone #:` is usually empty but sometimes has a real value (confirmed 2026-07-27) — must be extracted and shown to the technician when present, never silently dropped just because it isn't a required field. Address can appear as a full single-line street address (`764 Chantry Dr, Virginia Beach, VA 23452`) as well as the city/state/zip-only form shown above — both are handled by the same address parser.
+- Everything after `Desc:` (vehicle info, notes, or both mixed together) is taken verbatim as the notes field. There is **not always a blank line** separating it from the structured fields above — confirmed 2026-07-27 by a real job with none at all. Don't assume a blank-line-separated block; anchor on `Desc:` instead.
+- The vehicle line doesn't always name a car -- confirmed 2026-07-27 with an RV ("2006 Forest River"), which isn't in the recognized-makes list, so it won't populate the structured `vehicle` field, but it's still fully preserved in `notes`.
 - No price field.
 
 ## AGN

@@ -214,3 +214,19 @@ def test_last_notes_label_wins_when_repeated(rules):
     redundant empty label must not leak into the extracted value."""
     job = extract_job(load("lucky_bare_extension_and_double_notes.txt"), rules)
     assert job.notes.value == "CX IS AT BEST BUY"
+
+
+def test_main_leads_notes_do_not_swallow_structured_fields_without_a_blank_line(rules):
+    """Confirmed 2026-07-27 from a real Main Leads job: there is no blank
+    line between the structured fields and the freeform vehicle/notes tail
+    at all -- the old block-splitting heuristic (which only worked when a
+    blank line happened to be present) wrongly swallowed the entire
+    message, including the ticket/name/phone/address, into "notes"."""
+    job = extract_job(load("main_leads_no_blank_line_before_notes.txt"), rules)
+    assert job.notes.value == (
+        "RV lock-out latch is not working// 2006 Forest River//"
+        "  call back  555 010 6000 // service as soon as possible"
+    )
+    assert "FAKE8-TEST" not in job.notes.value
+    assert "Testerson" not in job.notes.value
+    assert "Faketown" not in job.notes.value
