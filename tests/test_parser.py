@@ -189,3 +189,28 @@ def test_two_digit_vehicle_year_shorthand_is_recognized(rules):
     assert "2012" in job.vehicle.reason
     assert job.vehicle_restriction_status == "allowed"
     assert job.status == ExtractionStatus.OK
+
+
+def test_bare_trailing_extension_is_split_from_phone(rules):
+    """Confirmed 2026-07-27 from a real Lucky job: "Ph: 5551234567 133" has
+    no (Job Ext: N) wrapper -- the phone and extension must still be split,
+    not glued into one unusable dial string."""
+    job = extract_job(load("lucky_bare_extension_and_double_notes.txt"), rules)
+    assert job.phone.value == "5551234567"
+    assert job.extension.value == "133"
+
+
+def test_normally_spaced_phone_number_is_not_mistaken_for_an_extension(rules):
+    from dispatcher.parser import extract_phone_and_extension
+
+    phone, ext = extract_phone_and_extension("Ph: (571) 431-9558")
+    assert phone.value == "(571) 431-9558"
+    assert ext.value is None
+
+
+def test_last_notes_label_wins_when_repeated(rules):
+    """Confirmed 2026-07-27 from the same real Lucky job: Quo can repeat an
+    empty "Notes:" label before the one that actually has content -- the
+    redundant empty label must not leak into the extracted value."""
+    job = extract_job(load("lucky_bare_extension_and_double_notes.txt"), rules)
+    assert job.notes.value == "CX IS AT BEST BUY"

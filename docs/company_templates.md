@@ -58,9 +58,10 @@ Notes:
 Notes:
 - Detect via: `Ref: AGN Locksmith Services` and/or a `PDL:` field.
 - Customer name is sometimes absent, sometimes present via `N:` — don't assume either way; always attempt to extract it.
-- Phone is often a company routing number plus `(Job Ext: NNN)` — pass both through unchanged, never invent an extension if one isn't given.
-- Vehicle info, when present, is embedded inside `Desc:` or `Notes:` (e.g. "Car Lockout - Honda Civic 2020"), not a separate field.
+- Phone is often a company routing number plus `(Job Ext: NNN)`, but the extension can also appear as a bare trailing number with no wrapper at all (e.g. "Ph: 7048000948 133", confirmed 2026-07-27 on a real Lucky job) — pass both through unchanged, never invent an extension if one isn't given.
+- Vehicle info, when present, is embedded inside `Desc:` or `Notes:` (e.g. "Car Lockout - Honda Civic 2020"), not a separate field. The model year is sometimes written as a 2-digit shorthand (e.g. "accord 12" = 2012).
 - `Notes:` can carry important special instructions (e.g. "IDENTIFY AS <BRAND> VETERANS!!!" — an alternate name the technician should give the customer for that specific job) — always preserved verbatim, never summarized or dropped.
+- The `Notes:` label itself can appear twice, with an empty one before the one that actually has content (confirmed on both AGN and Lucky jobs) — use the last occurrence, not the first, so the real content isn't preceded by a redundant empty label.
 - No price field.
 
 ## Lucky Locksmith LLC

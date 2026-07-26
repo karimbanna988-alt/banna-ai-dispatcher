@@ -41,7 +41,7 @@ Main Leads gives the customer's real phone number directly. AGN/Lucky sometimes 
 - Customer name (if provided — AGN/Lucky often omit it)
 - Phone number
 - Second phone number, if provided (confirmed 2026-07-27 — a real customer-supplied alternate contact number, never dropped just because it's optional)
-- Extension, if provided (never invented — see section 6)
+- Extension, if provided — either wrapped as `(Job Ext: N)` or a bare trailing number after the phone (e.g. "7048000948 133", confirmed 2026-07-27); never invented — see section 6
 - Full address
 - City, state, ZIP
 - Service type

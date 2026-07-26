@@ -57,7 +57,6 @@ VEHICLE_RE = re.compile(
     rf"\s*(?P<model>[A-Za-z0-9]+)?\s*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
     re.IGNORECASE,
 )
-NOTES_LABEL_RE = re.compile(r"Notes:\s*(?P<val>.*)", re.DOTALL)
 MAIN_LEADS_LABEL_PREFIXES = (
     "Power By", "Ticket:", "Name:", "Phone:", "2nd Phone", "Address:", "Desc:",
 )
@@ -112,17 +111,44 @@ def extract_name(raw_text: str) -> FieldValue:
     return FieldValue(val, 90, "parsed from Name: field")
 
 
+def _split_bare_trailing_extension(phone_raw: str) -> Tuple[str, Optional[str]]:
+    """Some jobs give the extension as a bare trailing number with no
+    "(Job Ext: N)" wrapper, e.g. "7048000948 133" (confirmed 2026-07-27,
+    a real Lucky job). Only split when the part before the last space is
+    a plausible complete phone number (>=10 digits) and the trailing part
+    is short and purely numeric -- otherwise a normally-spaced phone
+    number (e.g. "704 800 0948") could be wrongly split."""
+    if " " not in phone_raw:
+        return phone_raw, None
+    main, _, trailing = phone_raw.rpartition(" ")
+    digits_in_main = re.sub(r"\D", "", main)
+    if trailing.isdigit() and 1 <= len(trailing) <= 5 and len(digits_in_main) >= 10:
+        return main.strip(), trailing
+    return phone_raw, None
+
+
 def extract_phone_and_extension(raw_text: str) -> Tuple[FieldValue, FieldValue]:
     m = PHONE_RE.search(raw_text)
     if not m or not m.group("phone"):
         missing = FieldValue(None, 0, "no Phone:/Ph: field with a number found")
         return missing, FieldValue(None, 0, "no extension present")
-    phone_field = FieldValue(m.group("phone").strip(), 95, "parsed from Phone:/Ph: field")
+
     ext_val = m.group("ext")
+    phone_raw = m.group("phone").strip()
+
     if ext_val:
+        phone_field = FieldValue(phone_raw, 95, "parsed from Phone:/Ph: field")
         ext_field = FieldValue(ext_val, 95, "parsed from (Job Ext: N) in the phone line")
-    else:
-        ext_field = FieldValue(None, 100, "no extension provided in the message — not invented")
+        return phone_field, ext_field
+
+    main_phone, bare_ext = _split_bare_trailing_extension(phone_raw)
+    if bare_ext:
+        phone_field = FieldValue(main_phone, 90, "parsed from Phone:/Ph: field, extension split off")
+        ext_field = FieldValue(bare_ext, 75, "parsed as a bare trailing extension after the phone number")
+        return phone_field, ext_field
+
+    phone_field = FieldValue(phone_raw, 95, "parsed from Phone:/Ph: field")
+    ext_field = FieldValue(None, 100, "no extension provided in the message — not invented")
     return phone_field, ext_field
 
 
@@ -254,13 +280,20 @@ def check_vehicle_restriction(vehicle_text: Optional[str], rules: dict) -> Tuple
 
 def extract_notes(raw_text: str, source: Source) -> FieldValue:
     if source in (Source.AGN, Source.LUCKY):
-        m = NOTES_LABEL_RE.search(raw_text)
-        if not m:
+        # Quo sometimes repeats an empty "Notes:" label before the one that
+        # actually carries content (confirmed 2026-07-27, a real Lucky job:
+        # "Notes:\n\nNotes:\nCX IS AT BEST BUY") -- use the LAST occurrence
+        # so the real content isn't preceded by a redundant empty label.
+        # (a single greedy/DOTALL "Notes:.*" pattern would consume to the
+        # end of the string on its first match, so finding all *label*
+        # positions first is necessary to locate the last one.)
+        label_positions = list(re.finditer(r"Notes:", raw_text))
+        if not label_positions:
             return FieldValue(None, 0, "no Notes: field found")
-        val = m.group("val").strip()
+        val = raw_text[label_positions[-1].end():].strip()
         if not val:
             return FieldValue(None, 0, "Notes: field present but empty")
-        return FieldValue(val, 85, "parsed verbatim from Notes: field")
+        return FieldValue(val, 85, "parsed verbatim from the last Notes: label in the message")
 
     blocks = [b.strip() for b in re.split(r"\n\s*\n", raw_text.strip()) if b.strip()]
     if len(blocks) < 2:
