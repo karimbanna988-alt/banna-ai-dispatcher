@@ -1,0 +1,13 @@
+{
+  "_comment": "Business rules, not code. Edit this file to update restrictions without touching the parser. Years are inclusive bounds unless noted.",
+  "oldest_model_year_allowed": 1986,
+  "excluded_makes": [
+    "Audi",
+    "Volkswagen"
+  ],
+  "make_year_caps": {
+    "Mercedes": 2011,
+    "Mercedes-Benz": 2011,
+    "BMW": 2014
+  }
+}

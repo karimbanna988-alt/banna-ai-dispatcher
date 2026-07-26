@@ -1,0 +1,140 @@
+# Permanent service-area mapping (business rules, not code).
+#
+# This is a starter placeholder covering the areas the business owner named
+# as "current known working areas" on 2026-07-26. dispatch_group and
+# closing_group are intentionally left null (unconfirmed) for every entry --
+# per explicit instruction, the system must never guess a WhatsApp group
+# name. A record with an unconfirmed group is treated as "known area, but
+# forces HANDLE MANUALLY" until a real dispatch_group/closing_group value is
+# filled in here.
+#
+# state is left null wherever the business owner gave only a bare city name
+# (several of these city names are ambiguous across multiple US states --
+# e.g. Arlington, Augusta, Columbia, Greenville, Chicago, Vancouver -- and
+# guessing the wrong one would risk misrouting a job). Only "Charlotte, NC"
+# was given with an explicit state. Fill in state once confirmed; until
+# then, matching falls back to city-name-only (see rules/service_areas.py).
+#
+# To add a new area: append another entry below. To confirm a group: fill
+# in dispatch_group/closing_group and remove the TODO note. No code changes
+# needed for either.
+
+- city: Arlington
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state (multiple US cities named Arlington) and dispatch/closing WhatsApp group names."
+
+- city: Augusta
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state (multiple US cities named Augusta) and dispatch/closing WhatsApp group names."
+
+- city: Charlotte
+  state: NC
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm dispatch/closing WhatsApp group names."
+
+- city: Chicago
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+
+- city: Columbia
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state (multiple US cities named Columbia) and dispatch/closing WhatsApp group names."
+
+- city: null
+  state: DE
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "Whole state (Delaware), not a specific city. TODO: confirm dispatch/closing WhatsApp group names."
+
+- city: Greenville
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state (multiple US cities named Greenville) and dispatch/closing WhatsApp group names."
+
+- city: null
+  state: NJ
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "Whole state (New Jersey), not a specific city. TODO: confirm dispatch/closing WhatsApp group names."
+
+- city: San Antonio
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+
+- city: Savannah
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+
+- city: Vancouver
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state/country (Vancouver, WA vs Vancouver, BC Canada) and dispatch/closing WhatsApp group names."
+
+- city: Virginia Beach
+  state: null
+  zip_codes: []
+  dispatch_group: null
+  closing_group: null
+  active: true
+  default_technician_availability: unknown
+  company_restrictions: []
+  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
