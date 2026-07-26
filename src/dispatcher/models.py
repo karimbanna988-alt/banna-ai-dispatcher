@@ -58,6 +58,7 @@ class ExtractedJob:
     ticket_number: FieldValue
     customer_name: FieldValue
     phone: FieldValue
+    second_phone: FieldValue
     extension: FieldValue
     address: FieldValue
     city: FieldValue
@@ -79,6 +80,7 @@ class ExtractedJob:
             "ticket_number": self.ticket_number,
             "customer_name": self.customer_name,
             "phone": self.phone,
+            "second_phone": self.second_phone,
             "extension": self.extension,
             "address": self.address,
             "city": self.city,

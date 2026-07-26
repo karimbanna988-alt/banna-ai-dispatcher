@@ -39,6 +39,10 @@ def format_technician_message(job: ExtractedJob) -> str:
         f"Ticket: {ticket}",
         f"Customer: {name}",
         f"Phone: {phone}",
+    ]
+    if job.second_phone.value:
+        lines.append(f"2nd Phone: {job.second_phone.value}")
+    lines += [
         f"Address: {address}",
         f"Service: {service}",
         f"Vehicle: {vehicle}",

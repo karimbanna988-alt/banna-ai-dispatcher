@@ -42,6 +42,11 @@ PHONE_RE = re.compile(
     r"^(?:Phone|Ph):[ \t]*(?P<phone>[\d()+\-. ]*\d)?[ \t]*(?:\(Job Ext:[ \t]*(?P<ext>\d+)\))?[ \t]*$",
     re.MULTILINE,
 )
+# A genuine second contact number some Main Leads jobs provide -- must be
+# kept, never dropped, when the customer's primary line doesn't answer.
+SECOND_PHONE_RE = re.compile(
+    r"^2nd Phone\s*#?:[ \t]*(?P<phone>[\d()+\-. ]*\d)?[ \t]*$", re.MULTILINE,
+)
 DESC_RE = re.compile(r"^Desc:[ \t]*(?P<val>.*)$", re.MULTILINE)
 ADDRESS_LINE_RE = re.compile(r"^(?:Address|Addr):[ \t]*(?P<line>.*)$", re.MULTILINE)
 ADDRESS_TAIL_RE = re.compile(
@@ -119,6 +124,13 @@ def extract_phone_and_extension(raw_text: str) -> Tuple[FieldValue, FieldValue]:
     else:
         ext_field = FieldValue(None, 100, "no extension provided in the message — not invented")
     return phone_field, ext_field
+
+
+def extract_second_phone(raw_text: str) -> FieldValue:
+    m = SECOND_PHONE_RE.search(raw_text)
+    if not m or not m.group("phone"):
+        return FieldValue(None, 0, "no 2nd Phone #: field with a number found")
+    return FieldValue(m.group("phone").strip(), 95, "parsed from 2nd Phone #: field")
 
 
 def extract_address(raw_text: str) -> Dict[str, FieldValue]:
@@ -284,6 +296,7 @@ def extract_job(raw_text: str, rules: Optional[dict] = None) -> ExtractedJob:
     # just because one past example omitted it.
     name = extract_name(raw_text)
     phone, extension = extract_phone_and_extension(raw_text)
+    second_phone = extract_second_phone(raw_text)
     addr = extract_address(raw_text)
     service_type = extract_service_type(raw_text)
     vehicle = extract_vehicle(raw_text)
@@ -297,6 +310,7 @@ def extract_job(raw_text: str, rules: Optional[dict] = None) -> ExtractedJob:
         ticket_number=ticket,
         customer_name=name,
         phone=phone,
+        second_phone=second_phone,
         extension=extension,
         address=addr["address"],
         city=addr["city"],

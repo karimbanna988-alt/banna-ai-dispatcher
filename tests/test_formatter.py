@@ -48,3 +48,15 @@ def test_main_leads_message_preserves_name_and_notes(rules):
     msg = format_technician_message(job)
     assert "Jordan" in msg
     assert "fob is inside" in msg
+
+
+def test_second_phone_included_when_present(rules):
+    job = extract_job(load("main_leads_with_second_phone.txt"), rules)
+    msg = format_technician_message(job)
+    assert "2nd Phone: (555) 010-9000" in msg
+
+
+def test_second_phone_line_omitted_when_absent(rules):
+    job = extract_job(load("main_leads_clean.txt"), rules)
+    msg = format_technician_message(job)
+    assert "2nd Phone" not in msg

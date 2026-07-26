@@ -144,3 +144,16 @@ def test_clean_jobs_never_report_missing_extension_as_a_problem(rules):
     assert job.extension.is_missing
     assert job.extension.confidence == 100
     assert "not invented" in job.extension.reason
+
+
+def test_second_phone_is_missing_when_field_is_empty(rules):
+    job = extract_job(load("main_leads_clean.txt"), rules)
+    assert job.second_phone.value is None
+
+
+def test_second_phone_is_extracted_when_provided(rules):
+    """Confirmed 2026-07-27 from a real Main Leads job: a genuine second
+    contact number must never be silently dropped just because it wasn't
+    part of the original required-field list."""
+    job = extract_job(load("main_leads_with_second_phone.txt"), rules)
+    assert job.second_phone.value == "(555) 010-9000"

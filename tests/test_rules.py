@@ -164,6 +164,7 @@ def test_needs_review_when_confidence_below_threshold():
         ticket_number=FieldValue("T1", 65, "test"),
         customer_name=FieldValue(None, 0, "n/a"),
         phone=FieldValue("555-0000", 65, "test"),
+        second_phone=FieldValue(None, 0, "no 2nd phone"),
         extension=FieldValue(None, 100, "not invented"),
         address=FieldValue("1 Test St, Faketown, NC 27500", 65, "test"),
         city=FieldValue("Faketown", 90, "test"),
