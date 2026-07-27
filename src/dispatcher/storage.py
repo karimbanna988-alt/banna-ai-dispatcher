@@ -63,19 +63,24 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+JOBS_PRE_SOURCE_SCOPED_BACKUP_TABLE = "jobs_pre_source_scoped_unique_backup"
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_number TEXT UNIQUE NOT NULL,
+            ticket_number TEXT NOT NULL,
             source TEXT NOT NULL,
             latest_fields_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            UNIQUE (source, ticket_number)
         )
         """
     )
+    _migrate_jobs_to_source_scoped_unique(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -124,6 +129,49 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_jobs_to_source_scoped_unique(conn: sqlite3.Connection) -> None:
+    """2026-07-28: jobs.ticket_number was globally UNIQUE, but a ticket
+    number is only unique WITHIN one source company -- AGN, Lucky, and Main
+    Leads each generate their own independently, so two companies can
+    legitimately share a ticket number. That crashed save_audit_entry with
+    a UNIQUE constraint violation (and lost the audit record for whichever
+    save failed, since the whole INSERT rolled back).
+
+    Migrates the unique key to (source, ticket_number). Idempotent (skips
+    once already applied) and never destructive: the pre-migration table is
+    renamed to JOBS_PRE_SOURCE_SCOPED_BACKUP_TABLE, never dropped, and every
+    row is copied across with its exact original `id` preserved so
+    `events.job_id` foreign keys keep pointing at the right row."""
+    current_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()
+    if current_sql_row is None or "ticket_number TEXT UNIQUE NOT NULL" not in current_sql_row[0]:
+        return  # brand-new table already has the new schema, or already migrated
+
+    conn.execute(f"ALTER TABLE jobs RENAME TO {JOBS_PRE_SOURCE_SCOPED_BACKUP_TABLE}")
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_number TEXT NOT NULL,
+            source TEXT NOT NULL,
+            latest_fields_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (source, ticket_number)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO jobs (id, ticket_number, source, latest_fields_json, created_at, updated_at)
+        SELECT id, ticket_number, source, latest_fields_json, created_at, updated_at
+        FROM {JOBS_PRE_SOURCE_SCOPED_BACKUP_TABLE}
+        """
+    )
+    conn.commit()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -144,8 +192,13 @@ def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyRe
             "no ticket/PDL number -- cannot correlate with any existing job",
         )
 
+    # Scoped by source too: ticket numbers are only unique WITHIN one
+    # source company (AGN, Lucky, Main Leads each generate their own
+    # independently) -- a bare ticket_number lookup could match the wrong
+    # company's job if two happened to share the same ticket string.
     row = conn.execute(
-        "SELECT id, latest_fields_json FROM jobs WHERE ticket_number = ?", (ticket,)
+        "SELECT id, latest_fields_json FROM jobs WHERE ticket_number = ? AND source = ?",
+        (ticket, job.source.value),
     ).fetchone()
     if row is None:
         # In real dispatching, every ticket is dispatched before it can be
@@ -209,21 +262,37 @@ def save_audit_entry(
 ) -> int:
     now = _now()
     ticket = job.ticket_number.value
-    job_id = classify_result.existing_job_id
     fields_snapshot = json.dumps(_current_fields(job))
 
-    if job_id is None and ticket:
-        cur = conn.execute(
-            "INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+    if ticket:
+        # Deliberately does NOT trust classify_result.existing_job_id for
+        # the insert-vs-update decision -- that value is computed once when
+        # a message is first loaded into the review screen and can go
+        # stale (e.g. the dispatcher finalizes the same loaded job twice,
+        # a double-click, or re-approves after already handling it). An
+        # upsert keyed on (source, ticket_number) is idempotent regardless:
+        # re-saving the same job any number of times updates the same row
+        # instead of attempting a second INSERT and crashing on the
+        # UNIQUE constraint. job_id is always resolved fresh afterward.
+        conn.execute(
+            """
+            INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (source, ticket_number) DO UPDATE SET
+                latest_fields_json = excluded.latest_fields_json,
+                updated_at = excluded.updated_at
+            """,
             (ticket, job.source.value, fields_snapshot, now, now),
         )
-        job_id = cur.lastrowid
-    elif job_id is not None:
-        conn.execute(
-            "UPDATE jobs SET latest_fields_json = ?, updated_at = ? WHERE id = ?",
-            (fields_snapshot, now, job_id),
-        )
+        job_id = conn.execute(
+            "SELECT id FROM jobs WHERE source = ? AND ticket_number = ?",
+            (job.source.value, ticket),
+        ).fetchone()[0]
+    else:
+        # No ticket at all to key an upsert on -- fall back to whatever the
+        # caller already resolved (e.g. a status/closing entry attached to
+        # an already-known job_id).
+        job_id = classify_result.existing_job_id
 
     conn.execute(
         """

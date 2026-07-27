@@ -225,7 +225,8 @@ with tab_status:
             elif st.button("Approve status reply"):
                 job = st.session_state.current_job
                 row = conn.execute(
-                    "SELECT id FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)
+                    "SELECT id FROM jobs WHERE ticket_number = ? AND source = ?",
+                    (job.ticket_number.value, job.source.value),
                 ).fetchone()
                 classify_result = ClassifyResult(
                     MessageType.STATUS, existing_job_id=row[0] if row else None,
@@ -261,7 +262,8 @@ with tab_closing:
             if st.button("Record closing to audit log"):
                 job = st.session_state.current_job
                 row = conn.execute(
-                    "SELECT id FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)
+                    "SELECT id FROM jobs WHERE ticket_number = ? AND source = ?",
+                    (job.ticket_number.value, job.source.value),
                 ).fetchone()
                 classify_result = ClassifyResult(
                     MessageType.CLOSING, existing_job_id=row[0] if row else None,

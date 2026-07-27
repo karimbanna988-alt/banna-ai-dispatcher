@@ -111,6 +111,12 @@ def test_status_message_is_classified(conn, vehicle_rules):
 
     status_job = extract_job("Going", vehicle_rules)
     status_job.ticket_number = job.ticket_number  # same ticket, freeform status text
+    # A status update tied to this ticket is understood via which
+    # company's thread it arrived in -- same source as the original job,
+    # matching how app.py's Status Update tab already reuses the original
+    # job's source rather than a blind ticket_number-only match (ticket
+    # numbers are only unique WITHIN one source, not globally).
+    status_job.source = job.source
     result2 = storage.classify_incoming(conn, status_job)
     assert result2.message_type == MessageType.STATUS
 
@@ -165,3 +171,86 @@ def test_full_pipeline_writes_a_complete_audit_entry(conn, vehicle_rules):
     assert entry["luxor_message"].startswith("LUXOR LOCKSMITH")
     assert entry["final_action"] == "Approve"
     assert job_id is not None
+
+
+# ------------------------------------------------- Regression: crash fix ---
+# Confirmed 2026-07-27/28: jobs.ticket_number was globally UNIQUE (not
+# scoped per source), and save_audit_entry() trusted a caller-supplied
+# existing_job_id that could go stale (e.g. the same loaded job finalized
+# twice). Both crashed with sqlite3.IntegrityError: UNIQUE constraint
+# failed: jobs.ticket_number, and the failure happened mid-INSERT, so the
+# events row -- the audit trail of what the dispatcher actually did -- was
+# lost too. These tests lock in that none of that can happen again.
+
+def test_same_message_processed_twice_does_not_crash(conn, vehicle_rules):
+    raw = load("agn_clean.txt")
+
+    job1 = extract_job(raw, vehicle_rules)
+    result1 = storage.classify_incoming(conn, job1)
+    storage.save_audit_entry(conn, job1, result1, final_action="Approve")
+
+    # Reprocess the exact same raw text from scratch, as if the same Quo
+    # message were re-reviewed or re-delivered.
+    job2 = extract_job(raw, vehicle_rules)
+    result2 = storage.classify_incoming(conn, job2)
+    assert result2.message_type == MessageType.DUPLICATE
+    storage.save_audit_entry(conn, job2, result2, final_action="Approve")  # must not raise
+
+    assert conn.execute("SELECT COUNT(*) FROM jobs WHERE ticket_number = ?", (job1.ticket_number.value,)).fetchone()[0] == 1
+    timeline = storage.get_audit_timeline(conn, job1.ticket_number.value)
+    assert len(timeline) == 2  # both attempts preserved in the append-only log
+
+
+def test_same_ticket_number_from_different_sources_does_not_collide(conn, vehicle_rules):
+    agn_job = extract_job(load("agn_clean.txt"), vehicle_rules)
+    lucky_job = extract_job(load("lucky_clean.txt"), vehicle_rules)
+    # Force an artificial collision: two different companies' own,
+    # independently-generated ticket numbering happening to coincide.
+    shared_ticket = "SHARED123"
+    agn_job.ticket_number.value = shared_ticket
+    lucky_job.ticket_number.value = shared_ticket
+    assert agn_job.source != lucky_job.source
+
+    result_a = storage.classify_incoming(conn, agn_job)
+    storage.save_audit_entry(conn, agn_job, result_a, final_action="Approve")
+
+    result_l = storage.classify_incoming(conn, lucky_job)
+    assert result_l.message_type == MessageType.NEW  # not mistaken for the AGN job
+    storage.save_audit_entry(conn, lucky_job, result_l, final_action="Approve")  # must not raise
+
+    rows = conn.execute(
+        "SELECT source FROM jobs WHERE ticket_number = ? ORDER BY source", (shared_ticket,)
+    ).fetchall()
+    assert [r[0] for r in rows] == ["AGN", "Lucky"]
+
+
+def test_repeated_handle_manually_on_the_same_loaded_job_does_not_crash(conn, vehicle_rules):
+    """Reproduces the actual reported crash: the review screen doesn't
+    clear itself after a save, and _finalize() never recomputes
+    classify_result -- so clicking the same action button again (a
+    double-click, or re-clicking after already handling it) reuses the
+    same, now-stale ClassifyResult object."""
+    job = extract_job(load("agn_clean.txt"), vehicle_rules)
+    classify_result = storage.classify_incoming(conn, job)
+    assert classify_result.existing_job_id is None  # first time, brand new
+
+    storage.save_audit_entry(conn, job, classify_result, final_action="Handle Manually")
+    # Re-finalize using the exact same (now stale) classify_result object,
+    # simulating a second click without ever re-running classify_incoming.
+    storage.save_audit_entry(conn, job, classify_result, final_action="Handle Manually")  # must not raise
+
+    assert conn.execute("SELECT COUNT(*) FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)).fetchone()[0] == 1
+
+
+def test_audit_log_preserves_every_repeated_action(conn, vehicle_rules):
+    job = extract_job(load("agn_clean.txt"), vehicle_rules)
+    classify_result = storage.classify_incoming(conn, job)
+
+    storage.save_audit_entry(conn, job, classify_result, final_action="Handle Manually")
+    storage.save_audit_entry(conn, job, classify_result, final_action="Handle Manually")
+    storage.save_audit_entry(conn, job, classify_result, final_action="Approve")
+
+    timeline = storage.get_audit_timeline(conn, job.ticket_number.value)
+    assert [e["final_action"] for e in timeline] == ["Handle Manually", "Handle Manually", "Approve"]
+    # jobs stays a single, current-state row throughout
+    assert conn.execute("SELECT COUNT(*) FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)).fetchone()[0] == 1
