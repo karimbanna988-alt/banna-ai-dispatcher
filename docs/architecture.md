@@ -1,6 +1,6 @@
 # Phase 1 Architecture — Complete Execution Flow
 
-**Status: Phase 1 core system is built and tested (69 pytest cases passing).**
+**Status: Phase 1 core system is built and tested (126 pytest cases passing, including app.py integration tests -- see section 5).**
 This is the full design for Phase 1: everything from a raw Quo message landing
 in the dispatcher's clipboard to the dispatcher pressing **Approve** or
 **Handle Manually**. Every module below is now `[DONE]`; where a real business
@@ -138,8 +138,12 @@ Three side flows use the same core modules but enter the pipeline differently
 | `src/dispatcher/formatter.py` | Convert `ExtractedJob` into the Luxor Locksmith-branded technician message (V1 rule) | `ExtractedJob` | technician message (string) | **DONE** |
 | `src/dispatcher/updates.py` | Map a technician's confirmed status text to the standard short company reply | freeform tech status text | `StandardReply` | **DONE** |
 | `src/dispatcher/storage.py` | SQLite job records; classify incoming messages against existing records; append-only audit log | `ExtractedJob` + every stage's output + human actions | persisted rows | **DONE** |
-| `app.py` | Streamlit UI; orchestrates every module above; Approve/Edit/Reject/Handle Manually + Daily Rules/Status/Closing/Audit tabs; shows live business-hours status | dispatcher input | approval screen + writes to storage | **DONE** |
-| `tests/test_*.py` | Regression coverage across all of the above | — | — | **DONE** (90 tests passing) |
+| `src/dispatcher/pipeline.py` | The single `extract_job → classify_incoming → get_company_profile → decide → format_technician_message` sequence, shared by `app.py`'s Process tab and the fake-inbox simulator | raw text, vehicle rules, service areas, conn, daily rules | `ProcessResult` | **DONE** |
+| `src/dispatcher/simulator.py` | Fake Quo inbox: scripted, ordered conversation scenarios delivered into the same session_state the real UI uses -- no real Quo message is ever sent | scenario selection + step index | populates the Process/Status/Closing tabs as if a real message arrived | **DONE** |
+| `simulator/scenarios/**` | Scenario fixture data (fake, `SIM*` ticket prefixes) — one folder per scenario, ordered step files | — | — | **DONE** |
+| `app.py` | Streamlit UI; orchestrates every module above; Approve/Edit/Reject/Handle Manually + Daily Rules/Status/Closing/Audit/Fake-Inbox tabs; shows live business-hours status | dispatcher input | approval screen + writes to storage | **DONE** |
+| `tests/test_*.py` | Unit coverage of every `src/dispatcher` module in isolation | — | — | **DONE** |
+| `tests/test_app_integration.py` | Integration coverage of `app.py` itself via `streamlit.testing.v1.AppTest`, driven through the fake-inbox simulator -- one test per conversation scenario, asserting on the resulting audit log | — | — | **DONE** (126 tests passing overall) |
 
 ## 3. Key data contracts (as implemented)
 
@@ -205,6 +209,7 @@ class MessageType(str, Enum):
     STATUS = "STATUS"
     CLOSING = "CLOSING"
     CANCELLATION = "CANCELLATION"
+    CLOSING_WITHOUT_DISPATCH = "CLOSING_WITHOUT_DISPATCH"
     UNRECOGNIZED = "UNRECOGNIZED"
 
 @dataclass
@@ -241,3 +246,94 @@ These are safe, editable, and clearly marked as TODO — none of them silently g
 - **Message-type classification heuristics** in `storage.classify_incoming()` (e.g. "contains 'closed' + a dollar amount" → `CLOSING`, "contains 'cancel'" → `CANCELLATION`) are keyword-based, not a business rule you dictated. Anything that doesn't match a known pattern comes back `UNRECOGNIZED` rather than being force-fit into the wrong category.
 
 None of these block using the system today — they just mean many real jobs will currently land on `HANDLE_MANUALLY` (mainly due to unconfirmed dispatch/closing groups) until the underlying business data is filled in.
+
+## 5. Fake Quo inbox simulator (2026-07-27, local only -- no real Quo integration)
+
+Manual testing (pasting real, anonymized jobs one at a time) validated the
+parser/decision/formatter path well, but only ever exercised a *single new
+message* -- never a full conversation (reminder, correction, cancellation,
+status update, closing), and never `app.py` itself (every test before this
+covered `src/dispatcher/*` in isolation).
+
+- **`src/dispatcher/pipeline.py`** extracts the `extract_job → classify_incoming
+  → get_company_profile → decide → format_technician_message` sequence that
+  used to be inlined in `app.py`'s Process-tab button handler. Both the real
+  "paste a message" flow and the simulator's "deliver a scripted message"
+  flow call this one function -- there is exactly one place this
+  orchestration exists.
+- **`src/dispatcher/simulator.py`** + **`simulator/scenarios/**`** (fake
+  `SIM*`-prefixed ticket data) implement a **"Fake Inbox (Simulator)"** tab in
+  `app.py`. A scenario is an ordered list of steps (`message` / `status_phrase`
+  / `closing_input`); "Deliver next message" pushes the next step into the
+  same `st.session_state` keys a real paste+click would populate, so the
+  existing review screen and Approve/Edit/Reject/Handle Manually buttons work
+  completely unchanged. **Nothing is ever sent to a real Quo** -- this only
+  exercises the local audit log.
+- Delivery is **manual-advance, not timed**: a human is meant to actively
+  review/act on each delivered step, so "arrives automatically" means *the
+  tester never retypes or copy-pastes a message*, not unattended timing.
+- Scenarios cover all 6 requested conversation types (new job x3 sources,
+  reminder/duplicate, corrected info, cancellation, technician status update,
+  closing) **plus two scenarios that deliberately document known
+  classification gaps** rather than hide them -- see section 6.
+- **`tests/test_app_integration.py`** drives `app.py` itself headlessly via
+  `streamlit.testing.v1.AppTest`, one test per scenario, asserting on the
+  resulting `storage.get_audit_timeline()` contents. Each test isolates its
+  own SQLite file (`monkeypatch.setattr(storage, "DB_PATH", ...)` +
+  `st.cache_resource.clear()`) so nothing ever touches the real
+  `data/dispatcher.db` or leaks a cached connection between tests.
+- **Status Update tab** previously had no persistence at all -- confirming a
+  technician's status never wrote anything to the audit log. Now wired the
+  same way the Closing tab already does it (build a `ClassifyResult`
+  manually, call `storage.save_audit_entry`), so status updates are now part
+  of a ticket's permanent history.
+
+Next phase (not started): real Quo API integration, read-only, via
+incoming-message webhooks -- only after the criteria in section 7 are met.
+
+## 6. Known limitations (found, documented, explicitly accepted for V1)
+
+- **Vehicle-make list completeness**: `parser.py`'s `MAKES` list is not
+  exhaustive (e.g. Isuzu is not recognized). Nothing is lost when this
+  happens -- the mention still shows up verbatim in the notes field -- it's
+  just not pulled into the structured `vehicle` field.
+- **Reminder detection is exact-match only**: `storage.classify_incoming`
+  only classifies `DUPLICATE` for a byte-identical repeat. A reminder for the
+  same ticket, reworded even slightly, falls through to `UNRECOGNIZED`. See
+  `tests/test_app_integration.py::test_reworded_reminder_is_a_documented_gap_not_duplicate`.
+- **Cancellation detection is a literal substring check** for the word
+  "cancel". Several real messages hit during manual testing 2026-07-27 ("no
+  longer needs service", "customer found her keys...", "will call back later
+  hung up") never say "cancel" and fall through to `UNRECOGNIZED` today. See
+  `tests/test_app_integration.py::test_cancellation_worded_differently_is_a_documented_gap`.
+- **Intra-message data inconsistency isn't cross-validated**: e.g. a
+  structured `Address:` field's zip code differing from a zip mentioned in
+  the freeform notes of the *same* message isn't flagged -- both are
+  preserved verbatim, but nothing compares them to each other.
+
+None of these cause information loss, an incorrect decision, or incorrect
+routing on their own -- that's exactly why they're accepted limitations
+rather than blocking bugs. Fixing any of them is a deliberate future choice,
+not an oversight.
+
+## 7. Parser V1 stability: acceptance criteria
+
+Defined 2026-07-27 so real-job testing has a bounded exit point instead of
+continuing indefinitely. **Not all met yet** -- this section records the bar,
+not a claim it's been cleared.
+
+1. **Unit tests**: full `pytest` suite green (126 tests today, `tests/test_*.py`).
+2. **Integration tests**: every scenario in `tests/test_app_integration.py`
+   green, including the two documented-gap scenarios passing with their
+   *documented* (not necessarily ideal) expected behavior.
+3. **Manual real-job testing**: the last 3 consecutive batches of 5 real jobs
+   each (15 jobs) processed with zero bugs in the categories that matter --
+   incorrect extraction, incorrect decision, incorrect routing, or
+   information loss. Cosmetic issues don't reset this counter.
+4. **This Known Limitations section (§6)** stays current -- anything newly
+   found-but-accepted gets added here, not left undocumented.
+5. **Sign-off checklist**: Extraction / Decision engine / Formatter / Audit
+   logging each explicitly confirmed via both unit and integration tests.
+6. Once 1-5 are met, this section gets a **"Parser V1 -- STABLE"** marker with
+   the date it was earned; any later behavior change to parser/decision/
+   formatter requires a new dated note here, not silent drift.

@@ -15,13 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import streamlit as st
 
-from dispatcher import storage, updates
+from dispatcher import simulator, storage, updates
 from dispatcher.closing import ClosingInput, render_closing
-from dispatcher.companies import get_company_profile
-from dispatcher.formatter import format_technician_message
 from dispatcher.models import ExtractionStatus
-from dispatcher.parser import extract_job, load_vehicle_rules
-from dispatcher.rules import Verdict, decide, force_handle_manually
+from dispatcher.parser import load_vehicle_rules
+from dispatcher.pipeline import process_raw_message
 from dispatcher.rules.daily import parse_daily_rules
 from dispatcher.rules.hours import check_business_hours
 from dispatcher.rules.service_areas import load_service_areas
@@ -61,6 +59,10 @@ conn = get_db()
 vehicle_rules = get_vehicle_rules()
 service_areas = get_service_areas()
 
+# Must run before any tab below instantiates its widgets -- see the
+# docstring on apply_pending_delivery for why.
+simulator.apply_pending_delivery(conn, vehicle_rules, service_areas)
+
 st.title("Luxor Locksmith — AI Dispatcher (Phase 1)")
 st.caption(
     "Nothing on this screen is ever sent to Quo, WhatsApp, or a technician automatically. "
@@ -71,8 +73,8 @@ _hours = check_business_hours()
 _hours_label = f"Business hours: {'OPEN' if _hours.within_hours else 'CLOSED'} — {_hours.local_time.strftime('%A %H:%M %Z')}"
 (st.success if _hours.within_hours else st.error)(_hours_label)
 
-tab_process, tab_daily, tab_status, tab_closing, tab_audit = st.tabs(
-    ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline"]
+tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator = st.tabs(
+    ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline", "Fake Inbox (Simulator)"]
 )
 
 # ---------------------------------------------------------------- Process --
@@ -81,24 +83,18 @@ with tab_process:
     raw_text = st.text_area("Raw message", height=220, key="raw_text_input")
 
     if st.button("Process", type="primary"):
-        job = extract_job(raw_text, vehicle_rules)
-        classify_result = storage.classify_incoming(conn, job)
-        profile = get_company_profile(job.source)
-        decision = decide(job, profile, service_areas, st.session_state.daily_rules)
-        if classify_result.message_type == MessageType.CLOSING_WITHOUT_DISPATCH:
-            decision = force_handle_manually(decision, classify_result.reason)
-        luxor_message = format_technician_message(job)
+        result = process_raw_message(raw_text, vehicle_rules, service_areas, conn, st.session_state.daily_rules)
 
-        st.session_state.current_job = job
-        st.session_state.current_classify = classify_result
-        st.session_state.current_profile = profile
-        st.session_state.current_decision = decision
-        st.session_state.current_luxor_message = luxor_message
+        st.session_state.current_job = result.job
+        st.session_state.current_classify = result.classify_result
+        st.session_state.current_profile = result.profile
+        st.session_state.current_decision = result.decision
+        st.session_state.current_luxor_message = result.luxor_message
         # The "edit_message" text_area below is keyed, so Streamlit ignores
         # its value= on rerun once session_state already holds that key --
         # without this, processing a second job leaves the box showing the
         # previous job's message. Overwrite it explicitly here.
-        st.session_state.edit_message = luxor_message
+        st.session_state.edit_message = result.luxor_message
 
     job = st.session_state.current_job
     if job is not None:
@@ -208,6 +204,7 @@ with tab_daily:
 with tab_status:
     st.subheader("Technician status update")
     st.caption('Also used to answer company questions like "Any update?" or "Did anyone call?"')
+    st.caption("Uses the ticket from the job most recently processed in the Process Job tab.")
     status_text = st.text_input("Technician's status (paste exactly, confirmed by you)", key="status_text_input")
 
     if st.button("Map status"):
@@ -217,7 +214,21 @@ with tab_status:
     if reply is not None:
         if reply.confirmed:
             st.success(f"Suggested reply: {reply.reply}")
-            if st.button("Approve status reply"):
+            if st.session_state.current_job is None:
+                st.error("Process a job in the Process Job tab first -- a status update needs a ticket to attach to.")
+            elif st.button("Approve status reply"):
+                job = st.session_state.current_job
+                row = conn.execute(
+                    "SELECT id FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)
+                ).fetchone()
+                classify_result = ClassifyResult(
+                    MessageType.STATUS, existing_job_id=row[0] if row else None,
+                    reason="dispatcher-confirmed technician status update",
+                )
+                storage.save_audit_entry(
+                    conn, job, classify_result,
+                    luxor_message=reply.reply, dispatcher_edits=status_text, final_action="Approve",
+                )
                 st.success("Recorded. Copy this reply into Quo yourself.")
         else:
             st.error(reply.reason)
@@ -269,3 +280,7 @@ with tab_audit:
         for event in timeline:
             with st.expander(f"{event['created_at']} — {event['message_type']} — {event['final_action']}"):
                 st.json(event)
+
+# --------------------------------------------------------- Fake inbox (sim) --
+with tab_simulator:
+    simulator.render_fake_inbox_tab(conn, vehicle_rules, service_areas)
