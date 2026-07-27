@@ -31,6 +31,10 @@ DISPATCH_GROUPS_PATH = Path(__file__).resolve().parents[2] / "rules" / "quo_disp
 DEFAULT_LOOKBACK_MINUTES = 15
 LOOKBACK_ENV_VAR = "QUO_POLL_INITIAL_LOOKBACK_MINUTES"
 
+# Audit-log channel tag for a message delivered via this module -- shadow
+# mode: read-only, nothing was ever sent, replied to, or acknowledged.
+SHADOW_MODE_CHANNEL = "shadow_mode_quo_live"
+
 # Confirmed 2026-07-27 against real Quo messages: the literal values are
 # "incoming" and "outgoing".
 INBOUND_DIRECTION_VALUES = {"incoming"}
@@ -173,5 +177,7 @@ def render_quo_live_tab(conn: sqlite3.Connection) -> None:
     if st.button("Load next Quo message into review", disabled=not queue):
         next_item = queue[0]
         st.session_state.quo_pending_queue = queue[1:]
-        st.session_state.sim_pending_delivery = {"kind": "message", "content": next_item.raw_text}
+        st.session_state.sim_pending_delivery = {
+            "kind": "message", "content": next_item.raw_text, "channel": SHADOW_MODE_CHANNEL,
+        }
         st.rerun()

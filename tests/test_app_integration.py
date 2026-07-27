@@ -61,6 +61,38 @@ def timeline_for(ticket):
     return storage.get_audit_timeline(conn, ticket)
 
 
+# ---------------------------------------------------------- Channel tags ---
+MANUAL_PASTE_TEXT = (
+    "Power By Ucallz App\n\nFabricated Locksmith Pro\nTicket: CHANMANUAL1\n"
+    "Name: Test Person\nPhone: (555) 010-1000\n2nd Phone #:\n"
+    "Address: 100 Fake St, Faketown, GA 30301\nDesc: Car lockout\n2015 Toyota Corolla\n"
+)
+
+
+def test_manually_pasted_message_is_tagged_manual_channel(app):
+    """A message typed/pasted directly into the Process tab (not delivered
+    via the simulator or the live Quo tab) must be tagged "manual" -- the
+    default, ordinary path, distinguishable from shadow mode."""
+    process_tab = app.tabs[PROCESS_TAB_INDEX]
+    process_tab.text_area[0].set_value(MANUAL_PASTE_TEXT).run()
+    process_tab = app.tabs[PROCESS_TAB_INDEX]
+    [b for b in process_tab.button if b.label == "Process"][0].click().run()
+    click_process_action(app, "Approve")
+
+    timeline = timeline_for("CHANMANUAL1")
+    assert len(timeline) == 1
+    assert timeline[0]["channel"] == "manual"
+
+
+def test_simulator_delivered_message_is_tagged_simulator_channel(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    timeline = timeline_for("SIM2AG")
+    assert timeline[0]["channel"] == "simulator"
+
+
 # ------------------------------------------------------------- New job -----
 @pytest.mark.parametrize(
     "title, ticket",
@@ -275,6 +307,9 @@ def test_quo_live_message_flows_through_same_pipeline_and_audit_log(app, monkeyp
     assert timeline[0]["message_type"] == "NEW"
     assert timeline[0]["final_action"] == "Approve"
     assert timeline[0]["raw_message"] == QUO_AGN_TEXT
+    # Shadow mode: the audit record must be clearly distinguishable from a
+    # manually pasted or simulator-delivered message.
+    assert timeline[0]["channel"] == quo_ingest.SHADOW_MODE_CHANNEL
 
     # Polling again with the same stub (same message) must not re-queue it.
     quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]

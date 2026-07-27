@@ -168,6 +168,10 @@ def apply_pending_delivery(conn, vehicle_rules, service_areas) -> None:
         st.session_state.current_decision = result.decision
         st.session_state.current_luxor_message = result.luxor_message
         st.session_state.edit_message = result.luxor_message
+        # Who produced this delivery -- defaults to "simulator" since that's
+        # this module's own delivery path; quo_ingest tags its own real,
+        # read-only deliveries with "shadow_mode_quo_live" explicitly.
+        st.session_state.current_channel = delivery.get("channel", "simulator")
 
     elif kind == "status_phrase":
         st.session_state.status_text_input = content

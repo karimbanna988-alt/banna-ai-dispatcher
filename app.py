@@ -56,6 +56,7 @@ for key, default in (
     ("status_reply", None),
     ("last_closing_result", None),
     ("quo_pending_queue", []),
+    ("current_channel", "manual"),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -96,6 +97,10 @@ with tab_process:
         st.session_state.current_profile = result.profile
         st.session_state.current_decision = result.decision
         st.session_state.current_luxor_message = result.luxor_message
+        # A message typed/pasted directly here is always "manual" -- only
+        # simulator/Quo-live deliveries (via apply_pending_delivery) tag a
+        # different channel.
+        st.session_state.current_channel = "manual"
         # The "edit_message" text_area below is keyed, so Streamlit ignores
         # its value= on rerun once session_state already holds that key --
         # without this, processing a second job leaves the box showing the
@@ -107,6 +112,13 @@ with tab_process:
         classify_result = st.session_state.current_classify
         decision = st.session_state.current_decision
         luxor_message = st.session_state.current_luxor_message
+
+        if st.session_state.current_channel == quo_ingest.SHADOW_MODE_CHANNEL:
+            st.info(
+                "🔒 **SHADOW MODE** — this message was polled read-only from the real Quo account. "
+                "Nothing has been or will be sent, replied to, acknowledged, or modified in Quo. "
+                "Approve/Edit/Handle Manually below only record a local comparison record."
+            )
 
         st.subheader("2. Detected source")
         st.write(f"**{job.source.value}** (confidence {job.source_confidence}) — {job.source_reason}")
@@ -165,14 +177,19 @@ with tab_process:
 
         def _finalize(action: str) -> None:
             edits = edited_message if edited_message != luxor_message else None
+            channel = st.session_state.current_channel
             storage.save_audit_entry(
                 conn, job, classify_result, decision=decision,
                 suggested_quo_reply=decision.quo_reply_suggestion,
                 luxor_message=luxor_message,
                 dispatcher_edits=edits or (edit_notes or None),
                 final_action=action,
+                channel=channel,
             )
-            st.success(f"Recorded action: {action}. Nothing was sent automatically — copy the approved text yourself.")
+            if channel == quo_ingest.SHADOW_MODE_CHANNEL:
+                st.success(f"Recorded locally as SHADOW MODE — {action}. Nothing was sent to Quo.")
+            else:
+                st.success(f"Recorded action: {action}. Nothing was sent automatically — copy the approved text yourself.")
 
         if col1.button("Approve"):
             _finalize("Approve")
@@ -235,6 +252,7 @@ with tab_status:
                 storage.save_audit_entry(
                     conn, job, classify_result,
                     luxor_message=reply.reply, dispatcher_edits=status_text, final_action="Approve",
+                    channel=st.session_state.current_channel,
                 )
                 st.success("Recorded. Copy this reply into Quo yourself.")
         else:
@@ -271,6 +289,7 @@ with tab_closing:
                 )
                 storage.save_audit_entry(
                     conn, job, classify_result, luxor_message=result.text, final_action="Approve",
+                    channel=st.session_state.current_channel,
                 )
                 st.success("Closing recorded in the audit log.")
         else:
@@ -286,7 +305,9 @@ with tab_audit:
         if not timeline:
             st.info("No events found for this ticket.")
         for event in timeline:
-            with st.expander(f"{event['created_at']} — {event['message_type']} — {event['final_action']}"):
+            channel = event.get("channel") or "manual"
+            badge = "🔒 SHADOW MODE — NOT SENT — " if channel == quo_ingest.SHADOW_MODE_CHANNEL else ""
+            with st.expander(f"{badge}{event['created_at']} — {event['message_type']} — {event['final_action']}"):
                 st.json(event)
 
 # --------------------------------------------------------- Fake inbox (sim) --

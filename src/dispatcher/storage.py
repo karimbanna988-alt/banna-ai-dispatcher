@@ -103,6 +103,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Added 2026-07-27 for shadow mode: which pipeline entry point produced
+    # this record -- "manual" (pasted/typed), "simulator" (fake inbox), or
+    # "shadow_mode_quo_live" (real Quo message polled read-only, never
+    # sent). CREATE TABLE IF NOT EXISTS above is a no-op on an
+    # already-existing events table, so this column needs an explicit,
+    # idempotent migration for databases created before this column existed.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "channel" not in existing_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN channel TEXT DEFAULT 'manual'")
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -259,6 +268,7 @@ def save_audit_entry(
     luxor_message: Optional[str] = None,
     dispatcher_edits: Optional[str] = None,
     final_action: Optional[str] = None,
+    channel: str = "manual",
 ) -> int:
     now = _now()
     ticket = job.ticket_number.value
@@ -300,15 +310,15 @@ def save_audit_entry(
             job_id, ticket_number, raw_message, message_type, source,
             confidence, confidence_reasons_json, decision_verdict,
             decision_reasons_json, suggested_quo_reply, luxor_message,
-            dispatcher_edits, final_action, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            dispatcher_edits, final_action, created_at, channel
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id, ticket, job.raw_text, classify_result.message_type.value, job.source.value,
             job.overall_confidence, json.dumps(job.status_reasons),
             decision.verdict.value if decision else None,
             json.dumps(decision.reasons) if decision else None,
-            suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now,
+            suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now, channel,
         ),
     )
     conn.commit()
