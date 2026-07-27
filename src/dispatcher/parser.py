@@ -63,7 +63,18 @@ VEHICLE_RE = re.compile(
     # HOnda CRV..."): a plain \s* here matched across the blank line and
     # glued the second occurrence's leading year onto the first match,
     # producing a garbled "2014 HOnda CRV\n\n2014" vehicle value.
-    rf"\s*(?P<model>[A-Za-z0-9]+)?(?:[ \t]|\n(?!\n))*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
+    # The model is normally a single word (Civic, Prius, F150, A4). It's
+    # only allowed to include a second word when a year immediately follows
+    # that second word (confirmed 2026-07-27 from a real Lucky job: "jeep
+    # grand cherokee 2024" -- a single-word model swallowed only "grand",
+    # leaving "cherokee 2024" behind, which meant no year was found at all
+    # and incorrectly forced HANDLE_MANUALLY for a plain, unrestricted 2024
+    # vehicle). The second word's lookahead requires \b\d{2}\b (not just
+    # \d{2}) so it can't be satisfied by splitting a 4-digit year in half
+    # (e.g. "20" + "14") -- that exact split reintroduced the blank-line
+    # bug fixed above when tested with a lookahead lacking the boundary.
+    rf"\s*(?P<model>[A-Za-z0-9]+(?:\s+[A-Za-z0-9]+(?=\s*(?:(?:19|20)\d{{2}}\b|\b\d{{2}}\b)))?)?"
+    rf"(?:[ \t]|\n(?!\n))*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
     re.IGNORECASE,
 )
 

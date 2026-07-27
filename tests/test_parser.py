@@ -301,3 +301,18 @@ def test_vehicle_regex_does_not_cross_a_blank_line(rules):
     vehicle value instead of just "2014 HOnda CRV"."""
     job = extract_job(load("main_leads_vehicle_repeated_across_blank_line.txt"), rules)
     assert job.vehicle.value == "2014 HOnda CRV"
+
+
+def test_two_word_vehicle_model_with_trailing_year_is_captured(rules):
+    """Confirmed 2026-07-27 from a real Lucky job: "jeep grand cherokee
+    2024" has a two-word model ("grand cherokee"). Because the model group
+    only ever captured a single word, it grabbed "grand" and stopped --
+    "cherokee 2024" was left over, so no year was found at all. This
+    incorrectly forced HANDLE_MANUALLY ("no model year found") for a plain,
+    unrestricted 2024 vehicle. Must now capture the full model and year,
+    and must NOT regress the blank-line fix above by letting the two-word
+    lookahead split a 4-digit year in half to satisfy itself."""
+    job = extract_job(load("lucky_two_word_vehicle_model_with_year.txt"), rules)
+    assert job.vehicle.value == "jeep grand cherokee 2024"
+    assert job.vehicle_restriction_status == "allowed"
+    assert job.status == ExtractionStatus.OK
