@@ -89,6 +89,11 @@ with tab_process:
         st.session_state.current_profile = profile
         st.session_state.current_decision = decision
         st.session_state.current_luxor_message = luxor_message
+        # The "edit_message" text_area below is keyed, so Streamlit ignores
+        # its value= on rerun once session_state already holds that key --
+        # without this, processing a second job leaves the box showing the
+        # previous job's message. Overwrite it explicitly here.
+        st.session_state.edit_message = luxor_message
 
     job = st.session_state.current_job
     if job is not None:

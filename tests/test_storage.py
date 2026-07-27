@@ -157,6 +157,6 @@ def test_full_pipeline_writes_a_complete_audit_entry(conn, vehicle_rules):
     entry = timeline[0]
     assert entry["raw_message"] == raw
     assert entry["decision_verdict"] == "ACCEPT"
-    assert entry["luxor_message"].startswith("Luxor Locksmith")
+    assert entry["luxor_message"].startswith("LUXOR LOCKSMITH")
     assert entry["final_action"] == "Approve"
     assert job_id is not None
