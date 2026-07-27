@@ -290,3 +290,14 @@ def test_second_desc_line_is_preserved_not_used_as_notes_anchor(rules):
     assert job.notes.value is not None
     assert "Desc: Car Key" in job.notes.value
     assert "2005 Lincoln Navigation" in job.notes.value
+
+
+def test_vehicle_regex_does_not_cross_a_blank_line(rules):
+    """Confirmed 2026-07-27 from a real Main Leads job: the same vehicle
+    mention ("2014 HOnda CRV") appeared twice, separated by a blank line.
+    A plain \\s* between the model and the trailing year previously matched
+    across that blank line, gluing the second occurrence's leading year
+    onto the first match and producing a garbled "2014 HOnda CRV\\n\\n2014"
+    vehicle value instead of just "2014 HOnda CRV"."""
+    job = extract_job(load("main_leads_vehicle_repeated_across_blank_line.txt"), rules)
+    assert job.vehicle.value == "2014 HOnda CRV"

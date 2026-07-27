@@ -55,7 +55,15 @@ ADDRESS_TAIL_RE = re.compile(
 )
 VEHICLE_RE = re.compile(
     rf"\b(?:(?P<year1>(?:19|20)\d{{2}})\s+)?(?P<make>{_MAKES_PATTERN})\b"
-    rf"\s*(?P<model>[A-Za-z0-9]+)?\s*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
+    # The gap before year2 allows wrapping a single line break (some real
+    # messages put the model and year on adjacent lines with no blank line
+    # between them), but must stop at a genuine blank line -- confirmed
+    # 2026-07-27 from a real Main Leads job that repeated the same vehicle
+    # mention twice, separated by a blank line ("2014 HOnda CRV\n\n2014
+    # HOnda CRV..."): a plain \s* here matched across the blank line and
+    # glued the second occurrence's leading year onto the first match,
+    # producing a garbled "2014 HOnda CRV\n\n2014" vehicle value.
+    rf"\s*(?P<model>[A-Za-z0-9]+)?(?:[ \t]|\n(?!\n))*(?:(?P<year2>(?:19|20)\d{{2}})|(?P<year2_2d>\d{{2}})\b)?",
     re.IGNORECASE,
 )
 
