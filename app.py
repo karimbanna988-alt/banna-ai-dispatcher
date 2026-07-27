@@ -13,9 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import streamlit as st
 
-from dispatcher import simulator, storage, updates
+from dispatcher import quo_ingest, simulator, storage, updates
 from dispatcher.closing import ClosingInput, render_closing
 from dispatcher.models import ExtractionStatus
 from dispatcher.parser import load_vehicle_rules
@@ -51,6 +55,7 @@ for key, default in (
     ("current_luxor_message", None),
     ("status_reply", None),
     ("last_closing_result", None),
+    ("quo_pending_queue", []),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -73,8 +78,9 @@ _hours = check_business_hours()
 _hours_label = f"Business hours: {'OPEN' if _hours.within_hours else 'CLOSED'} — {_hours.local_time.strftime('%A %H:%M %Z')}"
 (st.success if _hours.within_hours else st.error)(_hours_label)
 
-tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator = st.tabs(
-    ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline", "Fake Inbox (Simulator)"]
+tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator, tab_quo_live = st.tabs(
+    ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline",
+     "Fake Inbox (Simulator)", "Quo Inbox (Live)"]
 )
 
 # ---------------------------------------------------------------- Process --
@@ -284,3 +290,7 @@ with tab_audit:
 # --------------------------------------------------------- Fake inbox (sim) --
 with tab_simulator:
     simulator.render_fake_inbox_tab(conn, vehicle_rules, service_areas)
+
+# ------------------------------------------------------- Quo inbox (live) --
+with tab_quo_live:
+    quo_ingest.render_quo_live_tab(conn)

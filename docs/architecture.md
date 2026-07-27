@@ -1,6 +1,6 @@
 # Phase 1 Architecture — Complete Execution Flow
 
-**Status: Phase 1 core system is built and tested (126 pytest cases passing, including app.py integration tests -- see section 5).**
+**Status: Phase 1 core system is built and tested (147 pytest cases passing, including app.py integration tests -- see sections 5 and 8).**
 This is the full design for Phase 1: everything from a raw Quo message landing
 in the dispatcher's clipboard to the dispatcher pressing **Approve** or
 **Handle Manually**. Every module below is now `[DONE]`; where a real business
@@ -141,9 +141,13 @@ Three side flows use the same core modules but enter the pipeline differently
 | `src/dispatcher/pipeline.py` | The single `extract_job → classify_incoming → get_company_profile → decide → format_technician_message` sequence, shared by `app.py`'s Process tab and the fake-inbox simulator | raw text, vehicle rules, service areas, conn, daily rules | `ProcessResult` | **DONE** |
 | `src/dispatcher/simulator.py` | Fake Quo inbox: scripted, ordered conversation scenarios delivered into the same session_state the real UI uses -- no real Quo message is ever sent | scenario selection + step index | populates the Process/Status/Closing tabs as if a real message arrived | **DONE** |
 | `simulator/scenarios/**` | Scenario fixture data (fake, `SIM*` ticket prefixes) — one folder per scenario, ordered step files | — | — | **DONE** |
-| `app.py` | Streamlit UI; orchestrates every module above; Approve/Edit/Reject/Handle Manually + Daily Rules/Status/Closing/Audit/Fake-Inbox tabs; shows live business-hours status | dispatcher input | approval screen + writes to storage | **DONE** |
+| `src/dispatcher/quo_client.py` | Read-only Quo (OpenPhone) API client -- GET only, structurally incapable of sending/modifying anything | HTTP calls to `api.quo.com/v1` | `Conversation`/`QuoMessage`/`Contact` objects | **DONE** |
+| `rules/quo_dispatch_groups.yaml` | The four confirmed dispatch-group Quo Contact ids (Lucky/CLOSINGS/AGN/Main Leads 2) + our Quo phone number id -- business config, not code | — | — | **DONE (confirmed 2026-07-27)** |
+| `src/dispatcher/quo_ingest.py` | Direct polling of the configured dispatch-group contacts (not conversation discovery) + fetch-time dedup; renders the "Quo Inbox (Live)" tab | `QuoClient`, `conn` | queued raw messages fed into `pipeline.process_raw_message` | **DONE** |
+| `scripts/quo_probe_readonly.py` | One-off manual script (outside `tests/`, not pytest-collected): real read-only GET calls to confirm envelope/direction/text-format assumptions | your real `QUO_API_KEY` | printed JSON | **DONE (run and confirmed 2026-07-27)** |
+| `app.py` | Streamlit UI; orchestrates every module above; Approve/Edit/Reject/Handle Manually + Daily Rules/Status/Closing/Audit/Fake-Inbox/Quo-Live tabs; shows live business-hours status | dispatcher input | approval screen + writes to storage | **DONE** |
 | `tests/test_*.py` | Unit coverage of every `src/dispatcher` module in isolation | — | — | **DONE** |
-| `tests/test_app_integration.py` | Integration coverage of `app.py` itself via `streamlit.testing.v1.AppTest`, driven through the fake-inbox simulator -- one test per conversation scenario, asserting on the resulting audit log | — | — | **DONE** (126 tests passing overall) |
+| `tests/test_app_integration.py` | Integration coverage of `app.py` itself via `streamlit.testing.v1.AppTest`, driven through the fake-inbox simulator and the live Quo tab (mocked client) -- one test per scenario, asserting on the resulting audit log | — | — | **DONE** (147 tests passing overall) |
 
 ## 3. Key data contracts (as implemented)
 
@@ -288,8 +292,10 @@ covered `src/dispatcher/*` in isolation).
   manually, call `storage.save_audit_entry`), so status updates are now part
   of a ticket's permanent history.
 
-Next phase (not started): real Quo API integration, read-only, via
-incoming-message webhooks -- only after the criteria in section 7 are met.
+Next phase: real Quo API integration, receive-only -- see section 8. Started
+2026-07-27, ahead of the section 7 criteria being fully met (that gate is
+for *behavior* stability; wiring up a real, structurally read-only message
+source doesn't change parser/decision/formatter behavior at all).
 
 ## 6. Known limitations (found, documented, explicitly accepted for V1)
 
@@ -337,3 +343,102 @@ not a claim it's been cleared.
 6. Once 1-5 are met, this section gets a **"Parser V1 -- STABLE"** marker with
    the date it was earned; any later behavior change to parser/decision/
    formatter requires a new dated note here, not silent drift.
+
+## 8. Real Quo API integration (2026-07-27, receive-only)
+
+Quo is the rebranded OpenPhone SMS platform (`api.quo.com`). This phase
+connects to the real API in **receive-only mode, structurally, not by
+convention**: `src/dispatcher/quo_client.py` contains no function capable
+of POST/PUT/PATCH/DELETE to Quo -- only GET. It is not possible for this
+code to send a reply, register a webhook, or otherwise modify the Quo
+account, because that capability does not exist in the module. A test
+(`test_module_source_contains_no_write_http_verbs` in
+`tests/test_quo_client.py`) enforces this by grepping the module's own
+source and asserting none of those verbs appear.
+
+- **`src/dispatcher/quo_client.py`**: `QuoClient` wraps `GET /v1/conversations`
+  and `GET /v1/messages` with auto-pagination (`nextPageToken`), a
+  client-side throttle (Quo's documented limit: 10 req/sec/key), and 429
+  retry-with-backoff. Auth: `Authorization: <raw key>` header (confirmed
+  from Quo's docs -- **not** a Bearer token). API key comes only from the
+  `QUO_API_KEY` env var (see `.env.example`), never hardcoded.
+- **Polling, not webhooks, this phase**: Quo does support webhooks
+  (`POST /v1/webhooks/messages`), but registering one is itself a write to
+  the Quo account, and receiving one requires this locally-run app to be
+  publicly reachable, which it isn't.
+- **Direct polling of known dispatch-group contacts, not conversation
+  discovery** (redesigned 2026-07-27 after real-world testing): the
+  original design called `GET /v1/conversations` with no filters to
+  discover new/unknown senders generically. Testing against the real
+  account found this endpoint's "most recent" ordering lags real message
+  activity by over an hour -- new incoming messages from the four known
+  dispatch groups (Lucky, CLOSINGS, AGN, Main Leads 2) did not appear in
+  the conversations list even minutes after arriving, though they were
+  fetchable directly via `GET /v1/messages` the whole time. The business
+  owner confirmed these four specific Quo contacts are the only sources
+  that matter, so polling now targets them directly instead:
+  `rules/quo_dispatch_groups.yaml` lists each group's stable Quo Contact
+  id (**not** a phone number -- resolved fresh via `GET /v1/contacts/{id}`
+  on every poll, so a renumbered contact never needs a code change) plus
+  `our_phone_number_id` (confirmed 2026-07-27: only one Quo number exists
+  on this account). Also confirmed against real messages: a conversation's
+  displayed name in the Quo UI ("Lucky 🍀" etc.) is **not** a field on the
+  conversation object (`name` was `null` on all 1,000 most recent
+  conversations checked) -- it's a saved Contact label
+  (`defaultFields.firstName`/`lastName`/`company`), which is why contacts,
+  not conversations, are the right thing to poll by.
+- **`src/dispatcher/quo_ingest.py`**: `poll_for_new_messages(conn, client,
+  config=None)` -- loads `rules/quo_dispatch_groups.yaml` (or an injected
+  `QuoPollConfig` for tests), resolves each configured contact's current
+  phone number, and polls `GET /v1/messages` directly for each. Checkpoint-
+  based (`quo_poll_state` table; first-ever poll uses a bounded lookback
+  window, `QUO_POLL_INITIAL_LOOKBACK_MINUTES`, default 15 min, rather than
+  importing the org's entire history), filters to inbound messages only
+  (`direction == "incoming"`, confirmed against real messages -- the other
+  observed value is `"outgoing"`), and dedupes against a
+  `quo_processed_messages` table **written at fetch time** -- so an
+  overlapping poll window or an app restart is structurally unable to
+  re-queue the same message, regardless of what the dispatcher later does
+  with it. Raw message text is handed to `pipeline.process_raw_message()`
+  **unmodified**. Each queued message carries its source group's label
+  (e.g. "AGN") so the dispatcher can see which company it came from before
+  loading it into review.
+- **Confirmed against real messages 2026-07-27**: Main Leads 2 and AGN
+  send the exact structured formats the parser already expects
+  (`Power By Ucallz App`/`Ticket:` and `Ref: AGN Locksmith Services`/`PDL:`
+  respectively) as the literal SMS body -- no transformation needed between
+  Quo and the parser. CLOSINGS is different by design, not a bug: it's a
+  back-and-forth thread where Lucky sends short operational replies and
+  **we** send the actual structured closing report as an *outgoing*
+  message (generated by the existing Closing tab) -- the inbound filter
+  correctly skips our own outgoing closing text there.
+- **UI**: a 7th, appended "Quo Inbox (Live)" tab in `app.py`
+  (`quo_ingest.render_quo_live_tab`). "Poll Quo now" is a manual button, not
+  a timer -- same reasoning as the simulator's manual-advance design: a
+  human has to review/act on each message regardless, so a background timer
+  adds real complexity for no workflow benefit. "Load next Quo message into
+  review" reuses the fake-inbox simulator's exact delivery mechanism
+  unmodified (`st.session_state.sim_pending_delivery`,
+  `simulator.apply_pending_delivery`) -- it has no idea whether the text
+  came from a scenario fixture or a real Quo message, so no new delivery
+  code path was needed, only a new producer of the same payload shape. From
+  there: identical Approve/Edit/Reject/Handle Manually -> `_finalize()` ->
+  `storage.save_audit_entry` as every other message source.
+- **Confirmed against real API responses 2026-07-27** (`scripts/quo_probe_readonly.py`
+  plus a manual scan of the four dispatch groups): the JSON envelope is
+  `{"data": [...], "nextPageToken": ..., "totalItems": ...}` exactly as
+  coded (`quo_client._unwrap_list()`), and `direction` is literally
+  `"incoming"`/`"outgoing"` (`quo_ingest.INBOUND_DIRECTION_VALUES`) --
+  both matched the original documentation-only assumptions, no code
+  changes were needed for either.
+- **Tests**: `tests/test_quo_client.py` and `tests/test_quo_ingest.py` --
+  zero real network calls, everything mocked/stubbed (one test does load
+  the real `rules/quo_dispatch_groups.yaml` to confirm it parses and lists
+  the four expected groups, but never makes a network call with it).
+  Extended `tests/test_app_integration.py` with the same AppTest-driven
+  pattern used for every simulator scenario, using a monkeypatched fake
+  `QuoClient`.
+- **Not yet done**: an actual real message hasn't been run through the
+  live "Poll Quo now" button in the running app and approved end-to-end
+  yet -- confirmed only via direct read-only API probing so far, plus the
+  full mocked test suite exercising the identical code path.

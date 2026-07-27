@@ -1,0 +1,47 @@
+# Known Quo dispatch-group contacts to poll directly for incoming job
+# messages (business config, not code).
+#
+# Confirmed by the business owner 2026-07-27: rather than discovering
+# conversations generically via GET /v1/conversations (which was found to
+# lag real message activity by over an hour during testing -- new incoming
+# messages from these exact four groups did not appear in the "most
+# recent" conversations list even though they were only minutes old), the
+# dispatcher polls these four known, named contacts directly via
+# GET /v1/messages, using each contact's phone number.
+#
+# quo_contact_id is Quo's own stable Contact id (from GET /v1/contacts),
+# NOT a phone number -- poll_for_new_messages() resolves it to a current
+# phone number via GET /v1/contacts/{id} on every poll, so a renumbered
+# contact never needs a code or config change here. Find a contact's id
+# via the Quo UI or GET /v1/contacts.
+#
+# To add a new dispatch group: find its contact in Quo, copy the contact
+# id, add an entry below. No code changes needed.
+
+# Confirmed 2026-07-27 via the API: only one phone number exists on this
+# account so far. If a second Quo number is ever added, this needs
+# updating -- find it via GET /v1/conversations (phoneNumberId field) or
+# the Quo UI's phone numbers settings.
+our_phone_number_id: "PNz0UUMzgr"
+
+dispatch_groups:
+  - label: Lucky
+    quo_contact_id: "68b6f5181f34e2050215b8e2"
+    notes: "Lucky dispatch group -- confirmed 2026-07-27"
+
+  - label: CLOSINGS
+    quo_contact_id: "68b6f559e295510502352f6e"
+    notes: >
+      Lucky closings group -- confirmed 2026-07-27. Mostly short
+      operational replies from Lucky; the actual closing report is SENT
+      BY us as an outgoing message (via the Closing tab), not received
+      here. Incoming messages in this thread are still worth surfacing
+      for review, just don't expect them to look like a job dispatch.
+
+  - label: AGN
+    quo_contact_id: "6868124428fcbbf702d566a0"
+    notes: "AGN dispatch group -- confirmed 2026-07-27"
+
+  - label: Main Leads 2
+    quo_contact_id: "686dc5703413dd1202ff13e3"
+    notes: "Our ad-generated jobs (Main Leads) -- confirmed 2026-07-27"

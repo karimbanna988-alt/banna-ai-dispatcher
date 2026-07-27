@@ -11,17 +11,28 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from dispatcher import storage
+from dispatcher import quo_ingest, storage
+from dispatcher.quo_client import Contact, QuoMessage
+from dispatcher.quo_ingest import load_dispatch_groups
 
 SIM_TAB_INDEX = 5
 PROCESS_TAB_INDEX = 0
 STATUS_TAB_INDEX = 2
 CLOSING_TAB_INDEX = 3
+QUO_LIVE_TAB_INDEX = 6
 
 
 @pytest.fixture()
 def app(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "DB_PATH", tmp_path / "test.db")
+    # app.py calls load_dotenv() on every run, which would otherwise load a
+    # real QUO_API_KEY from a developer's local .env into this test process.
+    # python-dotenv's load_dotenv() never overrides a key that's already set,
+    # so pre-setting it to "" here keeps the real key out of test runs
+    # entirely -- no real credential is ever loaded, let alone used, by the
+    # automated suite. Individual tests override this with their own fake
+    # key via monkeypatch.setenv when they need the Quo tab "configured".
+    monkeypatch.setenv("QUO_API_KEY", "")
     st.cache_resource.clear()
     at = AppTest.from_file("app.py", default_timeout=30)
     at.run()
@@ -187,3 +198,86 @@ def test_closing_is_rejected_for_a_company_with_no_template(app):
 
     timeline = timeline_for("SIM11UN")
     assert [e["message_type"] for e in timeline] == ["NEW"]
+
+
+# ---------------------------------------------------------- Quo live tab ---
+def _fake_quo_client_factory(contacts_by_id, messages_by_phone):
+    class _Stub:
+        def get_contact(self, contact_id):
+            return contacts_by_id[contact_id]
+
+        def iter_messages(self, *, phone_number_id, participants, **filters):
+            key = participants[0] if participants else None
+            return iter(messages_by_phone.get(key, []))
+
+    def factory(*args, **kwargs):
+        return _Stub()
+
+    return factory
+
+
+QUO_AGN_TEXT = (
+    "Ref: AGN Locksmith Services\nPDL: QLIVE1\nN: Pat\n"
+    "Ph: 1-555-010-9900 (Job Ext: 700)\nAddr: 400 Fake Way , Faketown, NC, 27500\n"
+    "Desc: Car Lockout [19+]\nOccu: Locksmith\n"
+)
+
+
+def test_quo_live_tab_shows_error_when_api_key_missing(app, monkeypatch):
+    monkeypatch.delenv("QUO_API_KEY", raising=False)
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    assert quo_tab.error[0].value.startswith("QUO_API_KEY is not set")
+    assert quo_tab.button == []
+
+
+def test_quo_live_message_flows_through_same_pipeline_and_audit_log(app, monkeypatch):
+    monkeypatch.setenv("QUO_API_KEY", "test-key-not-real")
+
+    # Uses the real rules/quo_dispatch_groups.yaml -- poll_for_new_messages
+    # will call get_contact() for every configured group, so the stub needs
+    # an entry for each of the four real ones, not just the one we care
+    # about for this test.
+    real_config = load_dispatch_groups()
+    agn_phone = "+15550109900"
+    contacts_by_id = {
+        g.quo_contact_id: Contact(
+            id=g.quo_contact_id, first_name=g.label, last_name=None, company=None,
+            phone_numbers=[agn_phone] if g.label == "AGN" else [],
+        )
+        for g in real_config.dispatch_groups
+    }
+    inbound = QuoMessage(
+        id="MSGLIVE1", to="PNus", from_number=agn_phone, text=QUO_AGN_TEXT,
+        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVLIVE1", direction="incoming",
+        status="delivered", created_at="2026-07-27T10:00:00Z", updated_at="2026-07-27T10:00:00Z",
+    )
+    monkeypatch.setattr(
+        quo_ingest, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}),
+    )
+    app.run()  # re-run so the newly-set QUO_API_KEY env var takes effect
+
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    quo_tab.button[0].click().run()  # "Poll Quo now"
+    assert len(app.exception) == 0
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    assert "Found 1 new message" in quo_tab.success[0].value
+
+    quo_tab.button[1].click().run()  # "Load next Quo message into review"
+    assert len(app.exception) == 0
+
+    # Same review screen, same pipeline, as every other message source.
+    process_tab = app.tabs[PROCESS_TAB_INDEX]
+    assert any("AGN" in md.value for md in process_tab.markdown)
+    click_process_action(app, "Approve")
+
+    timeline = timeline_for("QLIVE1")
+    assert len(timeline) == 1
+    assert timeline[0]["message_type"] == "NEW"
+    assert timeline[0]["final_action"] == "Approve"
+    assert timeline[0]["raw_message"] == QUO_AGN_TEXT
+
+    # Polling again with the same stub (same message) must not re-queue it.
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    quo_tab.button[0].click().run()
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    assert "Found 0 new message" in quo_tab.success[0].value

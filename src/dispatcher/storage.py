@@ -98,6 +98,29 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Single-row table (id=1 enforced) tracking the last successful Quo poll
+    # checkpoint -- one dispatcher polling one org.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quo_poll_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_checkpoint TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    # Every Quo message id that has ever been fetched, recorded at fetch
+    # time (not at Approve/Reject time) -- makes overlapping poll windows
+    # or an app restart structurally unable to re-queue the same message.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quo_processed_messages (
+            message_id TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            fetched_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -229,3 +252,32 @@ def get_audit_timeline(conn: sqlite3.Connection, ticket_number: str) -> List[dic
     ).fetchall()
     columns = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+def get_quo_checkpoint(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT last_checkpoint FROM quo_poll_state WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+def set_quo_checkpoint(conn: sqlite3.Connection, iso_ts: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO quo_poll_state (id, last_checkpoint, updated_at) VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET last_checkpoint = excluded.last_checkpoint, updated_at = excluded.updated_at
+        """,
+        (iso_ts, _now()),
+    )
+    conn.commit()
+
+
+def is_quo_message_processed(conn: sqlite3.Connection, message_id: str) -> bool:
+    row = conn.execute("SELECT 1 FROM quo_processed_messages WHERE message_id = ?", (message_id,)).fetchone()
+    return row is not None
+
+
+def mark_quo_message_processed(conn: sqlite3.Connection, message_id: str, conversation_id: Optional[str]) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO quo_processed_messages (message_id, conversation_id, fetched_at) VALUES (?, ?, ?)",
+        (message_id, conversation_id, _now()),
+    )
+    conn.commit()
