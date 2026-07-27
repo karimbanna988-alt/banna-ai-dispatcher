@@ -1,10 +1,13 @@
 """The accept/pass/needs-review/handle-manually decision engine.
 
-Combines: the parser's own hard HANDLE_MANUALLY override, the permanent
-service-area mapping, today's daily rules, and vehicle/service restrictions.
-Never guesses -- every branch that can't confidently produce ACCEPT or PASS
-falls back to HANDLE_MANUALLY. See docs/architecture.md section 3 for the
-data contracts this was designed against.
+Combines, in order: the parser's own hard HANDLE_MANUALLY override,
+permanent business hours (America/New_York, every day), the permanent
+service-area mapping, each area's recurring weekly day off (if any), daily
+technician-availability/restriction exceptions, and vehicle/service
+restrictions. Never guesses -- every branch that can't confidently produce
+ACCEPT or PASS falls back to HANDLE_MANUALLY. See docs/architecture.md
+section 3 for the data contracts this was designed against, and
+docs/workflow.md for the business rules confirmed 2026-07-27.
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from ..companies.base import CompanyProfile
 from ..models import ExtractedJob, ExtractionStatus
 from ..parser import REQUIRED_FIELDS
 from .daily import DailyRules
-from .service_areas import ServiceAreaRecord, find_service_area
+from .hours import check_business_hours
+from .service_areas import ServiceAreaRecord, find_service_area, is_recurring_day_off
 
 # Below this confidence, a would-be ACCEPT/PASS is downgraded to NEEDS_REVIEW
 # so the dispatcher double-checks it before approving, without treating it
@@ -48,10 +52,10 @@ class Decision:
 def force_handle_manually(decision: Decision, reason: str) -> Decision:
     """Escalate an already-computed Decision to HANDLE_MANUALLY, prepending
     `reason`. For cross-cutting overrides decided outside decide()'s own
-    area/vehicle/daily-rule checks -- e.g. the orchestration layer forces
-    this when storage.classify_incoming() reports a closing arriving with
-    no prior dispatch for its ticket (an anomaly that must never be treated
-    as a normal accept/pass job)."""
+    checks -- e.g. the orchestration layer forces this when
+    storage.classify_incoming() reports a closing arriving with no prior
+    dispatch for its ticket (an anomaly that must never be treated as a
+    normal accept/pass job)."""
     decision.verdict = Verdict.HANDLE_MANUALLY
     decision.reasons = [reason] + decision.reasons
     return decision
@@ -70,128 +74,115 @@ def decide(
     service_areas: List[ServiceAreaRecord],
     daily_rules: Optional[DailyRules] = None,
     now: Optional[datetime] = None,
+    business_now: Optional[datetime] = None,
 ) -> Decision:
+    """`now` (naive or aware) is only used for daily_rules.is_expired().
+    `business_now` must be timezone-aware if provided (defaults to the real
+    current time) and drives both the business-hours check and which
+    weekday "today" is for recurring day-off matching -- always computed in
+    America/New_York, never the operator's local clock."""
     missing, conflicts = _missing_and_conflicting(job)
     restrictions_triggered = (
         [job.vehicle_restriction_reason] if job.vehicle_restriction_status in ("restricted", "unclear") else []
     )
 
-    # Hard override: the parser already determined this can't be trusted.
-    if job.status == ExtractionStatus.HANDLE_MANUALLY:
+    def _decision(verdict: Verdict, reasons: List[str], dispatch_group: Optional[str] = None,
+                  quo_reply_suggestion: Optional[str] = None) -> Decision:
         return Decision(
-            verdict=Verdict.HANDLE_MANUALLY,
-            confidence=job.overall_confidence,
-            reasons=list(job.status_reasons),
-            missing_information=missing,
-            conflicts=conflicts,
-            restrictions_triggered=restrictions_triggered,
+            verdict=verdict, confidence=job.overall_confidence, reasons=reasons,
+            missing_information=missing, conflicts=conflicts, restrictions_triggered=restrictions_triggered,
+            dispatch_group=dispatch_group, quo_reply_suggestion=quo_reply_suggestion,
         )
 
+    # 1. Hard override: the parser already determined this can't be trusted.
+    if job.status == ExtractionStatus.HANDLE_MANUALLY:
+        return _decision(Verdict.HANDLE_MANUALLY, list(job.status_reasons))
+
+    # 2. Business hours: blanket check, before anything area-specific.
+    hours = check_business_hours(business_now)
+    if not hours.within_hours:
+        return _decision(Verdict.HANDLE_MANUALLY, ["Outside operating hours", hours.reason])
+
+    # 3. Permanent service-area lookup.
     area = find_service_area(job.city.value, job.state.value, service_areas)
 
     if area.status == "not_found":
-        return Decision(
-            verdict=Verdict.HANDLE_MANUALLY, confidence=job.overall_confidence,
-            reasons=[area.reason], missing_information=missing, conflicts=conflicts,
-            restrictions_triggered=restrictions_triggered,
-        )
-
+        return _decision(Verdict.HANDLE_MANUALLY, [area.reason])
     if area.status == "unconfirmed":
-        return Decision(
-            verdict=Verdict.HANDLE_MANUALLY, confidence=job.overall_confidence,
-            reasons=[area.reason], missing_information=missing, conflicts=conflicts,
-            restrictions_triggered=restrictions_triggered,
-        )
-
+        return _decision(Verdict.HANDLE_MANUALLY, [area.reason])
     if area.status == "inactive":
-        return Decision(
-            verdict=Verdict.PASS, confidence=job.overall_confidence,
-            reasons=[area.reason], missing_information=missing, conflicts=conflicts,
-            restrictions_triggered=restrictions_triggered,
-        )
+        return _decision(Verdict.PASS, [area.reason])
 
     # area.status == "confirmed" from here on.
     dispatch_group = area.dispatch_group
 
-    if daily_rules is None:
-        return Decision(
-            verdict=Verdict.HANDLE_MANUALLY, confidence=job.overall_confidence,
-            reasons=["no daily rules provided for today -- cannot confirm current area/technician coverage"],
-            missing_information=missing, conflicts=conflicts, restrictions_triggered=restrictions_triggered,
-            dispatch_group=dispatch_group,
-        )
-
-    if daily_rules.is_expired(now):
-        return Decision(
-            verdict=Verdict.HANDLE_MANUALLY, confidence=job.overall_confidence,
-            reasons=["today's temporary rules have expired -- confirm current coverage before deciding"],
-            missing_information=missing, conflicts=conflicts, restrictions_triggered=restrictions_triggered,
-            dispatch_group=dispatch_group,
-        )
-
+    daily_active = daily_rules is not None and not daily_rules.is_expired(now)
     area_labels = {v for v in (job.city.value, job.state.value, area.record.city, area.record.state) if v}
     area_labels_lower = {a.lower() for a in area_labels}
 
-    if any(closed.lower() in area_labels_lower for closed in daily_rules.closed_areas):
-        return Decision(
-            verdict=Verdict.PASS, confidence=job.overall_confidence,
-            reasons=["area is marked closed in today's rules"], missing_information=missing,
-            conflicts=conflicts, restrictions_triggered=restrictions_triggered, dispatch_group=dispatch_group,
+    # 4. Recurring weekly day off -- a daily "open" exception can override it.
+    opened_today = daily_active and any(o.lower() in area_labels_lower for o in daily_rules.open_areas)
+    if is_recurring_day_off(area.record, hours.local_time) and not opened_today:
+        reason = (
+            f"{area.record.city or area.record.state} is on its recurring day off "
+            f"({area.record.recurring_day_off})"
         )
+        if area.record.recurring_day_off_action.upper() == "HANDLE_MANUALLY":
+            return _decision(Verdict.HANDLE_MANUALLY, [reason], dispatch_group=dispatch_group)
+        return _decision(Verdict.PASS, [reason], dispatch_group=dispatch_group)
 
+    # 5. Daily exceptions (random, manually entered for the day) -- optional.
     tech_status = None
-    for area_name, status in daily_rules.technician_status.items():
-        if area_name.lower() in area_labels_lower or (dispatch_group and area_name.lower() == dispatch_group.lower()):
-            tech_status = status
-            break
+    if daily_active:
+        if any(closed.lower() in area_labels_lower for closed in daily_rules.closed_areas):
+            return _decision(
+                Verdict.PASS, ["area marked temporarily unavailable today"], dispatch_group=dispatch_group,
+            )
+        for area_name, status in daily_rules.technician_status.items():
+            if area_name.lower() in area_labels_lower or (dispatch_group and area_name.lower() == dispatch_group.lower()):
+                tech_status = status
+                break
 
-    if tech_status in ("off", "busy"):
-        return Decision(
-            verdict=Verdict.PASS, confidence=job.overall_confidence,
-            reasons=[f"technician for this area is {tech_status} today"], missing_information=missing,
-            conflicts=conflicts, restrictions_triggered=restrictions_triggered, dispatch_group=dispatch_group,
+    effective_tech_status = tech_status or area.record.default_technician_availability
+
+    if effective_tech_status in ("off", "busy"):
+        return _decision(
+            Verdict.PASS, [f"technician for this area is {effective_tech_status} today"], dispatch_group=dispatch_group,
+        )
+    if effective_tech_status == "unknown":
+        return _decision(
+            Verdict.HANDLE_MANUALLY,
+            ["technician availability for this area is unknown and no confirmed backup exists"],
+            dispatch_group=dispatch_group,
         )
 
+    # 6. Vehicle restrictions.
     if job.vehicle_restriction_status == "restricted":
-        return Decision(
-            verdict=Verdict.PASS, confidence=job.overall_confidence,
-            reasons=[job.vehicle_restriction_reason], missing_information=missing,
-            conflicts=conflicts, restrictions_triggered=restrictions_triggered, dispatch_group=dispatch_group,
-        )
-
+        return _decision(Verdict.PASS, [job.vehicle_restriction_reason], dispatch_group=dispatch_group)
     if job.vehicle_restriction_status == "unclear":
         # Should already be caught by job.status above; kept as a safety net.
-        return Decision(
-            verdict=Verdict.HANDLE_MANUALLY, confidence=job.overall_confidence,
-            reasons=[job.vehicle_restriction_reason], missing_information=missing,
-            conflicts=conflicts, restrictions_triggered=restrictions_triggered, dispatch_group=dispatch_group,
-        )
+        return _decision(Verdict.HANDLE_MANUALLY, [job.vehicle_restriction_reason], dispatch_group=dispatch_group)
 
-    vehicle_text = (job.vehicle.value or "").lower()
-    service_text = (job.service_type.value or "").lower()
-    for restriction in daily_rules.temporary_restrictions:
-        r = restriction.lower()
-        if r in vehicle_text or r in service_text:
-            return Decision(
-                verdict=Verdict.PASS, confidence=job.overall_confidence,
-                reasons=[f"'{restriction}' is a temporary restriction today"], missing_information=missing,
-                conflicts=conflicts, restrictions_triggered=restrictions_triggered + [restriction],
-                dispatch_group=dispatch_group,
-            )
+    if daily_active:
+        vehicle_text = (job.vehicle.value or "").lower()
+        service_text = (job.service_type.value or "").lower()
+        for restriction in daily_rules.temporary_restrictions:
+            r = restriction.lower()
+            if r in vehicle_text or r in service_text:
+                restrictions_triggered.append(restriction)
+                return _decision(
+                    Verdict.PASS, [f"'{restriction}' is a temporary restriction today"], dispatch_group=dispatch_group,
+                )
 
+    # 7. Nothing excluded it -- accept or flag for a closer look on confidence.
     verdict = (
         Verdict.NEEDS_REVIEW if job.overall_confidence < NEEDS_REVIEW_CONFIDENCE_THRESHOLD else Verdict.ACCEPT
     )
     reason = (
-        "area open, technician available, no restrictions triggered"
+        "area active, technician available, no restrictions triggered"
         if verdict == Verdict.ACCEPT
         else f"looks acceptable, but overall confidence ({job.overall_confidence}) is below the "
              f"high-confidence threshold ({NEEDS_REVIEW_CONFIDENCE_THRESHOLD}) -- double-check before approving"
     )
     quo_reply = "K" if profile.requires_k else None
-
-    return Decision(
-        verdict=verdict, confidence=job.overall_confidence, reasons=[reason],
-        missing_information=missing, conflicts=conflicts, restrictions_triggered=restrictions_triggered,
-        dispatch_group=dispatch_group, quo_reply_suggestion=quo_reply,
-    )
+    return _decision(verdict, [reason], dispatch_group=dispatch_group, quo_reply_suggestion=quo_reply)

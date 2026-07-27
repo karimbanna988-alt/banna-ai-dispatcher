@@ -19,7 +19,7 @@ Main Leads gives the customer's real phone number directly. AGN/Lucky sometimes 
 1. Raw job message arrives in Quo.
 2. Detect source (Main Leads / AGN / Lucky / Unknown).
 3. Extract structured fields (see section 4).
-4. Check today's temporary rules, then the permanent service-area/vehicle/restriction rules.
+4. Check business hours, the permanent service-area/vehicle/restriction rules, each area's recurring weekly day off, then any random daily exceptions entered for today (see section 9b).
 5. Decide accept / pass / needs-review (see section 5). Never decide on incomplete or conflicting data — flag it instead.
 6. If accept and source is AGN/Lucky: prepare a "K" reply (never sent automatically).
 7. Look up the correct regional WhatsApp dispatch group from the service-area mapping. If the location isn't in the mapping, do not guess — flag for the user.
@@ -52,8 +52,9 @@ Main Leads gives the customer's real phone number directly. AGN/Lucky sometimes 
 ## 5. Accept / Pass / Needs-review logic
 
 Accept (and prepare "K" for AGN/Lucky) only when **all** of the following hold:
-- The job's area is open per today's temporary rules (or, absent temporary rules, the permanent service-area mapping).
-- A technician is available in that region (not off, not already on another job).
+- The current time is within business hours (see section 9b).
+- The area is active, its dispatch/closing group is confirmed, and today isn't its recurring day off (or an explicit daily exception says it's open anyway).
+- A technician is available in that region (not off, not busy, not unknown -- see section 9b for the current "available by default" testing placeholder).
 - The service type is not restricted.
 - The vehicle (if identified) is not restricted — see the vehicle rules below.
 
@@ -109,12 +110,20 @@ Standard short replies, used only from a **confirmed** technician status (never 
 - Closing = original job info (as received) + amount + payment method (e.g. "CC" = credit card) + parts cost, repeated **exactly** as the technician reports it. Never recalculated, altered, or invented.
 - AGN and Lucky each have their own closing template — stored separately, never assumed identical.
 
+## 9b. Business hours and area availability (confirmed 2026-07-27, supersedes earlier daily-open/closed assumption)
+
+- The business operates every day, **8:00 AM - 10:00 PM America/New_York**, computed via the IANA timezone (never a hardcoded offset from the operator's local time -- daylight saving changes the conversion). Outside these hours, every decision is `HANDLE_MANUALLY` with reason "Outside operating hours."
+- There is **no daily "area open/closed" message** in real operation. Every configured service area is active by default, permanently.
+- Some areas have a **recurring weekly day off** (e.g. Chicago: Saturday; Raleigh, NC: Sunday) -- stored in `rules/service_areas.yaml`, not daily messages. Hitting a recurring day off resolves to `PASS` or `HANDLE_MANUALLY` depending on that area's configured `recurring_day_off_action`. The full weekly schedule isn't known yet; unconfirmed areas simply have no recurring day off configured.
+- The **only thing that varies day to day** is: a technician taking a random day off or being busy, a one-off area becoming temporarily unavailable, or a temporary vehicle/service restriction (e.g. "no BMW today") -- all entered manually for that day, all optional. If nothing is entered, the system falls back to the area being active and the technician being available (see below).
+- For now, `default_technician_availability` is set to "available" for every configured area, as an explicit temporary testing default -- **not** a claim that a specific technician is actually confirmed. This will be replaced by a real technician-availability workflow later.
+
 ## 10. Dispatch routing
 
 - Fixed city/county/service-area → regional WhatsApp dispatch group mapping (e.g. Columbia, SC → Columbia group; Charlotte, NC → Charlotte group). Each dispatch group has a matching Closing group.
 - Unknown location → ask the human, never guess.
 - Permanent service-area data lives in a separate reference document (see `docs/phase1_scope.md` for the planned schema) — not hardcoded, built as its own deliverable later.
-- Daily/temporary rules come from the dispatcher's freeform shift-start message (e.g. "Georgia open, Florida closed, Columbia tech busy, no BMW today"), parsed into structured rules that **override** the permanent map for that day, shown back as a confirmation summary, and expire at end of shift unless extended. Unclear/conflicting daily rules → ask, never guess.
+- Areas are active by default, permanently (see section 9b) -- there is no daily area open/closed message. Random daily exceptions (technician off/busy, one-off area unavailability, temporary restrictions) may optionally be entered by the dispatcher, parsed into structured rules that overlay the permanent/recurring model for that day, shown back as a confirmation summary, and expire after a shift unless extended. Unclear/conflicting entries → ask, never guess.
 
 ## 11. Technician-facing message
 

@@ -29,7 +29,10 @@ def load(name: str) -> str:
 
 
 def confirmed_area():
-    return ServiceAreaRecord(city="Faketown", state="NC", dispatch_group="TestGroup", closing_group="TestClose")
+    return ServiceAreaRecord(
+        city="Faketown", state="NC", dispatch_group="TestGroup", closing_group="TestClose",
+        default_technician_availability="available",
+    )
 
 
 def test_first_message_for_a_ticket_is_new(conn, vehicle_rules):
@@ -138,13 +141,15 @@ def test_original_message_is_never_overwritten(conn, vehicle_rules):
 
 def test_full_pipeline_writes_a_complete_audit_entry(conn, vehicle_rules):
     from datetime import datetime
+    from zoneinfo import ZoneInfo
 
     raw = load("agn_clean.txt")
     job = extract_job(raw, vehicle_rules)
     classify_result = storage.classify_incoming(conn, job)
-    now = datetime(2026, 1, 1, 8, 0, 0)
+    now = datetime(2026, 1, 7, 12, 0, 0)  # Wednesday
+    business_now = now.replace(tzinfo=ZoneInfo("America/New_York"))
     daily = parse_daily_rules("Today:\n- Georgia open\n", now=now)
-    decision = decide(job, agn.PROFILE, [confirmed_area()], daily, now=now)
+    decision = decide(job, agn.PROFILE, [confirmed_area()], daily, now=now, business_now=business_now)
     luxor_message = format_technician_message(job)
 
     job_id = storage.save_audit_entry(

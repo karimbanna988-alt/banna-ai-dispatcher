@@ -23,6 +23,7 @@ from dispatcher.models import ExtractionStatus
 from dispatcher.parser import extract_job, load_vehicle_rules
 from dispatcher.rules import Verdict, decide, force_handle_manually
 from dispatcher.rules.daily import parse_daily_rules
+from dispatcher.rules.hours import check_business_hours
 from dispatcher.rules.service_areas import load_service_areas
 from dispatcher.storage import ClassifyResult, MessageType
 
@@ -65,6 +66,10 @@ st.caption(
     "Nothing on this screen is ever sent to Quo, WhatsApp, or a technician automatically. "
     "Every suggestion requires your approval, and even then you copy the text yourself."
 )
+
+_hours = check_business_hours()
+_hours_label = f"Business hours: {'OPEN' if _hours.within_hours else 'CLOSED'} — {_hours.local_time.strftime('%A %H:%M %Z')}"
+(st.success if _hours.within_hours else st.error)(_hours_label)
 
 tab_process, tab_daily, tab_status, tab_closing, tab_audit = st.tabs(
     ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline"]
@@ -178,11 +183,18 @@ with tab_process:
 
 # ------------------------------------------------------------- Daily rules --
 with tab_daily:
-    st.subheader("Paste today's freeform shift-start message")
-    daily_text = st.text_area("Daily rules", height=200, key="daily_text_input")
-    shift_hours = st.number_input("Shift length (hours)", min_value=1, max_value=24, value=12)
+    st.subheader("Today's random exceptions (optional)")
+    st.caption(
+        "Areas are active by default and recurring weekly days off are already configured "
+        "(rules/service_areas.yaml) — you don't need to enter those here. Only use this for "
+        "things that vary randomly today: a technician taking an unplanned day off or being "
+        "busy, a one-off area being temporarily unavailable, or a temporary vehicle/service "
+        "restriction (e.g. \"no BMW today\"). Leave this empty and jobs still process normally."
+    )
+    daily_text = st.text_area("Today's exceptions", height=200, key="daily_text_input")
+    shift_hours = st.number_input("Applies for how many hours", min_value=1, max_value=24, value=12)
 
-    if st.button("Parse daily rules"):
+    if st.button("Parse today's exceptions"):
         st.session_state.daily_rules = parse_daily_rules(daily_text, shift_hours=int(shift_hours))
 
     daily = st.session_state.daily_rules
@@ -190,7 +202,7 @@ with tab_daily:
         st.text(daily.summary())
         if daily.needs_confirmation:
             st.warning("Some lines could not be parsed — confirm these manually before relying on today's rules.")
-        st.caption("These rules apply to every job processed in the Process Job tab until they expire.")
+        st.caption("These exceptions apply to every job processed in the Process Job tab until they expire.")
 
 # ------------------------------------------------------------ Status update --
 with tab_status:

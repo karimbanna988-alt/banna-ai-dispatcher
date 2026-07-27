@@ -1,6 +1,19 @@
-"""Parses the dispatcher's freeform shift-start message into structured,
-temporary rules that override the permanent service-area mapping for the
-day. Never guesses: any line that doesn't match a known pattern is kept in
+"""Parses the dispatcher's freeform message into structured, optional
+*random daily exceptions* -- entirely optional, on top of the permanent
+model (business hours, area active-by-default, recurring weekly days off).
+
+Per the business owner (2026-07-27): there is no daily "area open/closed"
+message in real operation -- areas are active by default and any recurring
+closure is handled by rules/service_areas.yaml's recurring_day_off, not
+here. What actually happens day to day is random: a technician taking an
+unplanned day off, being busy, a one-off area being temporarily
+unavailable, or a temporary vehicle/service restriction (e.g. "no BMW
+today"). This module still recognizes "<area> open"/"<area> closed" phrasing
+because a dispatcher can use "open" to explicitly override a recurring day
+off for that day, and "closed" to mark a one-off, not-otherwise-scheduled
+unavailability.
+
+Never guesses: any line that doesn't match a known pattern is kept in
 `unparsed_lines` and surfaced for the dispatcher to confirm rather than
 silently dropped or misinterpreted. See docs/workflow.md section 10.
 """

@@ -17,6 +17,11 @@ import yaml
 SERVICE_AREAS_PATH = Path(__file__).resolve().parents[3] / "rules" / "service_areas.yaml"
 
 
+WEEKDAY_NAMES = (
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+)
+
+
 @dataclass(frozen=True)
 class ServiceAreaRecord:
     city: Optional[str]
@@ -28,6 +33,21 @@ class ServiceAreaRecord:
     default_technician_availability: str = "unknown"
     company_restrictions: List[str] = field(default_factory=list)
     notes: str = ""
+    # Recurring weekly day off (e.g. "Saturday"), not a daily message --
+    # confirmed examples: Chicago (Saturday), Raleigh NC (Sunday). None
+    # means no known recurring day off.
+    recurring_day_off: Optional[str] = None
+    # What a hit on recurring_day_off resolves to: "PASS" (a known, regular
+    # closure -- treated like any other confirmed non-coverage day) or
+    # "HANDLE_MANUALLY" (still ask a human every time). Configurable per
+    # area rather than hardcoded.
+    recurring_day_off_action: str = "PASS"
+
+
+def is_recurring_day_off(record: ServiceAreaRecord, local_dt) -> bool:
+    if not record.recurring_day_off:
+        return False
+    return local_dt.strftime("%A").lower() == record.recurring_day_off.strip().lower()
 
 
 @dataclass
