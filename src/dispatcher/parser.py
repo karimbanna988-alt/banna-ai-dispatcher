@@ -276,7 +276,17 @@ def check_vehicle_restriction(vehicle_text: Optional[str], rules: dict) -> Tuple
     return "allowed", "no matching restriction found for this vehicle"
 
 
-_AGN_LUCKY_FIELD_PATTERNS = (TICKET_RE, NAME_RE, PHONE_RE, ADDRESS_LINE_RE, DESC_RE, OCCU_RE)
+# DESC_RE is deliberately excluded (confirmed 2026-07-27 from a real Lucky
+# job with two "Desc:" lines -- "Desc: Car Ignition key" followed later by
+# a second "Desc: Car Key"): extract_service_type() always takes the FIRST
+# Desc: match, so if a second Desc: were anchored on here as "the latest
+# recognized field," notes-extraction would jump past it and silently drop
+# both that second Desc: line and anything on it -- the exact
+# silently-lose-information failure this whole anchoring scheme exists to
+# prevent. Every real field template seen so far always has "Occu:" after
+# "Desc:" anyway, so dropping DESC_RE from this list doesn't change anchor
+# position for the normal case.
+_AGN_LUCKY_FIELD_PATTERNS = (TICKET_RE, NAME_RE, PHONE_RE, ADDRESS_LINE_RE, OCCU_RE)
 
 
 def _last_recognized_field_end(raw_text: str) -> Optional[int]:

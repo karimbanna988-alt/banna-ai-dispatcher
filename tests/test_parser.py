@@ -274,3 +274,19 @@ def test_unrecognized_field_before_empty_notes_label_is_preserved(rules):
     job = extract_job(load("agn_appt_field_empty_notes.txt"), rules)
     assert job.notes.value is not None
     assert "Appt: 07/26 at 08:00 AM UTC" in job.notes.value
+
+
+def test_second_desc_line_is_preserved_not_used_as_notes_anchor(rules):
+    """Confirmed 2026-07-27 from a real Lucky job: a second "Desc:" line
+    ("Desc: Car Key") appeared after "Notes:", following a first "Desc: Car
+    Ignition key" used for service_type. Because "Desc:" was previously
+    treated as a recognized-field anchor, notes-extraction jumped past this
+    second Desc: line entirely -- it wasn't in service_type (which only
+    ever takes the first Desc: match) and wasn't in notes either, silently
+    dropped. Must now be preserved verbatim in notes, even though the
+    literal label text "Desc:" ends up inside it."""
+    job = extract_job(load("lucky_second_desc_line_preserved.txt"), rules)
+    assert job.service_type.value == "Car Ignition key"
+    assert job.notes.value is not None
+    assert "Desc: Car Key" in job.notes.value
+    assert "2005 Lincoln Navigation" in job.notes.value
