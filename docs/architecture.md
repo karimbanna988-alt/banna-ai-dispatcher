@@ -671,7 +671,7 @@ to contain zero `.post(`, `.put(`, `.delete(`, or `.patch(` calls after
 every change in this phase. Nothing here sends, replies to, acknowledges,
 or modifies anything in the real Quo account.
 
-## 10. Technician assignment (2026-07-28)
+## 10. Technician assignment (2026-07-28, corrected same day)
 
 **Before this**: no technician-identity concept existed anywhere in this
 codebase or in any `rules/*.yaml`/`.json` config file -- confirmed by
@@ -683,10 +683,29 @@ override in `rules/daily.py` (e.g. "Charlotte technician busy") -- neither
 names an individual technician. A `technicians` table was therefore
 genuinely required; nothing existing could safely be reused.
 
+**Corrected same day, before any real data was entered**: the first pass
+put `dispatch_group`/`closing_group` on the *service area*, gated by
+whether both were set ("confirmed" vs "unconfirmed"). Real WhatsApp
+screenshots showed this was wrong: one area (e.g. Greenville) can have
+several technician-specific dispatch/closing groups, which a single
+area-level string can't represent without arbitrarily picking one and
+silently misrouting the rest. The business owner's correction: **service
+areas hold only geographic/business facts; dispatch/closing group names
+are opaque, technician-owned destination strings the AI never parses or
+reasons about.** Everything below reflects the corrected model -- the
+brief unconfirmed/area-level-group design was replaced before it was ever
+used with real data.
+
 ### 10a. Schema (additive, idempotent -- same pattern as every prior migration)
 
+- `rules/service_areas.yaml` / `ServiceAreaRecord`: **no** `dispatch_group`
+  or `closing_group` fields -- geographic/business facts only (city/state,
+  `active`, recurring day off, default technician availability, vehicle/
+  company restrictions).
 - New `technicians` table: `name` (unique), `active` flag, `areas_json`/
-  `skills_json`/`vehicle_restrictions_json` (JSON string lists), timestamps.
+  `skills_json`/`vehicle_restrictions_json` (JSON string lists of service-
+  area names, not group names), plain `dispatch_group`/`closing_group` TEXT
+  columns (nullable, opaque, e.g. a WhatsApp group name), timestamps.
 - New `jobs.assigned_technician_id` column (nullable, `REFERENCES
   technicians (id)`) -- mirrors the job's *current* assignment, exactly
   like `jobs.status`/`last_event_id` already mirror current lifecycle
@@ -701,43 +720,51 @@ genuinely required; nothing existing could safely be reused.
 
 `add_technician`, `set_technician_active`, `list_technicians`,
 `get_technician` -- plain CRUD, no eligibility logic. `areas` must be
-`dispatch_group` names (the same regional grouping `rules/service_areas.yaml`
-and `rules.decide()` already use), not free-text city names, so
-eligibility checks stay anchored to the one existing area concept rather
-than inventing a second one. `skills`/`vehicle_restrictions` are optional
-and explicit: empty means "no additional restriction beyond the global
+**service-area names** (the same geographic identity `rules/service_areas.yaml`
+and `rules.decide()` already resolve to, e.g. "Charlotte") -- never a
+WhatsApp group name, so eligibility checks stay anchored to the one
+existing area concept. `skills`/`vehicle_restrictions` are optional and
+explicit: empty means "no additional restriction beyond the global
 vehicle-restriction rules `rules.decide()` already enforces before a job
-ever reaches assignment" -- never inferred.
+ever reaches assignment" -- never inferred. `dispatch_group`/
+`closing_group` are opaque strings, purely informational -- stored and
+later displayed verbatim, never matched against or reasoned about.
 
-### 10c. `storage.assign_technician(conn, job_id, technician_id, service_areas)`
+### 10c. `rules.decide()` -- what changed
+
+`find_service_area()`'s `"unconfirmed"` status is retired: since areas no
+longer hold group data, a known, active area is `"confirmed"` as soon as
+it's found (statuses are now just `"confirmed"` / `"inactive"` /
+`"not_found"`). `Decision.dispatch_group` was renamed to
+`Decision.service_area` and now holds the confirmed area's own label
+(e.g. `"Charlotte"`) -- `decide()` has no way to know which technician
+(and therefore which dispatch/closing group) will eventually handle a
+job; that's resolved later, by a human, at technician assignment.
+
+### 10d. `storage.assign_technician(conn, job_id, technician_id, service_areas)`
 
 The sole entry point for changing a job's assignment. `technician_id=None`
 removes the current assignment -- always allowed, no eligibility checks,
 since removing is the safe direction.
 
 For a real technician id, checked in order (any failure -> `Handle
-Manually`, never a silent partial assignment):
+Manually`, never a silent partial assignment), reasoning **only** about
+service-area identity and technician eligibility, never a group name's
+wording:
 1. Technician is active.
-2. The job's `dispatch_group` is **re-derived fresh** via
-   `find_service_area()` against the job's stored city/state -- the exact
-   same lookup `rules.decide()` already uses, never a stale or duplicated
-   area concept -- and must be `"confirmed"` (not `"not_found"` or
-   `"unconfirmed"`).
-3. The technician's configured `areas` must include that dispatch group.
+2. The job's service area is **re-derived fresh** via `find_service_area()`
+   against the job's stored city/state -- the exact same lookup
+   `rules.decide()` already uses -- and must be `"confirmed"`.
+3. The technician's configured `areas` must include that area's label.
 4. If the technician has explicit `skills` configured, the job's service
    type must be present *and* match one of them -- missing service-type
    data is itself a block (can't verify), not a silent pass.
 5. If the technician has explicit `vehicle_restrictions` configured, the
    job's vehicle must be present and must *not* match one -- same
    missing-data-is-a-block rule.
-
-Because `rules/service_areas.yaml` currently has every `dispatch_group`
-unconfirmed (null), step 2 above means **no real job can be successfully
-assigned yet** -- inherited directly from `rules.decide()`, which already
-forces `HANDLE_MANUALLY` for the same reason on every real job today. Not
-a new limitation introduced by this feature; confirmed by an app-level
-test (`test_jobs_tab_assignment_is_blocked_for_a_real_unconfirmed_service_area`)
-and a live smoke test against the real app and real database.
+6. Only once all of the above pass: the selected technician's own
+   `dispatch_group`/`closing_group` are surfaced on the result -- opaque
+   strings for the dispatcher to use, never reasoned about here.
 
 Every call -- successful or blocked -- writes one permanent `events` row:
 new `MessageType.ASSIGNMENT`, `final_action` one of `Assign` / `Reassign`
@@ -750,26 +777,34 @@ current status (who's assigned is orthogonal to lifecycle stage) unless
 `final_action` is `Handle Manually`, which -- as with every other message
 type -- always wins via the pre-existing rule 1.
 
-### 10d. UI
+### 10e. UI
 
 - **"Technicians" tab** (9th, appended -- every existing tab index is
-  unchanged): add/list the roster, toggle active/inactive. (While
-  building this, a same-script-run staleness bug was caught and fixed:
-  the roster table is fetched before the toggle button in script order,
-  so the toggle needs `st.rerun()`, with its confirmation message stashed
-  in `st.session_state` first since `st.success()` doesn't survive a
-  rerun -- the same pattern `simulator.py`'s `sim_pending_delivery`
-  already uses for the identical class of problem.)
+  unchanged): add a technician (name, service areas covered, optional
+  skills/vehicle restrictions, optional opaque dispatch/closing group),
+  list the roster, toggle active/inactive. (While building this, a same-
+  script-run staleness bug was caught and fixed: the roster table is
+  fetched before the toggle button in script order, so the toggle needs
+  `st.rerun()`, with its confirmation message stashed in
+  `st.session_state` first since `st.success()` doesn't survive a rerun
+  -- the same pattern `simulator.py`'s `sim_pending_delivery` already
+  uses for the identical class of problem.)
 - **Jobs tab**: list gains an "Assigned" column (technician name only --
   not customer PII). Selecting a job reveals an "Assign technician"
   section: current assignment, a selectbox of active technicians plus
   "(remove assignment)", and an "Apply assignment" button reporting
-  either the successful outcome or the exact `Handle Manually` reason.
+  either the successful outcome (plus the selected technician's opaque
+  dispatch/closing group) or the exact `Handle Manually` reason.
+- Process tab's decision display now shows "Service area: X" (was
+  "Dispatch group: X") -- consistent with `decide()` no longer claiming
+  to know a WhatsApp destination.
 
-### 10e. Not built (explicitly out of scope this phase)
+### 10f. Not built (explicitly out of scope this phase)
 
 Auto-assignment/suggestion, ETA, technician acceptance/confirmation
 workflow, a technician-facing interface of any kind, and (per the
 project's standing constraints) anything that would write to Quo. Every
 assignment stays local-only, human-initiated, and requires the dispatcher
-to separately notify the technician through Quo/WhatsApp themselves.
+to separately notify the technician through Quo/WhatsApp themselves. No
+real technician or dispatch-group data has been entered yet -- every
+example above uses fabricated placeholders.

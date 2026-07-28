@@ -31,10 +31,7 @@ def load(name: str) -> str:
 
 
 def confirmed_area(city="Faketown", state="NC", **overrides):
-    defaults = dict(
-        city=city, state=state, dispatch_group="TestGroup", closing_group="TestClose",
-        active=True, default_technician_availability="available",
-    )
+    defaults = dict(city=city, state=state, active=True, default_technician_availability="available")
     defaults.update(overrides)
     return ServiceAreaRecord(**defaults)
 
@@ -47,7 +44,7 @@ def test_accept_when_everything_clean(vehicle_rules):
     job = extract_job(load("agn_clean.txt"), vehicle_rules)
     decision = decide(job, agn.PROFILE, [confirmed_area()], business_now=WITHIN_HOURS)
     assert decision.verdict == Verdict.ACCEPT
-    assert decision.dispatch_group == "TestGroup"
+    assert decision.service_area == "Faketown"
     assert decision.quo_reply_suggestion == "K"
 
 
@@ -91,12 +88,17 @@ def test_handle_manually_when_area_not_found(vehicle_rules):
     assert "not found" in decision.reasons[0] or "not be found" in decision.reasons[0]
 
 
-def test_handle_manually_when_area_group_unconfirmed(vehicle_rules):
+def test_known_active_area_with_no_group_data_still_accepts(vehicle_rules):
+    """2026-07-28: dispatch/closing groups no longer live on service areas
+    at all (they're technician-owned, opaque data) -- retired the old
+    "unconfirmed" gating this test used to check. A known, active area
+    with default technician availability accepts on its own; whether a
+    technician is actually eligible to be assigned is a separate,
+    later concern (storage.assign_technician)."""
     job = extract_job(load("agn_clean.txt"), vehicle_rules)
-    unconfirmed_area = ServiceAreaRecord(city="Faketown", state="NC")  # no dispatch/closing group
-    decision = decide(job, agn.PROFILE, [unconfirmed_area], business_now=WITHIN_HOURS)
-    assert decision.verdict == Verdict.HANDLE_MANUALLY
-    assert "not been confirmed" in decision.reasons[0]
+    area = ServiceAreaRecord(city="Faketown", state="NC", default_technician_availability="available")
+    decision = decide(job, agn.PROFILE, [area], business_now=WITHIN_HOURS)
+    assert decision.verdict == Verdict.ACCEPT
 
 
 def test_pass_when_area_inactive(vehicle_rules):
@@ -162,7 +164,7 @@ def test_pass_when_daily_area_marked_unavailable(vehicle_rules):
 def test_pass_when_technician_busy_today(vehicle_rules):
     job = extract_job(load("agn_clean.txt"), vehicle_rules)
     naive_now = WITHIN_HOURS.replace(tzinfo=None)
-    daily = parse_daily_rules("Today:\n- TestGroup technician busy\n", now=naive_now)
+    daily = parse_daily_rules("Today:\n- Faketown technician busy\n", now=naive_now)
     decision = decide(job, agn.PROFILE, [confirmed_area()], daily, now=naive_now, business_now=WITHIN_HOURS)
     assert decision.verdict == Verdict.PASS
     assert "busy" in decision.reasons[0]
@@ -175,7 +177,7 @@ def test_expired_daily_exceptions_are_ignored_not_blocking(vehicle_rules):
     job = extract_job(load("agn_clean.txt"), vehicle_rules)
     naive_now = WITHIN_HOURS.replace(tzinfo=None)
     stale = parse_daily_rules(
-        "Today:\n- TestGroup technician busy\n", shift_hours=1, now=naive_now - timedelta(hours=5),
+        "Today:\n- Faketown technician busy\n", shift_hours=1, now=naive_now - timedelta(hours=5),
     )
     decision = decide(job, agn.PROFILE, [confirmed_area()], stale, now=naive_now, business_now=WITHIN_HOURS)
     assert decision.verdict == Verdict.ACCEPT
@@ -204,9 +206,9 @@ def test_pass_when_daily_temporary_restriction_matches_vehicle(vehicle_rules):
 
 
 def test_real_service_area_mapping_forces_handle_manually_today(vehicle_rules):
-    """Every current entry in rules/service_areas.yaml has no confirmed
-    dispatch/closing group yet, so accepting against the real mapping must
-    always come back HANDLE_MANUALLY until groups are confirmed."""
+    """This fixture's city ("Faketown") isn't in the real
+    rules/service_areas.yaml mapping at all, so it resolves "not_found" ->
+    HANDLE_MANUALLY, same as any genuinely unrecognized location."""
     job = extract_job(load("lucky_clean.txt"), vehicle_rules)  # Faketown, SC -- not even in the real mapping
     decision = decide(job, lucky.PROFILE, load_service_areas(), business_now=WITHIN_HOURS)
     assert decision.verdict == Verdict.HANDLE_MANUALLY

@@ -35,15 +35,11 @@ def load(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
 
-def confirmed_area(dispatch_group="TestGroup"):
-    """Real rules/service_areas.yaml has every dispatch_group unconfirmed
-    (null) today, same as test_storage.py's own confirmed_area() fixture
-    -- a synthetic, explicitly-confirmed area is needed to exercise the
-    "eligible" path at all."""
-    return ServiceAreaRecord(
-        city="Faketown", state="NC", dispatch_group=dispatch_group, closing_group="TestClose",
-        default_technician_availability="available",
-    )
+def confirmed_area(city="Faketown", state="NC"):
+    """A synthetic, known, active service area -- areas no longer hold
+    dispatch/closing group data at all (that's technician-owned, opaque
+    data), so "confirmed" now depends only on being found and active."""
+    return ServiceAreaRecord(city=city, state=state, default_technician_availability="available")
 
 
 def make_job(conn, vehicle_rules, raw="agn_clean.txt"):
@@ -57,8 +53,8 @@ def make_job(conn, vehicle_rules, raw="agn_clean.txt"):
 def test_technicians_table_and_jobs_column_created(conn):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(technicians)")}
     assert columns == {
-        "id", "name", "active", "areas_json", "skills_json",
-        "vehicle_restrictions_json", "created_at", "updated_at",
+        "id", "name", "active", "areas_json", "skills_json", "vehicle_restrictions_json",
+        "dispatch_group", "closing_group", "created_at", "updated_at",
     }
     jobs_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
     assert "assigned_technician_id" in jobs_columns
@@ -67,7 +63,7 @@ def test_technicians_table_and_jobs_column_created(conn):
 def test_migration_is_idempotent(tmp_path):
     db_path = tmp_path / "idem.db"
     conn1 = storage.connect(db_path)
-    tech_id = storage.add_technician(conn1, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn1, "Alex", areas=["Faketown"])
     conn2 = storage.connect(db_path)  # re-run _ensure_schema against the same file
     assert storage.get_technician(conn2, tech_id)["name"] == "Alex"
 
@@ -86,26 +82,26 @@ def test_foreign_keys_reject_an_invalid_assigned_technician_id(conn):
 
 # --------------------------------------------------------- Roster CRUD -----
 def test_add_and_list_technicians(conn):
-    storage.add_technician(conn, "Alex", areas=["TestGroup"], skills=["lockout"], vehicle_restrictions=["BMW"])
-    storage.add_technician(conn, "Sam", areas=["OtherGroup"])
+    storage.add_technician(conn, "Alex", areas=["Faketown"], skills=["lockout"], vehicle_restrictions=["BMW"])
+    storage.add_technician(conn, "Sam", areas=["OtherArea"])
     techs = storage.list_technicians(conn)
     names = {t["name"] for t in techs}
     assert names == {"Alex", "Sam"}
     alex = next(t for t in techs if t["name"] == "Alex")
     assert alex["active"] is True
-    assert alex["areas"] == ["TestGroup"]
+    assert alex["areas"] == ["Faketown"]
     assert alex["skills"] == ["lockout"]
     assert alex["vehicle_restrictions"] == ["BMW"]
 
 
 def test_duplicate_technician_name_rejected(conn):
-    storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    storage.add_technician(conn, "Alex", areas=["Faketown"])
     with pytest.raises(Exception):
-        storage.add_technician(conn, "Alex", areas=["OtherGroup"])
+        storage.add_technician(conn, "Alex", areas=["OtherArea"])
 
 
 def test_set_technician_active_toggle(conn):
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
     storage.set_technician_active(conn, tech_id, False)
     assert storage.get_technician(conn, tech_id)["active"] is False
     storage.set_technician_active(conn, tech_id, True)
@@ -113,8 +109,8 @@ def test_set_technician_active_toggle(conn):
 
 
 def test_list_technicians_active_only_filter(conn):
-    active_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
-    inactive_id = storage.add_technician(conn, "Sam", areas=["TestGroup"])
+    active_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    inactive_id = storage.add_technician(conn, "Sam", areas=["Faketown"])
     storage.set_technician_active(conn, inactive_id, False)
     active = storage.list_technicians(conn, active_only=True)
     assert [t["id"] for t in active] == [active_id]
@@ -123,7 +119,7 @@ def test_list_technicians_active_only_filter(conn):
 # ------------------------------------------------------------ Assignment ---
 def test_successful_assignment(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -135,7 +131,7 @@ def test_successful_assignment(conn, vehicle_rules):
 
 def test_assignment_is_recorded_in_the_audit_timeline(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
     storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
     timeline = storage.get_audit_timeline_by_job_id(conn, job_id)
@@ -148,7 +144,7 @@ def test_assignment_is_recorded_in_the_audit_timeline(conn, vehicle_rules):
 def test_assignment_preserves_job_status(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)  # status becomes "Approved" via final_action="Approve"
     before = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()[0]
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
 
     storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -158,8 +154,8 @@ def test_assignment_preserves_job_status(conn, vehicle_rules):
 
 def test_reassignment(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech1 = storage.add_technician(conn, "Alex", areas=["TestGroup"])
-    tech2 = storage.add_technician(conn, "Sam", areas=["TestGroup"])
+    tech1 = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    tech2 = storage.add_technician(conn, "Sam", areas=["Faketown"])
     storage.assign_technician(conn, job_id, tech1, [confirmed_area()])
 
     result = storage.assign_technician(conn, job_id, tech2, [confirmed_area()])
@@ -171,7 +167,7 @@ def test_reassignment(conn, vehicle_rules):
 
 def test_removal(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
     storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
     result = storage.assign_technician(conn, job_id, None, [confirmed_area()])
@@ -183,7 +179,7 @@ def test_removal(conn, vehicle_rules):
 
 
 def test_assigning_a_nonexistent_job_raises(conn):
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
     with pytest.raises(ValueError):
         storage.assign_technician(conn, 999999, tech_id, [confirmed_area()])
 
@@ -197,7 +193,7 @@ def test_assigning_a_nonexistent_technician_raises(conn, vehicle_rules):
 # ------------------------------------------------- Prevention (Rule #8) ----
 def test_inactive_technician_blocked(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
     storage.set_technician_active(conn, tech_id, False)
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
@@ -210,12 +206,12 @@ def test_inactive_technician_blocked(conn, vehicle_rules):
 
 def test_area_mismatch_blocked(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["SomeOtherGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["OtherArea"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
     assert result.outcome == "handle_manually"
-    assert "does not cover dispatch group" in result.reason
+    assert "does not cover service area" in result.reason
 
 
 def test_technician_with_no_configured_areas_blocked(conn, vehicle_rules):
@@ -228,18 +224,20 @@ def test_technician_with_no_configured_areas_blocked(conn, vehicle_rules):
     assert "no configured coverage areas" in result.reason
 
 
-def test_unconfirmed_service_area_blocked(conn, vehicle_rules):
-    """Matches today's real rules/service_areas.yaml: every dispatch_group
-    is null/unconfirmed, so no assignment can proceed for a real job yet --
-    this is inherited, expected behavior, not a bug in this layer."""
+def test_unresolvable_service_area_blocked(conn, vehicle_rules):
+    """If the job's city/state doesn't resolve against the known service
+    areas at all (e.g. rules/service_areas.yaml has no matching entry --
+    matches today's real file for any city the simulator/fixtures use),
+    assignment must block rather than guess. Areas no longer have an
+    "unconfirmed" status of their own (see rules/service_areas.py) --
+    the only way an area lookup can fail now is not being found/active."""
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
-    unconfirmed_area = ServiceAreaRecord(city="Faketown", state="NC", dispatch_group=None, closing_group=None)
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
 
-    result = storage.assign_technician(conn, job_id, tech_id, [unconfirmed_area])
+    result = storage.assign_technician(conn, job_id, tech_id, [])  # no matching area at all
 
     assert result.outcome == "handle_manually"
-    assert "not confirmed for dispatch" in result.reason
+    assert "job's service area is not confirmed" in result.reason
 
 
 def test_missing_city_and_state_blocked(conn, vehicle_rules):
@@ -250,7 +248,7 @@ def test_missing_city_and_state_blocked(conn, vehicle_rules):
     fields["state"] = None
     conn.execute("UPDATE jobs SET latest_fields_json = ? WHERE id = ?", (json.dumps(fields), job_id))
     conn.commit()
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -265,7 +263,7 @@ def test_skills_configured_but_job_service_type_missing_blocked(conn, vehicle_ru
     fields["service_type"] = None
     conn.execute("UPDATE jobs SET latest_fields_json = ? WHERE id = ?", (json.dumps(fields), job_id))
     conn.commit()
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"], skills=["lockout"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"], skills=["lockout"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -275,7 +273,7 @@ def test_skills_configured_but_job_service_type_missing_blocked(conn, vehicle_ru
 
 def test_skills_mismatch_blocked(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)  # agn_clean.txt's service_type is a lockout-style job
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"], skills=["ignition repair only"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"], skills=["ignition repair only"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -290,7 +288,7 @@ def test_vehicle_restriction_missing_vehicle_info_blocked(conn, vehicle_rules):
     fields["vehicle"] = None
     conn.execute("UPDATE jobs SET latest_fields_json = ? WHERE id = ?", (json.dumps(fields), job_id))
     conn.commit()
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"], vehicle_restrictions=["BMW"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"], vehicle_restrictions=["BMW"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -305,7 +303,7 @@ def test_vehicle_restriction_match_blocked(conn, vehicle_rules):
     fields["vehicle"] = "2015 BMW 328i"
     conn.execute("UPDATE jobs SET latest_fields_json = ? WHERE id = ?", (json.dumps(fields), job_id))
     conn.commit()
-    tech_id = storage.add_technician(conn, "Alex", areas=["TestGroup"], vehicle_restrictions=["BMW"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"], vehicle_restrictions=["BMW"])
 
     result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -315,10 +313,10 @@ def test_vehicle_restriction_match_blocked(conn, vehicle_rules):
 
 def test_blocked_reassignment_does_not_clear_existing_assignment(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    good_tech = storage.add_technician(conn, "Alex", areas=["TestGroup"])
+    good_tech = storage.add_technician(conn, "Alex", areas=["Faketown"])
     storage.assign_technician(conn, job_id, good_tech, [confirmed_area()])
 
-    bad_tech = storage.add_technician(conn, "Sam", areas=["SomeOtherGroup"])
+    bad_tech = storage.add_technician(conn, "Sam", areas=["OtherArea"])
     result = storage.assign_technician(conn, job_id, bad_tech, [confirmed_area()])
 
     assert result.outcome == "handle_manually"
@@ -328,7 +326,7 @@ def test_blocked_reassignment_does_not_clear_existing_assignment(conn, vehicle_r
 
 def test_blocked_assignment_still_records_a_handle_manually_event(conn, vehicle_rules):
     job_id = make_job(conn, vehicle_rules)
-    tech_id = storage.add_technician(conn, "Alex", areas=["SomeOtherGroup"])
+    tech_id = storage.add_technician(conn, "Alex", areas=["OtherArea"])
 
     storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
 
@@ -351,3 +349,48 @@ def test_derive_job_status_assignment_handle_manually_wins():
 
 def test_derive_job_status_assignment_unknown_action_falls_back():
     assert storage.derive_job_status("Approved", storage.MessageType.ASSIGNMENT.value, "Bogus") == "Needs Review"
+
+
+# ---------------------------------- Opaque dispatch_group/closing_group ----
+def test_technician_dispatch_and_closing_group_are_stored_verbatim(conn):
+    """These are opaque strings -- storage never parses or reasons about
+    their wording, just stores and later surfaces them verbatim."""
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"],
+        dispatch_group="Fabricated Tech Dispatch Group", closing_group="Fabricated Tech Closing Group",
+    )
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["dispatch_group"] == "Fabricated Tech Dispatch Group"
+    assert tech["closing_group"] == "Fabricated Tech Closing Group"
+
+
+def test_technician_dispatch_and_closing_group_default_to_none(conn):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["dispatch_group"] is None
+    assert tech["closing_group"] is None
+
+
+def test_successful_assignment_surfaces_technicians_opaque_groups(conn, vehicle_rules):
+    job_id = make_job(conn, vehicle_rules)
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"],
+        dispatch_group="Fabricated Tech Dispatch Group", closing_group="Fabricated Tech Closing Group",
+    )
+
+    result = storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
+
+    assert result.outcome == "assigned"
+    assert result.dispatch_group == "Fabricated Tech Dispatch Group"
+    assert result.closing_group == "Fabricated Tech Closing Group"
+
+
+def test_removal_result_has_no_dispatch_or_closing_group(conn, vehicle_rules):
+    job_id = make_job(conn, vehicle_rules)
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"], dispatch_group="Fabricated Tech Dispatch Group")
+    storage.assign_technician(conn, job_id, tech_id, [confirmed_area()])
+
+    result = storage.assign_technician(conn, job_id, None, [confirmed_area()])
+
+    assert result.dispatch_group is None
+    assert result.closing_group is None

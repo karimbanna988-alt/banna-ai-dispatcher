@@ -179,7 +179,7 @@ with tab_process:
             st.write(f"Conflicts: {', '.join(decision.conflicts)}")
         if decision.restrictions_triggered:
             st.write(f"Restrictions triggered: {', '.join(decision.restrictions_triggered)}")
-        st.write(f"Dispatch group: {decision.dispatch_group or '(not confirmed)'}")
+        st.write(f"Service area: {decision.service_area or '(not confirmed)'}")
         st.write(f"Suggested Quo reply: {decision.quo_reply_suggestion or '(none)'}")
 
         st.subheader("6. Luxor Locksmith technician message")
@@ -414,16 +414,22 @@ with tab_jobs:
                 st.error(f"Could not assign -- Handle Manually: {assignment_result.reason}")
             else:
                 st.success(f"{assignment_result.outcome.capitalize()}: {assignment_result.reason}")
+                if assignment_result.dispatch_group or assignment_result.closing_group:
+                    st.info(
+                        f"Use dispatch group: {assignment_result.dispatch_group or '(not set)'} | "
+                        f"closing group: {assignment_result.closing_group or '(not set)'}"
+                    )
 
 # ------------------------------------------------------------ Technicians --
 with tab_technicians:
     st.subheader("Technicians")
     st.caption(
-        "A minimal roster: name, active/inactive, dispatch-group coverage areas, and optional "
-        "explicit skills/vehicle restrictions. Areas must match confirmed dispatch_group names "
-        "from rules/service_areas.yaml -- every one is currently unconfirmed there, so no real "
-        "job can be successfully assigned yet (the same limitation the rest of the app already "
-        "has, not a new one introduced here)."
+        "A minimal roster: name, active/inactive, the service areas they cover (by area name, e.g. "
+        "\"Charlotte\" -- matching rules/service_areas.yaml, never a WhatsApp group name), and optional "
+        "explicit skills/vehicle restrictions. Dispatch group and closing group are opaque destination "
+        "strings for this one technician (e.g. their WhatsApp group name) -- nothing in this app parses "
+        "or reasons about their wording; they're only ever shown back to you once this technician is "
+        "selected for a job."
     )
 
     tech_status_message = st.session_state.pop("tech_status_message", None)
@@ -432,10 +438,16 @@ with tab_technicians:
 
     st.write("Add a technician")
     new_tech_name = st.text_input("Name", key="tech_new_name")
-    new_tech_areas = st.text_input("Coverage areas (comma-separated dispatch_group names)", key="tech_new_areas")
+    new_tech_areas = st.text_input("Service areas covered (comma-separated area names)", key="tech_new_areas")
     new_tech_skills = st.text_input("Skills (optional, comma-separated)", key="tech_new_skills")
     new_tech_vehicle_restrictions = st.text_input(
         "Vehicle restrictions (optional, comma-separated)", key="tech_new_vehicle_restrictions",
+    )
+    new_tech_dispatch_group = st.text_input(
+        "Dispatch group (opaque destination string, e.g. a WhatsApp group name)", key="tech_new_dispatch_group",
+    )
+    new_tech_closing_group = st.text_input(
+        "Closing group (opaque destination string, optional)", key="tech_new_closing_group",
     )
     if st.button("Add technician", key="tech_add_button"):
         if not new_tech_name.strip():
@@ -445,7 +457,11 @@ with tab_technicians:
             skills = [s.strip() for s in new_tech_skills.split(",") if s.strip()]
             vehicle_restrictions = [v.strip() for v in new_tech_vehicle_restrictions.split(",") if v.strip()]
             try:
-                storage.add_technician(conn, new_tech_name.strip(), areas, skills or None, vehicle_restrictions or None)
+                storage.add_technician(
+                    conn, new_tech_name.strip(), areas, skills or None, vehicle_restrictions or None,
+                    dispatch_group=new_tech_dispatch_group.strip() or None,
+                    closing_group=new_tech_closing_group.strip() or None,
+                )
                 st.success(f"Added {new_tech_name.strip()}.")
             except Exception as exc:
                 st.error(f"Could not add technician (name may already exist): {exc}")
@@ -457,9 +473,11 @@ with tab_technicians:
             {
                 "Name": t["name"],
                 "Active": "Yes" if t["active"] else "No",
-                "Areas": ", ".join(t["areas"]) or "(none configured)",
+                "Service areas": ", ".join(t["areas"]) or "(none configured)",
                 "Skills": ", ".join(t["skills"]) or "(none -- no restriction beyond global rules)",
                 "Vehicle restrictions": ", ".join(t["vehicle_restrictions"]) or "(none)",
+                "Dispatch group": t["dispatch_group"] or "(not set)",
+                "Closing group": t["closing_group"] or "(not set)",
             }
             for t in technicians
         ]

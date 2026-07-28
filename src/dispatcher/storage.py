@@ -443,7 +443,13 @@ def _add_technician_assignment_support(conn: sqlite3.Connection) -> None:
     an alternate source of truth.
 
     Idempotent via the same PRAGMA table_info / CREATE TABLE IF NOT EXISTS
-    pattern used by every other migration in this module."""
+    pattern used by every other migration in this module.
+
+    2026-07-28: dispatch_group/closing_group are opaque, technician-owned
+    destination strings (the AI never parses or reasons about their
+    wording) -- added here as plain nullable columns via idempotent
+    ALTER TABLE for databases that already have a technicians table from
+    before this concept existed."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS technicians (
@@ -453,11 +459,18 @@ def _add_technician_assignment_support(conn: sqlite3.Connection) -> None:
             areas_json TEXT NOT NULL DEFAULT '[]',
             skills_json TEXT NOT NULL DEFAULT '[]',
             vehicle_restrictions_json TEXT NOT NULL DEFAULT '[]',
+            dispatch_group TEXT,
+            closing_group TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
     )
+    existing_technician_columns = {row[1] for row in conn.execute("PRAGMA table_info(technicians)")}
+    if "dispatch_group" not in existing_technician_columns:
+        conn.execute("ALTER TABLE technicians ADD COLUMN dispatch_group TEXT")
+    if "closing_group" not in existing_technician_columns:
+        conn.execute("ALTER TABLE technicians ADD COLUMN closing_group TEXT")
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
     if "assigned_technician_id" not in existing_columns:
         conn.execute(
@@ -817,23 +830,35 @@ def add_technician(
     areas: List[str],
     skills: Optional[List[str]] = None,
     vehicle_restrictions: Optional[List[str]] = None,
+    dispatch_group: Optional[str] = None,
+    closing_group: Optional[str] = None,
 ) -> int:
-    """Adds a technician to the roster. `areas` must be dispatch_group names
-    -- the same regional grouping rules/service_areas.yaml and rules.decide()
-    already use -- not free-text city names, so eligibility checks stay
-    anchored to the one existing area concept instead of inventing a second
-    one. `skills`/`vehicle_restrictions` are optional and explicit: empty
-    means "no additional restriction beyond the global vehicle-restriction
-    rules rules.decide() already enforces before a job ever reaches
-    assignment" -- never inferred or assumed."""
+    """Adds a technician to the roster. `areas` must be service-area names
+    -- the same geographic identity rules/service_areas.yaml and
+    rules.decide() already resolve to (e.g. "Charlotte") -- not a WhatsApp
+    group name, so eligibility checks stay anchored to the one existing
+    area concept. `skills`/`vehicle_restrictions` are optional and
+    explicit: empty means "no additional restriction beyond the global
+    vehicle-restriction rules rules.decide() already enforces before a job
+    ever reaches assignment" -- never inferred or assumed.
+
+    `dispatch_group`/`closing_group` are opaque destination strings (e.g.
+    a WhatsApp group name) -- purely informational, attached to this one
+    technician. Nothing in this codebase parses or reasons about their
+    wording; they're only ever displayed to the dispatcher once this
+    technician is selected for a job."""
     now = _now()
     cur = conn.execute(
         """
         INSERT INTO technicians (
-            name, active, areas_json, skills_json, vehicle_restrictions_json, created_at, updated_at
-        ) VALUES (?, 1, ?, ?, ?, ?, ?)
+            name, active, areas_json, skills_json, vehicle_restrictions_json,
+            dispatch_group, closing_group, created_at, updated_at
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, json.dumps(areas or []), json.dumps(skills or []), json.dumps(vehicle_restrictions or []), now, now),
+        (
+            name, json.dumps(areas or []), json.dumps(skills or []), json.dumps(vehicle_restrictions or []),
+            dispatch_group or None, closing_group or None, now, now,
+        ),
     )
     conn.commit()
     return cur.lastrowid
@@ -870,6 +895,11 @@ class AssignmentResult:
     reason: str
     technician_id: Optional[int] = None
     technician_name: Optional[str] = None
+    # Opaque destination strings from the selected technician's own record
+    # (None for "removed"/"handle_manually") -- for the dispatcher to use,
+    # never reasoned about by this module.
+    dispatch_group: Optional[str] = None
+    closing_group: Optional[str] = None
 
 
 def assign_technician(
@@ -886,14 +916,20 @@ def assign_technician(
 
     Never invents technician availability, skill match, acceptance, ETA, or
     completion -- only checks facts already on record: technician.active,
-    technician.areas against the job's own freshly re-derived dispatch_group
+    technician.areas against the job's own freshly re-derived service area
     (via the same find_service_area() the rest of the pipeline already uses
     -- never a stale or duplicated area concept), and technician.skills/
     vehicle_restrictions if explicitly configured. Falls back to "Handle
     Manually" the moment any of those facts don't unambiguously allow the
     assignment -- including when the job's own data is too incomplete to
     verify a configured restriction -- exactly like rules.decide() already
-    does for the rest of the pipeline."""
+    does for the rest of the pipeline.
+
+    Eligibility is reasoned about purely in terms of service-area identity
+    (e.g. "Charlotte") -- never a dispatch/closing group's wording. Once a
+    technician is selected, their own opaque dispatch_group/closing_group
+    are surfaced on the result for the dispatcher to use, not reasoned
+    about by this function."""
     job_row = conn.execute(
         "SELECT id, source, ticket_number, latest_fields_json, assigned_technician_id "
         "FROM jobs WHERE id = ?",
@@ -925,14 +961,17 @@ def assign_technician(
     else:
         area_lookup = find_service_area(city, state, service_areas)
         if area_lookup.status != "confirmed":
-            problems.append(f"job's service area is not confirmed for dispatch ({area_lookup.reason})")
-        elif not tech["areas"]:
-            problems.append(f"technician {tech['name']!r} has no configured coverage areas")
-        elif area_lookup.dispatch_group not in tech["areas"]:
-            problems.append(
-                f"technician {tech['name']!r} does not cover dispatch group "
-                f"{area_lookup.dispatch_group!r} (covers: {', '.join(tech['areas'])})"
-            )
+            problems.append(f"job's service area is not confirmed ({area_lookup.reason})")
+        else:
+            area_label = area_lookup.record.city or area_lookup.record.state
+            tech_areas_lower = {a.lower() for a in tech["areas"]}
+            if not tech["areas"]:
+                problems.append(f"technician {tech['name']!r} has no configured coverage areas")
+            elif (area_label or "").lower() not in tech_areas_lower:
+                problems.append(
+                    f"technician {tech['name']!r} does not cover service area "
+                    f"{area_label!r} (covers: {', '.join(tech['areas'])})"
+                )
 
     service_type = (fields.get("service_type") or "").lower()
     if tech["skills"]:
@@ -998,15 +1037,19 @@ def _apply_assignment_decision(
         )
     conn.commit()
 
-    tech_name = None
+    tech_name = tech_dispatch_group = tech_closing_group = None
     if result_technician_id:
-        row = conn.execute("SELECT name FROM technicians WHERE id = ?", (result_technician_id,)).fetchone()
-        tech_name = row[0] if row else None
+        row = conn.execute(
+            "SELECT name, dispatch_group, closing_group FROM technicians WHERE id = ?", (result_technician_id,),
+        ).fetchone()
+        if row:
+            tech_name, tech_dispatch_group, tech_closing_group = row
 
     outcome_map = {"Assign": "assigned", "Reassign": "reassigned", "Remove": "removed", "Handle Manually": "handle_manually"}
     return AssignmentResult(
         outcome=outcome_map[final_action], reason=reason,
         technician_id=result_technician_id, technician_name=tech_name,
+        dispatch_group=tech_dispatch_group, closing_group=tech_closing_group,
     )
 
 

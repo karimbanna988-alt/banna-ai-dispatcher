@@ -1,9 +1,16 @@
 """Permanent service-area lookup.
 
 Loads rules/service_areas.yaml and matches a job's city/state against it.
-Never guesses a dispatch/closing group: if either is missing on a matched
-record, the lookup comes back "unconfirmed" rather than filled in. See
-docs/phase1_scope.md, "Company profile architecture" and docs/architecture.md.
+
+2026-07-28: service areas hold ONLY geographic/business facts (city/state,
+active flag, recurring day off, default technician availability). They
+never held customer-facing routing information going forward -- dispatch
+and closing group names are opaque destination strings that live on
+individual technician records (see storage.py's technicians table), not
+here. This module never reasons about those names; it only resolves
+whether a job's location is a known, active service area. See
+docs/phase1_scope.md, "Company profile architecture" and
+docs/architecture.md section 10.
 """
 
 from __future__ import annotations
@@ -24,11 +31,13 @@ WEEKDAY_NAMES = (
 
 @dataclass(frozen=True)
 class ServiceAreaRecord:
+    """Geographic/business facts only -- no dispatch/closing group names.
+    Those are opaque, technician-owned destination strings (see
+    storage.py's technicians table), never area-level data."""
+
     city: Optional[str]
     state: Optional[str]
     zip_codes: List[str] = field(default_factory=list)
-    dispatch_group: Optional[str] = None
-    closing_group: Optional[str] = None
     active: bool = True
     default_technician_availability: str = "unknown"
     company_restrictions: List[str] = field(default_factory=list)
@@ -52,10 +61,15 @@ def is_recurring_day_off(record: ServiceAreaRecord, local_dt) -> bool:
 
 @dataclass
 class ServiceAreaLookup:
-    status: str  # "confirmed" | "unconfirmed" | "inactive" | "not_found"
+    """Status "unconfirmed" was retired 2026-07-28: it used to mean "known
+    area, but no dispatch/closing group set" -- group names no longer live
+    on areas at all, so a known, active area is "confirmed" as soon as
+    it's found. Confirming eligibility to actually dispatch a job now
+    happens one layer up, at technician assignment
+    (storage.assign_technician)."""
+
+    status: str  # "confirmed" | "inactive" | "not_found"
     record: Optional[ServiceAreaRecord]
-    dispatch_group: Optional[str]
-    closing_group: Optional[str]
     reason: str
 
 
@@ -77,7 +91,7 @@ def find_service_area(
 
     if not city_n and not state_n:
         return ServiceAreaLookup(
-            status="not_found", record=None, dispatch_group=None, closing_group=None,
+            status="not_found", record=None,
             reason="no city or state provided to match against the service-area mapping",
         )
 
@@ -97,7 +111,7 @@ def find_service_area(
             match = candidates[0]
         elif len(candidates) > 1:
             return ServiceAreaLookup(
-                status="not_found", record=None, dispatch_group=None, closing_group=None,
+                status="not_found", record=None,
                 reason=f"'{city}' matches more than one service-area entry with different states "
                        f"-- state must be confirmed to disambiguate",
             )
@@ -110,24 +124,17 @@ def find_service_area(
 
     if match is None:
         return ServiceAreaLookup(
-            status="not_found", record=None, dispatch_group=None, closing_group=None,
+            status="not_found",
+            record=None,
             reason=f"'{city or state}' was not found in the service-area mapping -- ask the dispatcher",
         )
 
     if not match.active:
         return ServiceAreaLookup(
-            status="inactive", record=match, dispatch_group=None, closing_group=None,
+            status="inactive", record=match,
             reason=f"{match.city or match.state} is marked inactive in the service-area mapping",
         )
 
-    if not match.dispatch_group or not match.closing_group:
-        return ServiceAreaLookup(
-            status="unconfirmed", record=match, dispatch_group=None, closing_group=None,
-            reason=f"{match.city or match.state} is a known working area, but its dispatch/closing "
-                   f"WhatsApp group has not been confirmed yet -- ask the dispatcher",
-        )
-
     return ServiceAreaLookup(
-        status="confirmed", record=match, dispatch_group=match.dispatch_group,
-        closing_group=match.closing_group, reason="matched a confirmed service-area entry",
+        status="confirmed", record=match, reason="matched a known, active service-area entry",
     )

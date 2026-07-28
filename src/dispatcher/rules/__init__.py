@@ -45,7 +45,14 @@ class Decision:
     missing_information: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     restrictions_triggered: List[str] = field(default_factory=list)
-    dispatch_group: Optional[str] = None
+    # The confirmed service area's own label (e.g. "Charlotte") -- NOT a
+    # WhatsApp dispatch group name. decide() has no way to know which
+    # technician (and therefore which dispatch/closing group) will handle
+    # this job; that's resolved later, by a human, at technician
+    # assignment (storage.assign_technician). Renamed from the old
+    # `dispatch_group` field 2026-07-28 so nothing here is ever mistaken
+    # for routing information.
+    service_area: Optional[str] = None
     quo_reply_suggestion: Optional[str] = None
 
 
@@ -86,12 +93,12 @@ def decide(
         [job.vehicle_restriction_reason] if job.vehicle_restriction_status in ("restricted", "unclear") else []
     )
 
-    def _decision(verdict: Verdict, reasons: List[str], dispatch_group: Optional[str] = None,
+    def _decision(verdict: Verdict, reasons: List[str], service_area: Optional[str] = None,
                   quo_reply_suggestion: Optional[str] = None) -> Decision:
         return Decision(
             verdict=verdict, confidence=job.overall_confidence, reasons=reasons,
             missing_information=missing, conflicts=conflicts, restrictions_triggered=restrictions_triggered,
-            dispatch_group=dispatch_group, quo_reply_suggestion=quo_reply_suggestion,
+            service_area=service_area, quo_reply_suggestion=quo_reply_suggestion,
         )
 
     # 1. Hard override: the parser already determined this can't be trusted.
@@ -108,13 +115,13 @@ def decide(
 
     if area.status == "not_found":
         return _decision(Verdict.HANDLE_MANUALLY, [area.reason])
-    if area.status == "unconfirmed":
-        return _decision(Verdict.HANDLE_MANUALLY, [area.reason])
     if area.status == "inactive":
         return _decision(Verdict.PASS, [area.reason])
 
-    # area.status == "confirmed" from here on.
-    dispatch_group = area.dispatch_group
+    # area.status == "confirmed" from here on. This is the area's own
+    # label, never a WhatsApp group name -- decide() has no visibility
+    # into technician-specific dispatch/closing groups (see Decision.service_area).
+    service_area = area.record.city or area.record.state
 
     daily_active = daily_rules is not None and not daily_rules.is_expired(now)
     area_labels = {v for v in (job.city.value, job.state.value, area.record.city, area.record.state) if v}
@@ -128,18 +135,18 @@ def decide(
             f"({area.record.recurring_day_off})"
         )
         if area.record.recurring_day_off_action.upper() == "HANDLE_MANUALLY":
-            return _decision(Verdict.HANDLE_MANUALLY, [reason], dispatch_group=dispatch_group)
-        return _decision(Verdict.PASS, [reason], dispatch_group=dispatch_group)
+            return _decision(Verdict.HANDLE_MANUALLY, [reason], service_area=service_area)
+        return _decision(Verdict.PASS, [reason], service_area=service_area)
 
     # 5. Daily exceptions (random, manually entered for the day) -- optional.
     tech_status = None
     if daily_active:
         if any(closed.lower() in area_labels_lower for closed in daily_rules.closed_areas):
             return _decision(
-                Verdict.PASS, ["area marked temporarily unavailable today"], dispatch_group=dispatch_group,
+                Verdict.PASS, ["area marked temporarily unavailable today"], service_area=service_area,
             )
         for area_name, status in daily_rules.technician_status.items():
-            if area_name.lower() in area_labels_lower or (dispatch_group and area_name.lower() == dispatch_group.lower()):
+            if area_name.lower() in area_labels_lower:
                 tech_status = status
                 break
 
@@ -147,21 +154,21 @@ def decide(
 
     if effective_tech_status in ("off", "busy"):
         return _decision(
-            Verdict.PASS, [f"technician for this area is {effective_tech_status} today"], dispatch_group=dispatch_group,
+            Verdict.PASS, [f"technician for this area is {effective_tech_status} today"], service_area=service_area,
         )
     if effective_tech_status == "unknown":
         return _decision(
             Verdict.HANDLE_MANUALLY,
             ["technician availability for this area is unknown and no confirmed backup exists"],
-            dispatch_group=dispatch_group,
+            service_area=service_area,
         )
 
     # 6. Vehicle restrictions.
     if job.vehicle_restriction_status == "restricted":
-        return _decision(Verdict.PASS, [job.vehicle_restriction_reason], dispatch_group=dispatch_group)
+        return _decision(Verdict.PASS, [job.vehicle_restriction_reason], service_area=service_area)
     if job.vehicle_restriction_status == "unclear":
         # Should already be caught by job.status above; kept as a safety net.
-        return _decision(Verdict.HANDLE_MANUALLY, [job.vehicle_restriction_reason], dispatch_group=dispatch_group)
+        return _decision(Verdict.HANDLE_MANUALLY, [job.vehicle_restriction_reason], service_area=service_area)
 
     if daily_active:
         vehicle_text = (job.vehicle.value or "").lower()
@@ -171,7 +178,7 @@ def decide(
             if r in vehicle_text or r in service_text:
                 restrictions_triggered.append(restriction)
                 return _decision(
-                    Verdict.PASS, [f"'{restriction}' is a temporary restriction today"], dispatch_group=dispatch_group,
+                    Verdict.PASS, [f"'{restriction}' is a temporary restriction today"], service_area=service_area,
                 )
 
     # 7. Nothing excluded it -- accept or flag for a closer look on confidence.
@@ -185,4 +192,4 @@ def decide(
              f"high-confidence threshold ({NEEDS_REVIEW_CONFIDENCE_THRESHOLD}) -- double-check before approving"
     )
     quo_reply = "K" if profile.requires_k else None
-    return _decision(verdict, [reason], dispatch_group=dispatch_group, quo_reply_suggestion=quo_reply)
+    return _decision(verdict, [reason], service_area=service_area, quo_reply_suggestion=quo_reply)

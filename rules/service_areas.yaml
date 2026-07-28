@@ -1,5 +1,16 @@
 # Permanent service-area mapping (business rules, not code).
 #
+# 2026-07-28: this file holds ONLY geographic/business facts -- city/state,
+# active flag, recurring day off, default technician availability, vehicle/
+# company restrictions. It intentionally does NOT hold dispatch_group or
+# closing_group values anymore. Those are opaque WhatsApp destination
+# strings that belong to individual technicians (configured per technician
+# in the app's "Technicians" tab / storage.py's technicians table), not to
+# an area -- a single area can have several technicians, each with their
+# own dispatch/closing group, and the system must never guess which one
+# applies from the wording of a group name. See docs/architecture.md
+# section 10.
+#
 # Business model confirmed by the business owner (2026-07-27):
 # - Every area is active by default, permanently. There is no daily
 #   "state open/closed" message in real operation.
@@ -20,12 +31,6 @@
 #   confirmed exclusion) or HANDLE_MANUALLY (still ask a human every time).
 #   Defaults to PASS; change per-area if the owner wants otherwise.
 #
-# dispatch_group and closing_group are intentionally left null (unconfirmed)
-# for every entry -- per explicit instruction, the system must never guess a
-# WhatsApp group name. A record with an unconfirmed group is treated as
-# "known area, but forces HANDLE MANUALLY" until a real dispatch_group/
-# closing_group value is filled in here.
-#
 # state is left null wherever the business owner gave only a bare city name
 # (several of these city names are ambiguous across multiple US states --
 # e.g. Arlington, Augusta, Columbia, Greenville, Chicago, Vancouver -- and
@@ -34,162 +39,134 @@
 # confirmed; until then, matching falls back to city-name-only (see
 # rules/service_areas.py).
 #
-# To add a new area: append another entry below. To confirm a group: fill
-# in dispatch_group/closing_group and remove the TODO note. No code changes
-# needed for either.
+# To add a new area: append another entry below. No code changes needed.
 
 - city: Arlington
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state (multiple US cities named Arlington) and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state (multiple US cities named Arlington)."
 
 - city: Augusta
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state (multiple US cities named Augusta) and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state (multiple US cities named Augusta)."
 
 - city: Charlotte
   state: NC
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm dispatch/closing WhatsApp group names."
+  notes: ""
 
 - city: Chicago
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: Saturday
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state and dispatch/closing WhatsApp group names. Recurring day off (Saturday) confirmed 2026-07-27."
+  notes: "TODO: confirm state. Recurring day off (Saturday) confirmed 2026-07-27."
 
 - city: Columbia
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state (multiple US cities named Columbia) and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state (multiple US cities named Columbia)."
 
 - city: null
   state: DE
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "Whole state (Delaware), not a specific city. TODO: confirm dispatch/closing WhatsApp group names."
+  notes: "Whole state (Delaware), not a specific city."
 
 - city: Greenville
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state (multiple US cities named Greenville) and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state (multiple US cities named Greenville)."
 
 - city: null
   state: NJ
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "Whole state (New Jersey), not a specific city. TODO: confirm dispatch/closing WhatsApp group names."
+  notes: "Whole state (New Jersey), not a specific city."
 
 - city: Raleigh
   state: NC
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: Sunday
   recurring_day_off_action: PASS
-  notes: "Added 2026-07-27. Recurring day off (Sunday) confirmed 2026-07-27. TODO: confirm dispatch/closing WhatsApp group names."
+  notes: "Added 2026-07-27. Recurring day off (Sunday) confirmed 2026-07-27."
 
 - city: San Antonio
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state."
 
 - city: Savannah
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state."
 
 - city: Vancouver
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state/country (Vancouver, WA vs Vancouver, BC Canada) and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state/country (Vancouver, WA vs Vancouver, BC Canada)."
 
 - city: Virginia Beach
   state: null
   zip_codes: []
-  dispatch_group: null
-  closing_group: null
   active: true
   default_technician_availability: available
   company_restrictions: []
   recurring_day_off: null
   recurring_day_off_action: PASS
-  notes: "TODO: confirm state and dispatch/closing WhatsApp group names."
+  notes: "TODO: confirm state."

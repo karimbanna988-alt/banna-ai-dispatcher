@@ -508,7 +508,7 @@ def test_technicians_tab_add_and_list(app):
     assert "Alex" in table["Name"].values
     row = table[table["Name"] == "Alex"].iloc[0]
     assert row["Active"] == "Yes"
-    assert "Charlotte" in row["Areas"] and "Raleigh" in row["Areas"]
+    assert "Charlotte" in row["Service areas"] and "Raleigh" in row["Service areas"]
     assert row["Skills"] == "lockout"
 
 
@@ -544,12 +544,12 @@ def test_technicians_tab_toggle_active(app):
 
 
 # ------------------------------------------ Jobs tab: assign technician ----
-def test_jobs_tab_assignment_is_blocked_for_a_real_unconfirmed_service_area(app):
-    """rules/service_areas.yaml has every dispatch_group unconfirmed today
-    -- confirmed by direct inspection. So even a technician whose
-    configured area matches the job's city exactly must still come back
-    Handle Manually through the real app config, never a silent success.
-    This is the correct, inherited behavior, not a gap in this feature."""
+def test_jobs_tab_assignment_is_blocked_when_job_area_is_not_in_the_real_mapping(app):
+    """The simulator's AGN fixture uses city "Faketown", which isn't in
+    the real rules/service_areas.yaml at all -- so even a technician whose
+    configured area matches that city exactly must still come back Handle
+    Manually (area lookup: not_found), never a silent success. This is
+    correct, inherited behavior, not a gap in this feature."""
     select_scenario(app, "New job -- AGN")
     deliver_next(app)
     click_process_action(app, "Approve")

@@ -30,10 +30,7 @@ def load(name: str) -> str:
 
 
 def confirmed_area():
-    return ServiceAreaRecord(
-        city="Faketown", state="NC", dispatch_group="TestGroup", closing_group="TestClose",
-        default_technician_availability="available",
-    )
+    return ServiceAreaRecord(city="Faketown", state="NC", default_technician_availability="available")
 
 
 def test_first_message_for_a_ticket_is_new(conn, vehicle_rules):
