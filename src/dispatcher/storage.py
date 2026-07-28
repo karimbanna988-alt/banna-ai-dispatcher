@@ -122,6 +122,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_job_status_columns_and_backfill(conn)
     _add_technician_assignment_support(conn)
     _add_whatsapp_handoff_support(conn)
+    _add_outbound_log_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -507,6 +508,39 @@ def _add_whatsapp_handoff_support(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_whatsapp_handoffs_job_id ON whatsapp_handoffs (job_id)"
+    )
+    conn.commit()
+
+
+def _add_outbound_log_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same pattern as every other migration in this
+    module. Every outbound attempt -- previewed, blocked, duplicate, or
+    (in a future phase) actually sent -- is recorded here before any
+    network call could happen, so the audit trail covers every attempt,
+    not just successful sends. See dispatcher/outbound.py, which is the
+    only module permitted to write to this table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quo_outbound_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            job_id INTEGER,
+            quo_contact_id TEXT NOT NULL,
+            proposed_text TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            approved_by TEXT,
+            requested_at TEXT NOT NULL,
+            sent_at TEXT,
+            response_status TEXT,
+            FOREIGN KEY (job_id) REFERENCES jobs (id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_quo_outbound_log_job_id ON quo_outbound_log (job_id)"
     )
     conn.commit()
 
@@ -992,6 +1026,36 @@ def get_whatsapp_handoffs(conn: sqlite3.Connection, job_id: int) -> List[dict]:
     )
     columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def is_outbound_duplicate(conn: sqlite3.Connection, idempotency_key: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM quo_outbound_log WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+    return row is not None
+
+
+def record_outbound_attempt(
+    conn: sqlite3.Connection, *, idempotency_key: str, source: str, job_id: Optional[int],
+    quo_contact_id: str, proposed_text: str, mode: str, outcome: str, reason: str,
+    approved_by: Optional[str] = None,
+) -> None:
+    """Records exactly one outbound attempt -- called for every outcome
+    (previewed/blocked/duplicate), not only a real send, and always
+    before any network call could occur. `INSERT OR IGNORE` on the unique
+    idempotency_key means a second attempt with the same key is silently
+    absorbed here too, in addition to the explicit is_outbound_duplicate()
+    check callers are expected to make first."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO quo_outbound_log (
+            idempotency_key, source, job_id, quo_contact_id, proposed_text,
+            mode, outcome, reason, approved_by, requested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (idempotency_key, source, job_id, quo_contact_id, proposed_text, mode, outcome, reason, approved_by, _now()),
+    )
+    conn.commit()
 
 
 @dataclass
