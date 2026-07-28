@@ -1,7 +1,7 @@
-"""Tests for boss_demo.py -- the temporary, password-protected, read-only
-LIVE boss demo. Reuses the exact same storage.py/quo_client.py/quo_ingest.py
+"""Tests for luxor_demo.py -- the temporary, password-protected, read-only
+LIVE Luxor Dispatcher Preview. Reuses the exact same storage.py/quo_client.py/quo_ingest.py
 this whole suite already exercises; these tests focus on the new surface
-area boss_demo.py adds: the password gate, masking, absence of any
+area luxor_demo.py adds: the password gate, masking, absence of any
 mutation control, and that the refresh action only ever touches the
 existing durable pending-queue bookkeeping, never jobs/events directly."""
 
@@ -12,7 +12,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-import boss_demo
+import luxor_demo
 from dispatcher import storage
 from dispatcher.parser import extract_job, load_vehicle_rules
 from dispatcher.quo_client import Contact, QuoMessage
@@ -39,13 +39,13 @@ def app_env(db_path, monkeypatch):
     # Keep the real QUO_API_KEY out of the test process entirely -- same
     # reasoning as test_app_integration.py's own `app` fixture.
     monkeypatch.setenv("QUO_API_KEY", "")
-    monkeypatch.delenv("BOSS_DEMO_PASSWORD", raising=False)
+    monkeypatch.delenv("LUXOR_DEMO_PASSWORD", raising=False)
     st.cache_resource.clear()
     return db_path
 
 
 def make_app(password=None):
-    at = AppTest.from_file("boss_demo.py", default_timeout=30)
+    at = AppTest.from_file("luxor_demo.py", default_timeout=30)
     at.run()
     assert len(at.exception) == 0
     return at
@@ -64,24 +64,24 @@ def seed_one_job(db_path, ticket="FAKE1"):
 # -------------------------------------------------------------- Auth gate
 def test_no_password_env_var_denies_access(app_env):
     at = make_app()
-    assert any("BOSS_DEMO_PASSWORD" in e.value for e in at.error)
+    assert any("LUXOR_DEMO_PASSWORD" in e.value for e in at.error)
     assert at.text_input == []  # no password field shown, no dashboard
     assert at.table == []
 
 
 def test_incorrect_password_rejected(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "correct-horse-battery-staple")
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("wrong-password").run()
+    at.text_input(key="luxor_demo_password_input").set_value("wrong-password").run()
     at.button[0].click().run()
     assert any("Incorrect password" in e.value for e in at.error)
     assert at.table == []  # still no dashboard content
 
 
 def test_correct_password_shows_dashboard(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "correct-horse-battery-staple")
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("correct-horse-battery-staple").run()
+    at.text_input(key="luxor_demo_password_input").set_value("correct-horse-battery-staple").run()
     at.button[0].click().run()
     assert any("Jobs" == h.value for h in at.subheader)
     assert len(at.table) >= 1  # status counts + jobs tables rendered
@@ -89,10 +89,10 @@ def test_correct_password_shows_dashboard(app_env, monkeypatch):
 
 # ------------------------------------------------------- No mutation UI --
 def test_no_mutation_controls_appear(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     seed_one_job(app_env)
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
 
     button_labels = {b.label for b in at.button}
@@ -103,16 +103,16 @@ def test_no_mutation_controls_appear(app_env, monkeypatch):
 
 # --------------------------------------------------------------- Masking
 def test_sensitive_identifiers_are_masked_in_timeline(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     seed_one_job(app_env)  # agn_clean.txt contains "1-555-010-3000 (Job Ext: 123)"
 
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
 
-    select_box = at.selectbox(key="boss_demo_job_select")
+    select_box = at.selectbox(key="luxor_demo_job_select")
     select_box.select(select_box.options[0]).run()
-    at.button(key="boss_demo_show_timeline").click().run()
+    at.button(key="luxor_demo_show_timeline").click().run()
 
     assert len(at.json) == 1
     event = json.loads(at.json[0].value)
@@ -125,7 +125,7 @@ def test_sensitive_identifiers_are_masked_in_timeline(app_env, monkeypatch):
 def test_masking_function_directly():
     """Unit-level check of the masking helper itself, independent of the
     full app render."""
-    masked = boss_demo.mask_sensitive("Ph: 1-555-010-3000 (Job Ext: 123)")
+    masked = luxor_demo.mask_sensitive("Ph: 1-555-010-3000 (Job Ext: 123)")
     assert "555-010-3000" not in masked
     assert "123" not in masked or "[extension masked]" in masked
     assert "[phone masked]" in masked
@@ -133,13 +133,13 @@ def test_masking_function_directly():
 
 
 def test_masking_function_handles_none_and_empty():
-    assert boss_demo.mask_sensitive(None) is None
-    assert boss_demo.mask_sensitive("") == ""
+    assert luxor_demo.mask_sensitive(None) is None
+    assert luxor_demo.mask_sensitive("") == ""
 
 
 # -------------------------------------------------- Real jobs, unchanged
 def test_existing_jobs_remain_unchanged_after_viewing(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     seed_one_job(app_env)
 
     conn = storage.connect(app_env)
@@ -148,7 +148,7 @@ def test_existing_jobs_remain_unchanged_after_viewing(app_env, monkeypatch):
     conn.close()
 
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
     assert any("1" in m.value for m in at.metric)  # Total jobs metric rendered
 
@@ -178,7 +178,7 @@ def _fake_quo_client_factory(contacts_by_id, messages_by_phone):
 
 
 def test_refresh_button_never_touches_jobs_or_events(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     monkeypatch.setenv("QUO_API_KEY", "test-key-not-real")
     seed_one_job(app_env)
 
@@ -192,12 +192,12 @@ def test_refresh_button_never_touches_jobs_or_events(app_env, monkeypatch):
         for g in real_config.dispatch_groups
     }
     inbound = QuoMessage(
-        id="BOSSDEMO1", to="PNus", from_number=agn_phone, text="Ref: AGN Locksmith Services\nPDL: BOSSDEMO1\n",
-        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVBD1", direction="incoming",
+        id="LUXORDEMO1", to="PNus", from_number=agn_phone, text="Ref: AGN Locksmith Services\nPDL: LUXORDEMO1\n",
+        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVLD1", direction="incoming",
         status="delivered", created_at="2026-07-28T10:00:00Z", updated_at="2026-07-28T10:00:00Z",
     )
     monkeypatch.setattr(
-        boss_demo.quo_client, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}),
+        luxor_demo.quo_client, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}),
     )
 
     conn = storage.connect(app_env)
@@ -206,9 +206,9 @@ def test_refresh_button_never_touches_jobs_or_events(app_env, monkeypatch):
     conn.close()
 
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
-    at.button(key="boss_demo_refresh").click().run()
+    at.button(key="luxor_demo_refresh").click().run()
     assert len(at.exception) == 0
     assert any("Refreshed" in s.value for s in at.success)
 
@@ -226,7 +226,7 @@ def test_refresh_button_never_touches_jobs_or_events(app_env, monkeypatch):
 
 
 def test_refresh_is_idempotent_on_repeated_click(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     monkeypatch.setenv("QUO_API_KEY", "test-key-not-real")
 
     real_config = load_dispatch_groups()
@@ -239,19 +239,19 @@ def test_refresh_is_idempotent_on_repeated_click(app_env, monkeypatch):
         for g in real_config.dispatch_groups
     }
     inbound = QuoMessage(
-        id="BOSSDEMO2", to="PNus", from_number=agn_phone, text="Ref: AGN Locksmith Services\nPDL: BOSSDEMO2\n",
-        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVBD2", direction="incoming",
+        id="LUXORDEMO2", to="PNus", from_number=agn_phone, text="Ref: AGN Locksmith Services\nPDL: LUXORDEMO2\n",
+        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVLD2", direction="incoming",
         status="delivered", created_at="2026-07-28T10:00:00Z", updated_at="2026-07-28T10:00:00Z",
     )
     monkeypatch.setattr(
-        boss_demo.quo_client, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}),
+        luxor_demo.quo_client, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}),
     )
 
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
-    at.button(key="boss_demo_refresh").click().run()
-    at.button(key="boss_demo_refresh").click().run()  # same stub, same message id -- click again
+    at.button(key="luxor_demo_refresh").click().run()
+    at.button(key="luxor_demo_refresh").click().run()  # same stub, same message id -- click again
     assert len(at.exception) == 0
     assert any("0 new message" in s.value for s in at.success)  # second click dedupes to zero
 
@@ -264,13 +264,13 @@ def test_refresh_is_idempotent_on_repeated_click(app_env, monkeypatch):
 
 
 def test_refresh_shows_safe_error_when_api_key_missing(app_env, monkeypatch):
-    monkeypatch.setenv("BOSS_DEMO_PASSWORD", "pw")
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "pw")
     monkeypatch.setenv("QUO_API_KEY", "")  # explicitly unset for this test
 
     at = make_app()
-    at.text_input(key="boss_demo_password_input").set_value("pw").run()
+    at.text_input(key="luxor_demo_password_input").set_value("pw").run()
     at.button[0].click().run()
-    at.button(key="boss_demo_refresh").click().run()
+    at.button(key="luxor_demo_refresh").click().run()
 
     assert len(at.exception) == 0
     assert any("not configured" in e.value for e in at.error)
@@ -279,27 +279,27 @@ def test_refresh_shows_safe_error_when_api_key_missing(app_env, monkeypatch):
 
 
 # ------------------------------------------------- Structural safety net
-def test_boss_demo_source_contains_no_write_http_verbs():
-    source = Path("boss_demo.py").read_text(encoding="utf-8")
+def test_luxor_demo_source_contains_no_write_http_verbs():
+    source = Path("luxor_demo.py").read_text(encoding="utf-8")
     for forbidden in (".post(", ".put(", ".delete(", ".patch("):
-        assert forbidden not in source, f"boss_demo.py must never call {forbidden!r}"
+        assert forbidden not in source, f"luxor_demo.py must never call {forbidden!r}"
 
 
-def test_boss_demo_source_never_calls_job_mutation_functions():
-    source = Path("boss_demo.py").read_text(encoding="utf-8")
+def test_luxor_demo_source_never_calls_job_mutation_functions():
+    source = Path("luxor_demo.py").read_text(encoding="utf-8")
     forbidden_calls = (
         "save_audit_entry", "assign_technician", "add_technician", "set_technician_active",
         "mark_quo_pending_message_actioned", "mark_quo_pending_message_loaded",
     )
     for forbidden in forbidden_calls:
-        assert forbidden not in source, f"boss_demo.py must never reference {forbidden!r}"
+        assert forbidden not in source, f"luxor_demo.py must never reference {forbidden!r}"
 
 
-def test_boss_demo_source_never_references_the_api_key_value():
+def test_luxor_demo_source_never_references_the_api_key_value():
     """The env var *name* is fine to reference (that's how os.environ.get
     reads it) -- this only guards against the raw key ever being printed,
     logged, or embedded as a literal."""
-    source = Path("boss_demo.py").read_text(encoding="utf-8")
+    source = Path("luxor_demo.py").read_text(encoding="utf-8")
     assert "print(" not in source
     assert "st.write(os.environ" not in source
     assert "st.write(api_key" not in source and "st.text(api_key" not in source

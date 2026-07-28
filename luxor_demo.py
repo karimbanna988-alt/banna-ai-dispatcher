@@ -1,4 +1,4 @@
-"""LUXOR LOCKSMITH -- read-only LIVE boss demo (temporary, shadow mode).
+"""LUXOR LOCKSMITH -- Live Dispatcher Preview (temporary, read-only, shadow mode).
 
 Reuses the project's existing GET-only Quo pipeline exactly as built --
 storage.connect(), dispatcher.quo_client.QuoClient, and
@@ -30,7 +30,7 @@ skipped, existing message-ID + checkpoint deduplication preserved.
 Nothing in this file, or in the modules it calls, is capable of a Quo
 POST/PUT/PATCH/DELETE.
 
-Password-gated via the BOSS_DEMO_PASSWORD environment variable only --
+Password-gated via the LUXOR_DEMO_PASSWORD environment variable only --
 never hardcoded, never logged, never committed.
 """
 
@@ -56,9 +56,9 @@ from dispatcher import quo_client, storage
 from dispatcher.quo_client import API_KEY_ENV_VAR, QuoAPIError, QuoConfigError
 from dispatcher.quo_ingest import poll_for_new_messages
 
-PASSWORD_ENV_VAR = "BOSS_DEMO_PASSWORD"
+PASSWORD_ENV_VAR = "LUXOR_DEMO_PASSWORD"
 
-st.set_page_config(page_title="LUXOR LOCKSMITH -- Boss Demo (Read-Only Live)", layout="wide")
+st.set_page_config(page_title="LUXOR LOCKSMITH -- Live Dispatcher Preview", layout="wide")
 
 
 # ------------------------------------------------------------- Masking ----
@@ -150,12 +150,56 @@ def fetch_last_refresh(conn: sqlite3.Connection) -> Optional[str]:
     return row[0] if row else None
 
 
+# Deterministic, documented partition of the 8 fixed job statuses (see
+# storage.VALID_JOB_STATUSES) into the 3 summary buckets requested for the
+# metrics row. Every status falls into exactly one bucket.
+_ACTIVE_STATUSES = {"New", "Approved", "In Progress"}
+_MANUAL_REVIEW_STATUSES = {"Needs Review", "Handle Manually"}
+_TERMINAL_STATUSES = {"Closed", "Cancelled", "Rejected"}
+
+
+def summarize_statuses(jobs: list[dict]) -> tuple[int, int, int]:
+    active = sum(1 for j in jobs if j["status"] in _ACTIVE_STATUSES)
+    needs_review = sum(1 for j in jobs if j["status"] in _MANUAL_REVIEW_STATUSES)
+    terminal = sum(1 for j in jobs if j["status"] in _TERMINAL_STATUSES)
+    return active, needs_review, terminal
+
+
 # ------------------------------------------------------------------- UI ---
 st.title("LUXOR LOCKSMITH")
-st.warning(
-    "\U0001F512 **READ-ONLY LIVE DEMO** -- **UNDER DEVELOPMENT / SHADOW MODE**. Nothing on this "
-    "page can approve, edit, reject, assign, close, or send anything, in Quo or anywhere else. "
-    "The team continues dispatching normally through Quo; this is a preview only."
+st.subheader("Live Dispatcher Preview")
+
+badge_col1, badge_col2, badge_col3 = st.columns(3)
+badge_col1.success("\U0001F7E2 LIVE QUO DATA")
+badge_col2.info("\U0001F512 READ-ONLY")
+badge_col3.warning("\U0001F6A7 UNDER DEVELOPMENT / SHADOW MODE")
+
+st.markdown("**What this system does**")
+st.markdown(
+    "- Reads real incoming jobs through the existing Quo GET-only integration.\n"
+    "- Extracts and structures job information.\n"
+    "- Detects duplicates, cancellations, corrections, and status requests.\n"
+    "- Checks service area and deterministic business restrictions.\n"
+    "- Preserves each job and its chronological audit history.\n"
+    "- Sends uncertain cases to manual review instead of guessing.\n"
+    "- Prepares the foundation for technician routing and controlled dispatch."
+)
+
+st.markdown("**Operational value**")
+st.markdown(
+    "- Reduces repetitive copying and manual message interpretation.\n"
+    "- Keeps jobs and updates in one searchable operational record.\n"
+    "- Reduces the chance of missed, duplicated, or incorrectly handled jobs.\n"
+    "- Makes previous decisions and edits traceable.\n"
+    "- Allows management to view current activity without accessing Quo directly."
+)
+
+st.markdown("**Current limitations**")
+st.markdown(
+    "- This is shadow mode: dispatch continues normally through Quo -- nothing here is authoritative yet.\n"
+    "- No outbound Quo writes of any kind (structurally GET-only).\n"
+    "- No automated WhatsApp sending.\n"
+    "- Technician roster and real routing configuration will be added later."
 )
 
 _password = os.environ.get(PASSWORD_ENV_VAR)
@@ -163,19 +207,20 @@ if not _password:
     st.error(f"This demo is not configured ({PASSWORD_ENV_VAR} is not set). Access refused.")
     st.stop()
 
-if "boss_demo_authenticated" not in st.session_state:
-    st.session_state.boss_demo_authenticated = False
+if "luxor_demo_authenticated" not in st.session_state:
+    st.session_state.luxor_demo_authenticated = False
 
-if not st.session_state.boss_demo_authenticated:
-    entered = st.text_input("Password", type="password", key="boss_demo_password_input")
+if not st.session_state.luxor_demo_authenticated:
+    entered = st.text_input("Password", type="password", key="luxor_demo_password_input")
     if st.button("Enter", type="primary"):
         if hmac.compare_digest(entered, _password):
-            st.session_state.boss_demo_authenticated = True
+            st.session_state.luxor_demo_authenticated = True
             st.rerun()
         else:
             st.error("Incorrect password.")
     st.stop()
 
+st.divider()
 st.subheader("Live Quo refresh (GET-only)")
 st.caption(
     "Uses the exact same read-only polling pipeline as the internal tool's Quo Inbox (Live) tab -- "
@@ -185,7 +230,7 @@ st.caption(
     "pending-review queue the dispatcher already uses -- it only becomes a full job record once "
     "a dispatcher reviews and approves it in the internal tool; this demo cannot do that itself."
 )
-if st.button("Refresh live jobs from Quo", type="primary", key="boss_demo_refresh"):
+if st.button("Refresh live jobs from Quo", type="primary", key="luxor_demo_refresh"):
     api_key = os.environ.get(API_KEY_ENV_VAR)
     if not api_key:
         st.error("Quo is not configured in this environment.")
@@ -209,18 +254,22 @@ if st.button("Refresh live jobs from Quo", type="primary", key="boss_demo_refres
 conn = get_readonly_connection()
 
 last_refresh = fetch_last_refresh(conn)
-st.write(f"Last successful Quo refresh: **{last_refresh or '(not refreshed yet this session)'}**")
 pending_count = fetch_pending_review_count(conn)
 st.write(f"**{pending_count} new Quo message(s)** queued and awaiting dispatcher review (not yet a job record).")
 
 jobs = fetch_jobs(conn)
 status_counts = fetch_job_status_counts(conn)
+active_count, needs_review_count, terminal_count = summarize_statuses(jobs)
 
 st.subheader("Overview")
-col1, col2 = st.columns([1, 3])
-col1.metric("Total jobs", len(jobs))
-with col2:
-    st.write("**Status counts**")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Total jobs", len(jobs))
+m2.metric("Active / open", active_count)
+m3.metric("Needs manual review", needs_review_count)
+m4.metric("Completed / cancelled", terminal_count)
+m5.metric("Last Quo refresh", last_refresh or "Never")
+
+with st.expander("Status breakdown"):
     st.table([{"Status": status, "Count": count} for status, count in status_counts])
 
 st.subheader("Jobs")
@@ -244,8 +293,8 @@ st.table(
 if jobs:
     st.subheader("Job audit timeline")
     job_options = {f"{j['source']} | {j['ticket_number']} ({j['status']})": j["id"] for j in jobs}
-    selected_label = st.selectbox("Select a job", options=list(job_options.keys()), key="boss_demo_job_select")
-    if st.button("Show timeline", key="boss_demo_show_timeline"):
+    selected_label = st.selectbox("Select a job", options=list(job_options.keys()), key="luxor_demo_job_select")
+    if st.button("Show timeline", key="luxor_demo_show_timeline"):
         timeline = fetch_timeline(conn, job_options[selected_label])
         if not timeline:
             st.info("No events found.")
