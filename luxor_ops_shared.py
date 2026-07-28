@@ -153,6 +153,74 @@ def fetch_jobs(conn: sqlite3.Connection) -> list[dict]:
     return rows
 
 
+def _split_multivalue(value) -> list:
+    return [v.strip() for v in (value or "").split(";") if v.strip()]
+
+
+def parse_technician_csv(csv_text: str, existing_names: set, service_areas: list) -> tuple:
+    """The one shared technician-roster-import parser -- used by both
+    luxor_ops_pages/technicians.py's file uploader and any offline
+    preview script, so there is never a second CSV parser reimplementing
+    this. Every area is validated against the canonical service-area
+    configuration via resolve_area_text() and stored using its RESOLVED
+    canonical label (e.g. "NJ" for "New Jersey", not the raw input text)
+    -- the technician-eligibility matching functions in storage.py match
+    on that exact canonical label, so storing anything else would
+    silently make the technician unmatchable. A row with any
+    unresolvable area is rejected entirely (not partially imported) with
+    a specific reason. Returns (proposed_records, errors) -- nothing is
+    written to any database by this function."""
+    import csv
+    import io
+
+    from dispatcher.rules.service_areas import resolve_area_text
+
+    proposed: list = []
+    errors: list = []
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    required_columns = {"name", "areas"}
+    if not required_columns.issubset(set(reader.fieldnames or [])):
+        errors.append(f"CSV must include at least columns: {', '.join(sorted(required_columns))}")
+        return proposed, errors
+
+    for i, row in enumerate(reader, start=2):  # header is row 1
+        name = (row.get("name") or "").strip()
+        raw_areas = _split_multivalue(row.get("areas"))
+        if not name:
+            errors.append(f"Row {i}: missing name -- skipped")
+            continue
+        if not raw_areas:
+            errors.append(f"Row {i}: {name!r} has no service areas -- skipped")
+            continue
+        if name in existing_names:
+            errors.append(f"Row {i}: {name!r} is already on the roster -- skipped")
+            continue
+
+        resolved_areas = []
+        area_rejected = False
+        for raw_area in raw_areas:
+            lookup = resolve_area_text(raw_area, service_areas)
+            if lookup.status != "confirmed":
+                errors.append(f"Row {i}: {name!r}'s area {raw_area!r} could not be confirmed ({lookup.reason}) -- row skipped")
+                area_rejected = True
+                break
+            resolved_areas.append(lookup.record.city or lookup.record.state)
+        if area_rejected:
+            continue
+
+        proposed.append({
+            "name": name,
+            "areas": resolved_areas,
+            "skills": _split_multivalue(row.get("skills")),
+            "vehicle_restrictions": _split_multivalue(row.get("vehicle_restrictions")),
+            "dispatch_group": (row.get("dispatch_group") or "").strip() or None,
+            "closing_group": (row.get("closing_group") or "").strip() or None,
+        })
+
+    return proposed, errors
+
+
 def fetch_pending_message_by_id(conn: sqlite3.Connection, message_id: str) -> Optional[dict]:
     row = conn.execute("SELECT * FROM quo_pending_messages WHERE message_id = ?", (message_id,)).fetchone()
     if row is None:

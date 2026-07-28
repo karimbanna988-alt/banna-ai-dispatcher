@@ -156,3 +156,36 @@ def test_row_missing_required_fields_is_skipped_with_warning(app_env):
     assert len(at.exception) == 0
     assert len(at.warning) == 2  # missing name, missing areas
     assert not any(b.key == "luxor_ops_import_technicians" for b in at.button)
+
+
+def test_row_with_unconfigured_area_is_rejected_with_reason(app_env):
+    csv_content = "name,areas\nFabricated Tech,Nowhereville\n"
+    at = make_page("technicians")
+    uploader = at.get("file_uploader")[0]
+    uploader.set_value(("roster.csv", csv_content.encode("utf-8"), "text/csv"))
+    at.run()
+    assert len(at.exception) == 0
+    assert any("Nowhereville" in w.value and "could not be confirmed" in w.value for w in at.warning)
+    assert not any(b.key == "luxor_ops_import_technicians" for b in at.button)
+
+    conn = storage.connect(app_env)
+    count = conn.execute("SELECT COUNT(*) FROM technicians").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_row_with_typo_area_is_corrected_and_importable(app_env):
+    csv_content = "name,areas\nFabricated Tech,raliegh\n"
+    at = make_page("technicians")
+    uploader = at.get("file_uploader")[0]
+    uploader.set_value(("roster.csv", csv_content.encode("utf-8"), "text/csv"))
+    at.run()
+    assert len(at.exception) == 0
+    rendered = "\n".join(m.value for m in at.markdown) + "\n".join(c.value for c in at.caption)
+    assert "Raleigh" in rendered  # corrected, canonical spelling shown
+
+    at.button(key="luxor_ops_import_technicians").click().run()
+    conn = storage.connect(app_env)
+    areas = conn.execute("SELECT areas_json FROM technicians WHERE name = 'Fabricated Tech'").fetchone()[0]
+    conn.close()
+    assert "Raleigh" in areas

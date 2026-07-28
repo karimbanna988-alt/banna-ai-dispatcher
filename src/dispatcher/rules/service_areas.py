@@ -84,6 +84,58 @@ def _norm(value: Optional[str]) -> Optional[str]:
     return value.strip().lower() if value else None
 
 
+# Full state names -> the two-letter abbreviation rules/service_areas.yaml
+# itself always uses. Only the states that have actually come up in real
+# business data so far -- never guess a state that isn't explicitly named
+# here; an unrecognized full name is left as-is and will simply fail to
+# match anything in find_service_area(), which is the correct, safe
+# outcome (surfaced as "not found" rather than silently misresolved).
+_STATE_NAME_TO_ABBR = {
+    "south carolina": "SC", "north carolina": "NC", "new jersey": "NJ",
+    "georgia": "GA", "washington": "WA", "virginia": "VA", "illinois": "IL",
+    "delaware": "DE", "texas": "TX",
+}
+
+# Obvious, unambiguous typo corrections only -- deliberately a short,
+# explicit allowlist, never a fuzzy/similarity matcher. Every key here
+# corrects to a city name actually present in rules/service_areas.yaml.
+_KNOWN_CITY_TYPO_CORRECTIONS = {
+    "raliegh": "Raleigh", "charlottle": "Charlotte", "chichgo": "Chicago",
+}
+
+
+def resolve_area_text(raw_text: str, areas: List[ServiceAreaRecord]) -> ServiceAreaLookup:
+    """Resolves a free-text place name -- "Columbia, South Carolina",
+    "Raleigh, NC", "New Jersey", "raliegh" -- against the canonical
+    service-area configuration, for contexts (like the technician roster
+    import preview) that don't already have separately-parsed city/state
+    fields the way an extracted job does. Reuses find_service_area()
+    unchanged; this only normalizes free text into the (city, state)
+    shape that function already expects. Never invents a match: an
+    unrecognized place name (e.g. "Atlanta", which isn't in
+    rules/service_areas.yaml at all) resolves to status "not_found",
+    exactly like any other unconfirmed location."""
+    text = (raw_text or "").strip()
+    if not text:
+        return ServiceAreaLookup(status="not_found", record=None, reason="no area text supplied")
+
+    if "," in text:
+        city_part, _, state_part = text.partition(",")
+        city_part, state_part = city_part.strip(), state_part.strip()
+    else:
+        city_part, state_part = text, ""
+
+    corrected_city = _KNOWN_CITY_TYPO_CORRECTIONS.get(city_part.lower(), city_part)
+
+    # A bare, unqualified full state name (no comma, no city) -- e.g. the
+    # whole input is "New Jersey" -- resolves as state-only, not a city.
+    if not state_part and corrected_city.lower() in _STATE_NAME_TO_ABBR:
+        return find_service_area(None, _STATE_NAME_TO_ABBR[corrected_city.lower()], areas)
+
+    state_abbr = _STATE_NAME_TO_ABBR.get(state_part.lower(), state_part or None)
+    return find_service_area(corrected_city or None, state_abbr, areas)
+
+
 def find_service_area(
     city: Optional[str], state: Optional[str], areas: List[ServiceAreaRecord]
 ) -> ServiceAreaLookup:

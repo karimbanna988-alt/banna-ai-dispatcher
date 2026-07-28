@@ -1,4 +1,9 @@
-from dispatcher.rules.service_areas import ServiceAreaRecord, find_service_area, load_service_areas
+from dispatcher.rules.service_areas import (
+    ServiceAreaRecord,
+    find_service_area,
+    load_service_areas,
+    resolve_area_text,
+)
 
 
 def test_loads_real_service_areas_file():
@@ -43,3 +48,45 @@ def test_active_area_is_confirmed():
     lookup = find_service_area("Testville", "TS", areas)
     assert lookup.status == "confirmed"
     assert lookup.record.city == "Testville"
+
+
+# ------------------------------------------------------- resolve_area_text
+def _synthetic_areas():
+    return [
+        ServiceAreaRecord(city="Faketon", state="FS"),
+        ServiceAreaRecord(city=None, state="NJ"),  # whole-state entry, mirrors the real New Jersey record
+    ]
+
+
+def test_resolve_area_text_city_and_full_state_name():
+    lookup = resolve_area_text("Faketon, Fake State", _synthetic_areas())
+    # "Fake State" isn't in the abbreviation table, so this falls back to
+    # city-only matching -- still resolves correctly since Faketon is
+    # unambiguous in this synthetic set.
+    assert lookup.status == "confirmed"
+    assert lookup.record.city == "Faketon"
+
+
+def test_resolve_area_text_bare_full_state_name():
+    lookup = resolve_area_text("New Jersey", _synthetic_areas())
+    assert lookup.status == "confirmed"
+    assert lookup.record.state == "NJ"
+    assert lookup.record.city is None  # whole-state entry, area label will be "NJ" not a city
+
+
+def test_resolve_area_text_typo_correction():
+    lookup = resolve_area_text("raliegh", load_service_areas())
+    assert lookup.status == "confirmed"
+    assert lookup.record.city == "Raleigh"
+
+
+def test_resolve_area_text_rejects_unconfigured_place_without_inventing_it():
+    """"Atlanta" is not in rules/service_areas.yaml -- must resolve as
+    not_found, never silently matched to something else or added."""
+    lookup = resolve_area_text("Atlanta", load_service_areas())
+    assert lookup.status == "not_found"
+
+
+def test_resolve_area_text_empty_input_is_not_found():
+    lookup = resolve_area_text("", _synthetic_areas())
+    assert lookup.status == "not_found"

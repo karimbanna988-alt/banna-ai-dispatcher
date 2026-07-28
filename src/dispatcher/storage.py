@@ -26,6 +26,7 @@ from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
 from .rules.service_areas import ServiceAreaRecord, find_service_area
+from .rules.service_categories import KNOWN_SERVICE_CATEGORIES, classify_service_categories, normalize_skill_label
 from .updates import map_status_to_reply
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "dispatcher.db"
@@ -1151,6 +1152,92 @@ class AssignmentResult:
     closing_group: Optional[str] = None
 
 
+def _skill_matches(skill: str, service_type_lower: str) -> bool:
+    """Tries the deterministic service-category classifier first (for the
+    five known car/house lockout/keys/lock-installation categories --
+    matched regardless of whether the stored skill uses spaces,
+    underscores, or mixed case); falls back to the original plain
+    substring test for any other, free-text skill string so
+    existing/future non-category skills keep matching exactly as before."""
+    normalized = normalize_skill_label(skill)
+    if normalized in KNOWN_SERVICE_CATEGORIES:
+        return normalized in classify_service_categories(service_type_lower)
+    return skill.lower() in service_type_lower
+
+
+def _technician_area_problem(tech: dict, area_label: Optional[str]) -> Optional[str]:
+    """Only meaningful once an area_label has already been confirmed --
+    by find_service_area() in assign_technician(), or supplied directly
+    by list_eligible_technicians_for(). Returns a single problem
+    string, or None if the technician covers this area."""
+    if not area_label:
+        return "no confirmed service area to check against"
+    tech_areas_lower = {a.lower() for a in tech["areas"]}
+    if not tech["areas"]:
+        return f"technician {tech['name']!r} has no configured coverage areas"
+    if area_label.lower() not in tech_areas_lower:
+        return (
+            f"technician {tech['name']!r} does not cover service area "
+            f"{area_label!r} (covers: {', '.join(tech['areas'])})"
+        )
+    return None
+
+
+def _technician_skill_problem(tech: dict, service_type: Optional[str]) -> Optional[str]:
+    service_type_lower = (service_type or "").lower()
+    if not tech["skills"]:
+        return None
+    if not service_type_lower:
+        return f"job has no service type on record -- cannot verify technician {tech['name']!r}'s configured skills"
+    if not any(_skill_matches(skill, service_type_lower) for skill in tech["skills"]):
+        return f"technician {tech['name']!r}'s configured skills don't cover this job's service type"
+    return None
+
+
+def _technician_vehicle_problem(tech: dict, vehicle: Optional[str]) -> Optional[str]:
+    vehicle_lower = (vehicle or "").lower()
+    if not tech["vehicle_restrictions"]:
+        return None
+    if not vehicle_lower:
+        return (
+            f"job has no vehicle info on record -- cannot verify technician "
+            f"{tech['name']!r}'s configured vehicle restrictions"
+        )
+    if any(r.lower() in vehicle_lower for r in tech["vehicle_restrictions"]):
+        return f"technician {tech['name']!r} is explicitly restricted from this job's vehicle"
+    return None
+
+
+def list_eligible_technicians_for(
+    conn: sqlite3.Connection,
+    area_label: str,
+    service_type: Optional[str] = None,
+    vehicle: Optional[str] = None,
+    active_only: bool = True,
+) -> List[dict]:
+    """Read-only: every technician with zero eligibility problems against
+    an already-confirmed area_label (e.g. "Greenville", "NJ") and
+    optional service_type/vehicle. Unlike assign_technician(), never
+    resolves area_label itself from a job's raw city/state -- the caller
+    already knows which canonical area it's asking about (used for the
+    routing-matrix preview and any future "show all eligible candidates"
+    UI). Returns technicians in list_technicians()'s stable, name-sorted
+    order -- multiple eligible technicians are never reordered or reduced
+    to one by database/iteration order; presenting the full list for a
+    human to choose from is the caller's responsibility, not this
+    function's."""
+    eligible = []
+    for tech in list_technicians(conn, active_only=active_only):
+        if _technician_area_problem(tech, area_label):
+            continue
+        if _technician_skill_problem(tech, service_type):
+            continue
+        if _technician_vehicle_problem(tech, vehicle):
+            continue
+        eligible.append(tech)
+    return eligible
+
+
 def assign_technician(
     conn: sqlite3.Connection,
     job_id: int,
@@ -1213,30 +1300,17 @@ def assign_technician(
             problems.append(f"job's service area is not confirmed ({area_lookup.reason})")
         else:
             area_label = area_lookup.record.city or area_lookup.record.state
-            tech_areas_lower = {a.lower() for a in tech["areas"]}
-            if not tech["areas"]:
-                problems.append(f"technician {tech['name']!r} has no configured coverage areas")
-            elif (area_label or "").lower() not in tech_areas_lower:
-                problems.append(
-                    f"technician {tech['name']!r} does not cover service area "
-                    f"{area_label!r} (covers: {', '.join(tech['areas'])})"
-                )
+            area_problem = _technician_area_problem(tech, area_label)
+            if area_problem:
+                problems.append(area_problem)
 
-    service_type = (fields.get("service_type") or "").lower()
-    if tech["skills"]:
-        if not service_type:
-            problems.append(f"job has no service type on record -- cannot verify technician {tech['name']!r}'s configured skills")
-        elif not any(skill.lower() in service_type for skill in tech["skills"]):
-            problems.append(f"technician {tech['name']!r}'s configured skills don't cover this job's service type")
+    skill_problem = _technician_skill_problem(tech, fields.get("service_type"))
+    if skill_problem:
+        problems.append(skill_problem)
 
-    vehicle = (fields.get("vehicle") or "").lower()
-    if tech["vehicle_restrictions"]:
-        if not vehicle:
-            problems.append(
-                f"job has no vehicle info on record -- cannot verify technician {tech['name']!r}'s configured vehicle restrictions"
-            )
-        elif any(r.lower() in vehicle for r in tech["vehicle_restrictions"]):
-            problems.append(f"technician {tech['name']!r} is explicitly restricted from this job's vehicle")
+    vehicle_problem = _technician_vehicle_problem(tech, fields.get("vehicle"))
+    if vehicle_problem:
+        problems.append(vehicle_problem)
 
     if problems:
         return _apply_assignment_decision(
