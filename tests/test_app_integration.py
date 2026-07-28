@@ -170,19 +170,22 @@ def test_explicit_cancellation_is_classified(app):
     assert [e["message_type"] for e in timeline] == ["NEW", "CANCELLATION"]
 
 
-def test_cancellation_worded_differently_is_a_documented_gap(app):
-    """Known, accepted gap: CANCELLATION detection is a substring check for
-    the literal word "cancel". Several real messages hit during manual
-    testing 2026-07-27 ("no longer needs service", "found her keys...")
-    never say "cancel" and fall through to UNRECOGNIZED today."""
-    select_scenario(app, "Customer cancellation -- worded differently (known gap)")
+def test_cancellation_worded_differently_is_now_correctly_classified(app):
+    """Previously a documented, accepted gap: CANCELLATION detection was a
+    substring check for the literal word "cancel" only. Fixed 2026-07-29
+    with conservative, deterministic reworded-phrase patterns (see
+    storage._is_confident_cancellation) -- the real message that
+    originally exposed this gap ("customer found her keys, no longer
+    needs service, hung up the call") now correctly classifies as
+    CANCELLATION instead of falling through to UNRECOGNIZED."""
+    select_scenario(app, "Customer cancellation -- worded differently")
     deliver_next(app)
     click_process_action(app, "Approve")
     deliver_next(app)
     click_process_action(app, "Approve")
 
     timeline = timeline_for("SIM8CW")
-    assert [e["message_type"] for e in timeline] == ["NEW", "UNRECOGNIZED"]
+    assert [e["message_type"] for e in timeline] == ["NEW", "CANCELLATION"]
 
 
 # --------------------------------------------------- Technician status -----

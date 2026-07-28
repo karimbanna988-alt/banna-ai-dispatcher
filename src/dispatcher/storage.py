@@ -494,6 +494,42 @@ def _looks_like_closing(raw_text: str) -> bool:
     return bool(re.search(r"\bclosed\b", raw_text.lower()) and re.search(r"\$\s*\d", raw_text))
 
 
+# 2026-07-29: known, accepted gap (see docs/architecture.md section 6) --
+# a cancellation that never says "cancel" fell through to UNRECOGNIZED.
+# Closes it with a small, explicit set of conservative, deterministic
+# patterns for the exact reworded phrasings observed in real messages,
+# plus a narrow guard so a hedged or interrogative mention of
+# cancellation ("customer may cancel", "asked whether cancellation is
+# possible") is NOT treated as a confident cancellation -- deliberately
+# no attempt at broad natural-language understanding; anything not
+# matched here still falls through to UNRECOGNIZED for manual review,
+# exactly like before.
+_CANCELLATION_HEDGE_RE = re.compile(
+    r"\b(?:may|might|could|possibly)\s+\w*\s*cancel"  # "may cancel", "might just cancel"
+    r"|\bwhether\s+\w*\s*cancel",  # "whether cancellation is possible"
+    re.IGNORECASE,
+)
+
+_REWORDED_CANCELLATION_PATTERNS = (
+    re.compile(r"\bno longer needs?\b", re.IGNORECASE),
+    re.compile(r"\b(?:does not|doesn't|does n't) need\b.*\bany\s*more\b", re.IGNORECASE),
+    # Subject must be the customer ("customer"/"they"), never the
+    # technician -- "technician found the keys" is not a cancellation
+    # signal, so it's deliberately excluded by only allowlisting these
+    # two subjects rather than matching "found ... keys" on its own.
+    re.compile(r"\b(?:customer|they)\s+found\s+(?:her|his|their|the)\s+keys?\b", re.IGNORECASE),
+    re.compile(r"\bwill call back later,?\s*hung up\b", re.IGNORECASE),
+)
+
+
+def _is_confident_cancellation(raw_text: str) -> bool:
+    if _CANCELLATION_HEDGE_RE.search(raw_text):
+        return False
+    if re.search(r"\bcancel(?:led|ed)?\b", raw_text, re.IGNORECASE) or re.search(r"\bcancellation\b", raw_text, re.IGNORECASE):
+        return True
+    return any(pattern.search(raw_text) for pattern in _REWORDED_CANCELLATION_PATTERNS)
+
+
 def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyResult:
     ticket = job.ticket_number.value
     if not ticket:
@@ -534,7 +570,7 @@ def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyRe
 
     text_lower = job.raw_text.lower()
 
-    if "cancel" in text_lower:
+    if _is_confident_cancellation(job.raw_text):
         return ClassifyResult(MessageType.CANCELLATION, job_id, [], "message mentions cancellation")
 
     if _looks_like_closing(job.raw_text):

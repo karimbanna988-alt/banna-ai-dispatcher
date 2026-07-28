@@ -94,9 +94,10 @@ SCENARIOS: List[Scenario] = [
         ],
     ),
     Scenario(
-        "cancellation_worded_differently", "Customer cancellation -- worded differently (known gap)",
-        'A real-shaped cancellation that never says the word "cancel" -- documents that today\'s '
-        "substring-based CANCELLATION detection would miss it.",
+        "cancellation_worded_differently", "Customer cancellation -- worded differently",
+        'A real-shaped cancellation that never says the word "cancel" -- confirms the conservative '
+        "reworded-phrase patterns (storage._is_confident_cancellation) correctly classify it as "
+        "CANCELLATION rather than falling through to UNRECOGNIZED (fixed 2026-07-29).",
         [
             Step("message", "step_1.txt", "Original Main Leads job arrives"),
             Step("message", "step_2.txt", 'Customer cancels without saying "cancel"'),

@@ -101,6 +101,81 @@ def test_cancellation_message_is_classified(conn, vehicle_rules):
     assert result2.message_type == MessageType.CANCELLATION
 
 
+# --------------------------------- Regression: reworded cancellations -----
+# Confirmed 2026-07-29: closes the documented gap in docs/architecture.md
+# section 6 -- a cancellation that never says "cancel" used to fall through
+# to UNRECOGNIZED. Conservative, deterministic pattern matching only (see
+# storage._is_confident_cancellation) -- no LLM, no probabilistic
+# classification. Anything not explicitly matched still falls through to
+# UNRECOGNIZED for manual review, exactly as before.
+
+def _classify_followup(conn, vehicle_rules, followup_text):
+    raw = load("agn_clean.txt")
+    job = extract_job(raw, vehicle_rules)
+    result1 = storage.classify_incoming(conn, job)
+    storage.save_audit_entry(conn, job, result1, final_action="Approve")
+
+    followup_raw = raw + "\n" + followup_text + "\n"
+    followup_job = extract_job(followup_raw, vehicle_rules)
+    return storage.classify_incoming(conn, followup_job)
+
+
+@pytest.mark.parametrize("text", [
+    "Customer no longer needs service",
+    "No longer needs the service",
+    "Customer found her keys",
+    "Customer found his keys",
+    "They found the keys",
+    "Will call back later, hung up",
+    "Customer does not need us anymore",
+])
+def test_reworded_cancellation_is_classified(conn, vehicle_rules, text):
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.CANCELLATION
+
+
+@pytest.mark.parametrize("text", [
+    "CUSTOMER NO LONGER NEEDS SERVICE",
+    "customer no longer needs service.",
+    "Customer, no longer needs service!",
+    "customer found HER keys!!",
+    "They found the keys.",
+    "will call back later hung up",  # no comma
+    "Will call back later,   hung up",  # extra spaces
+])
+def test_reworded_cancellation_capitalization_and_punctuation_variations(conn, vehicle_rules, text):
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.CANCELLATION
+
+
+@pytest.mark.parametrize("text", [
+    "Customer called to cancel",
+    "Please cancel this job",
+    "Job canceled",
+    "Job cancelled",
+    "Cancelled by customer",
+])
+def test_existing_literal_cancel_behavior_is_preserved(conn, vehicle_rules, text):
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.CANCELLATION
+
+
+@pytest.mark.parametrize("text", [
+    "Customer may cancel",
+    "Asked whether cancellation is possible",
+    "Technician found the keys",
+    "Customer will call back with the address",
+])
+def test_reworded_cancellation_false_positive_protections(conn, vehicle_rules, text):
+    """These must stay UNRECOGNIZED (manual review), not be silently
+    misclassified as an actual cancellation -- a hedged/hypothetical or
+    interrogative mention of cancellation, a technician (not customer)
+    finding keys, and a callback that isn't the specific "later ... hung
+    up" shape are all deliberately excluded."""
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.UNRECOGNIZED
+
+
 def test_status_message_is_classified(conn, vehicle_rules):
     raw = load("agn_clean.txt")
     job = extract_job(raw, vehicle_rules)

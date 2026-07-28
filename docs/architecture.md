@@ -307,11 +307,6 @@ source doesn't change parser/decision/formatter behavior at all).
   only classifies `DUPLICATE` for a byte-identical repeat. A reminder for the
   same ticket, reworded even slightly, falls through to `UNRECOGNIZED`. See
   `tests/test_app_integration.py::test_reworded_reminder_is_a_documented_gap_not_duplicate`.
-- **Cancellation detection is a literal substring check** for the word
-  "cancel". Several real messages hit during manual testing 2026-07-27 ("no
-  longer needs service", "customer found her keys...", "will call back later
-  hung up") never say "cancel" and fall through to `UNRECOGNIZED` today. See
-  `tests/test_app_integration.py::test_cancellation_worded_differently_is_a_documented_gap`.
 - **Intra-message data inconsistency isn't cross-validated**: e.g. a
   structured `Address:` field's zip code differing from a zip mentioned in
   the freeform notes of the *same* message isn't flagged -- both are
@@ -321,6 +316,20 @@ None of these cause information loss, an incorrect decision, or incorrect
 routing on their own -- that's exactly why they're accepted limitations
 rather than blocking bugs. Fixing any of them is a deliberate future choice,
 not an oversight.
+
+**Fixed 2026-07-29**: cancellation detection was previously a literal
+substring check for the word "cancel" only; several real messages hit
+during manual testing 2026-07-27 ("no longer needs service", "customer
+found her keys...", "will call back later hung up") never said "cancel"
+and fell through to `UNRECOGNIZED`. `storage._is_confident_cancellation()`
+now also recognizes a small, explicit set of conservative, deterministic
+reworded phrasings (still no LLM, no probabilistic classification), with
+a narrow hedge guard so a hypothetical or interrogative mention of
+cancellation ("customer may cancel", "asked whether cancellation is
+possible") is deliberately *not* treated as a confident cancellation and
+still falls through to `UNRECOGNIZED` for manual review. See
+`tests/test_storage.py` (`test_reworded_cancellation_*`) and
+`tests/test_app_integration.py::test_cancellation_worded_differently_is_now_correctly_classified`.
 
 ## 7. Parser V1 stability: acceptance criteria
 
