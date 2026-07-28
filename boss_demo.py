@@ -1,0 +1,256 @@
+"""LUXOR LOCKSMITH -- read-only LIVE boss demo (temporary, shadow mode).
+
+Reuses the project's existing GET-only Quo pipeline exactly as built --
+storage.connect(), dispatcher.quo_client.QuoClient, and
+dispatcher.quo_ingest.poll_for_new_messages() -- rather than a second
+client/poller/parser/persistence layer. This file adds no new way to
+reach Quo or the database; it only adds a UI in front of what already
+exists.
+
+Two connections, deliberately kept separate and narrow in scope:
+- A read-only connection (SQLite's own `mode=ro` URI -- any write attempt
+  raises sqlite3.OperationalError at the database engine level) used for
+  every query that renders the page.
+- A normal read-write connection, opened only inside the "Refresh live
+  jobs from Quo" button handler and closed immediately after, used for
+  exactly one call: the existing, unmodified quo_ingest.poll_for_new_messages().
+  That call only ever writes poll/dedup bookkeeping (quo_pending_messages,
+  quo_processed_messages, quo_poll_state) -- it has never created a jobs
+  or events row in this codebase. Turning a pending Quo message into a
+  full job record still requires a dispatcher reviewing and approving it
+  in the internal tool; this demo has no Approve/Edit/Reject/Assign/
+  Delete/Close/Send control of any kind, so it cannot do that.
+
+Quo access stays strictly GET-only: poll_for_new_messages() is the same
+function already covered by tests/test_quo_ingest.py and
+tests/test_app_integration.py -- direct polling of the four configured
+dispatch-group contacts (never /v1/conversations discovery), only
+direction=="incoming" messages queued, CLOSINGS outgoing replies
+skipped, existing message-ID + checkpoint deduplication preserved.
+Nothing in this file, or in the modules it calls, is capable of a Quo
+POST/PUT/PATCH/DELETE.
+
+Password-gated via the BOSS_DEMO_PASSWORD environment variable only --
+never hardcoded, never logged, never committed.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Optional
+
+import streamlit as st
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from dispatcher import quo_client, storage
+from dispatcher.quo_client import API_KEY_ENV_VAR, QuoAPIError, QuoConfigError
+from dispatcher.quo_ingest import poll_for_new_messages
+
+PASSWORD_ENV_VAR = "BOSS_DEMO_PASSWORD"
+
+st.set_page_config(page_title="LUXOR LOCKSMITH -- Boss Demo (Read-Only Live)", layout="wide")
+
+
+# ------------------------------------------------------------- Masking ----
+_PHONE_RE = re.compile(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+_EXT_RE = re.compile(r"\b(?:ext\.?|extension)\s*:?\s*\d+\b", re.IGNORECASE)
+_TEXT_FIELDS_TO_MASK = ("raw_message", "dispatcher_edits", "luxor_message", "suggested_quo_reply")
+
+
+def mask_sensitive(text: Optional[str]) -> Optional[str]:
+    """Redacts phone numbers and extensions from freeform text. Quo
+    Contact IDs and API identifiers are never masked here because they
+    never appear in anything this file reads or displays -- the only
+    Quo-related call this file makes is the existing poll function, whose
+    result is never rendered verbatim (only a count and a timestamp)."""
+    if not text:
+        return text
+    text = _PHONE_RE.sub("[phone masked]", text)
+    text = _EXT_RE.sub("[extension masked]", text)
+    return text
+
+
+def masked_event(event: dict) -> dict:
+    result = dict(event)
+    for field in _TEXT_FIELDS_TO_MASK:
+        result[field] = mask_sensitive(result.get(field))
+    return result
+
+
+# --------------------------------------------------- Read-only data access
+def get_readonly_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Opens the database in SQLite's own read-only URI mode -- any write
+    attempt against this connection raises sqlite3.OperationalError at
+    the database engine level, regardless of what application code does.
+    This is the same kind of structural (not just conventional) guarantee
+    the rest of this project already uses for Quo's GET-only access.
+    Never used for the refresh action -- see module docstring.
+
+    Deliberately reads the path from storage.DB_PATH (the same source of
+    truth the write connection below already uses) rather than a second,
+    separate constant in this file -- one path, two connections, both
+    correctly redirectable to an isolated test database via the existing
+    `monkeypatch.setattr(storage, "DB_PATH", ...)` pattern this whole
+    test suite already relies on."""
+    path = db_path or storage.DB_PATH
+    uri = f"file:{path.as_posix()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def fetch_job_status_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    return conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status").fetchall()
+
+
+def fetch_jobs(conn: sqlite3.Connection) -> list[dict]:
+    sql = """
+        SELECT jobs.id, jobs.source, jobs.ticket_number, jobs.status,
+               jobs.created_at, jobs.updated_at, jobs.last_event_at,
+               jobs.latest_fields_json, technicians.name AS assigned_technician_name,
+               events.channel AS latest_channel
+        FROM jobs
+        LEFT JOIN technicians ON technicians.id = jobs.assigned_technician_id
+        LEFT JOIN events ON events.id = jobs.last_event_id
+        ORDER BY COALESCE(jobs.last_event_at, jobs.updated_at) DESC
+    """
+    cur = conn.execute(sql)
+    columns = [d[0] for d in cur.description]
+    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+    for row in rows:
+        fields = json.loads(row.pop("latest_fields_json") or "{}")
+        city, state = fields.get("city"), fields.get("state")
+        row["service_area"] = ", ".join(p for p in (city, state) if p) or "(unknown)"
+        row["description"] = " -- ".join(p for p in (fields.get("service_type"), fields.get("vehicle")) if p) or "(none)"
+    return rows
+
+
+def fetch_timeline(conn: sqlite3.Connection, job_id: int) -> list[dict]:
+    cur = conn.execute("SELECT * FROM events WHERE job_id = ? ORDER BY id ASC", (job_id,))
+    columns = [d[0] for d in cur.description]
+    return [masked_event(dict(zip(columns, row))) for row in cur.fetchall()]
+
+
+def fetch_pending_review_count(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM quo_pending_messages WHERE status IN ('pending', 'loaded')"
+    ).fetchone()[0]
+
+
+def fetch_last_refresh(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT updated_at FROM quo_poll_state WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+# ------------------------------------------------------------------- UI ---
+st.title("LUXOR LOCKSMITH")
+st.warning(
+    "\U0001F512 **READ-ONLY LIVE DEMO** -- **UNDER DEVELOPMENT / SHADOW MODE**. Nothing on this "
+    "page can approve, edit, reject, assign, close, or send anything, in Quo or anywhere else. "
+    "The team continues dispatching normally through Quo; this is a preview only."
+)
+
+_password = os.environ.get(PASSWORD_ENV_VAR)
+if not _password:
+    st.error(f"This demo is not configured ({PASSWORD_ENV_VAR} is not set). Access refused.")
+    st.stop()
+
+if "boss_demo_authenticated" not in st.session_state:
+    st.session_state.boss_demo_authenticated = False
+
+if not st.session_state.boss_demo_authenticated:
+    entered = st.text_input("Password", type="password", key="boss_demo_password_input")
+    if st.button("Enter", type="primary"):
+        if hmac.compare_digest(entered, _password):
+            st.session_state.boss_demo_authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+st.subheader("Live Quo refresh (GET-only)")
+st.caption(
+    "Uses the exact same read-only polling pipeline as the internal tool's Quo Inbox (Live) tab -- "
+    "direct GET requests to the four configured dispatch-group contacts, no /v1/conversations "
+    "discovery, only incoming messages queued, CLOSINGS outgoing replies skipped, existing "
+    "message-ID and checkpoint deduplication preserved. A new Quo message joins the same "
+    "pending-review queue the dispatcher already uses -- it only becomes a full job record once "
+    "a dispatcher reviews and approves it in the internal tool; this demo cannot do that itself."
+)
+if st.button("Refresh live jobs from Quo", type="primary", key="boss_demo_refresh"):
+    api_key = os.environ.get(API_KEY_ENV_VAR)
+    if not api_key:
+        st.error("Quo is not configured in this environment.")
+    else:
+        write_conn = None
+        try:
+            write_conn = storage.connect()
+            client = quo_client.QuoClient(api_key=api_key)
+            outcome = poll_for_new_messages(write_conn, client)
+            st.success(f"Refreshed -- found {len(outcome.queued)} new message(s) awaiting dispatcher review.")
+            if outcome.failed_count:
+                st.error(f"{outcome.failed_count} message(s) could not be saved durably and will be retried on the next refresh.")
+        except QuoConfigError:
+            st.error("Quo is not configured in this environment.")
+        except QuoAPIError:
+            st.error("Quo is temporarily unavailable. Please try again shortly.")
+        finally:
+            if write_conn is not None:
+                write_conn.close()
+
+conn = get_readonly_connection()
+
+last_refresh = fetch_last_refresh(conn)
+st.write(f"Last successful Quo refresh: **{last_refresh or '(not refreshed yet this session)'}**")
+pending_count = fetch_pending_review_count(conn)
+st.write(f"**{pending_count} new Quo message(s)** queued and awaiting dispatcher review (not yet a job record).")
+
+jobs = fetch_jobs(conn)
+status_counts = fetch_job_status_counts(conn)
+
+st.subheader("Overview")
+col1, col2 = st.columns([1, 3])
+col1.metric("Total jobs", len(jobs))
+with col2:
+    st.write("**Status counts**")
+    st.table([{"Status": status, "Count": count} for status, count in status_counts])
+
+st.subheader("Jobs")
+st.table(
+    [
+        {
+            "Source": j["source"],
+            "Ticket": j["ticket_number"],
+            "Service area": j["service_area"],
+            "Description": j["description"],
+            "Status": j["status"],
+            "Channel": j["latest_channel"] or "(none)",
+            "Assigned": j["assigned_technician_name"] or "(unassigned)",
+            "Created": j["created_at"],
+            "Last activity": j["last_event_at"] or j["updated_at"],
+        }
+        for j in jobs
+    ]
+)
+
+if jobs:
+    st.subheader("Job audit timeline")
+    job_options = {f"{j['source']} | {j['ticket_number']} ({j['status']})": j["id"] for j in jobs}
+    selected_label = st.selectbox("Select a job", options=list(job_options.keys()), key="boss_demo_job_select")
+    if st.button("Show timeline", key="boss_demo_show_timeline"):
+        timeline = fetch_timeline(conn, job_options[selected_label])
+        if not timeline:
+            st.info("No events found.")
+        for event in timeline:
+            with st.expander(f"{event['created_at']} -- {event['message_type']} -- {event['final_action']}"):
+                st.json(event)
+
+conn.close()
