@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -254,3 +255,200 @@ def test_audit_log_preserves_every_repeated_action(conn, vehicle_rules):
     assert [e["final_action"] for e in timeline] == ["Handle Manually", "Handle Manually", "Approve"]
     # jobs stays a single, current-state row throughout
     assert conn.execute("SELECT COUNT(*) FROM jobs WHERE ticket_number = ?", (job.ticket_number.value,)).fetchone()[0] == 1
+
+
+# ------------------------------------------ Regression: events FK repair ---
+# Confirmed 2026-07-28: a real database migrated by the earlier
+# _migrate_jobs_to_source_scoped_unique (renaming jobs away and back) ended
+# up with events.job_id's FOREIGN KEY clause literally pointing at
+# "jobs_pre_source_scoped_unique_backup" instead of "jobs" -- SQLite
+# rewrites other tables' FK clauses to follow a renamed table. These tests
+# build that exact drifted schema by hand (never through storage.connect(),
+# so the repair hasn't run yet), then confirm storage.connect() repairs it
+# safely, preserving every row, without repeating the same rename-old-first
+# mistake.
+
+def _build_drifted_pre_repair_db(path: Path) -> None:
+    """Hand-build a database in the exact drifted, pre-repair shape found
+    in production: jobs uses the current (correct) schema, but events'
+    persisted FOREIGN KEY clause still names the old backup table."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_number TEXT NOT NULL,
+            source TEXT NOT NULL,
+            latest_fields_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (source, ticket_number)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE TABLE jobs_pre_source_scoped_unique_backup ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_number TEXT, source TEXT, "
+        "latest_fields_json TEXT, created_at TEXT, updated_at TEXT)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER,
+            ticket_number TEXT,
+            raw_message TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            confidence INTEGER,
+            confidence_reasons_json TEXT,
+            decision_verdict TEXT,
+            decision_reasons_json TEXT,
+            suggested_quo_reply TEXT,
+            luxor_message TEXT,
+            dispatcher_edits TEXT,
+            final_action TEXT,
+            created_at TEXT NOT NULL, channel TEXT DEFAULT 'manual',
+            FOREIGN KEY (job_id) REFERENCES "jobs_pre_source_scoped_unique_backup" (id)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO jobs (id, ticket_number, source, latest_fields_json, created_at, updated_at) "
+        "VALUES (1, 'DRIFT1', 'AGN', '{}', '2026-07-28T00:00:00+00:00', '2026-07-28T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO jobs (id, ticket_number, source, latest_fields_json, created_at, updated_at) "
+        "VALUES (2, 'DRIFT2', 'Lucky', '{}', '2026-07-28T00:00:00+00:00', '2026-07-28T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO events (id, job_id, ticket_number, raw_message, message_type, source, "
+        "final_action, created_at, channel) VALUES "
+        "(1, 1, 'DRIFT1', 'raw one', 'NEW', 'AGN', 'Approve', '2026-07-28T00:00:00+00:00', 'manual')"
+    )
+    conn.execute(
+        "INSERT INTO events (id, job_id, ticket_number, raw_message, message_type, source, "
+        "final_action, created_at, channel) VALUES "
+        "(2, 2, 'DRIFT2', 'raw two', 'NEW', 'Lucky', 'Handle Manually', '2026-07-28T00:00:00+00:00', 'manual')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_events_fk_repair_corrects_the_drifted_reference(tmp_path):
+    db_path = tmp_path / "drifted.db"
+    _build_drifted_pre_repair_db(db_path)
+
+    conn = storage.connect(db_path)
+
+    schema_sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
+    assert "jobs_pre_source_scoped_unique_backup" not in schema_sql
+    assert "REFERENCES jobs (id)" in schema_sql
+
+
+def test_events_fk_repair_preserves_every_row_and_id(tmp_path):
+    db_path = tmp_path / "drifted.db"
+    _build_drifted_pre_repair_db(db_path)
+
+    conn = storage.connect(db_path)
+
+    rows = conn.execute(
+        "SELECT id, job_id, ticket_number, raw_message, final_action, channel FROM events ORDER BY id"
+    ).fetchall()
+    assert rows == [
+        (1, 1, "DRIFT1", "raw one", "Approve", "manual"),
+        (2, 2, "DRIFT2", "raw two", "Handle Manually", "manual"),
+    ]
+
+
+def test_events_fk_repair_is_idempotent(tmp_path):
+    db_path = tmp_path / "drifted.db"
+    _build_drifted_pre_repair_db(db_path)
+
+    conn1 = storage.connect(db_path)
+    first_sql = conn1.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
+
+    conn2 = storage.connect(db_path)  # re-run migrations against the already-repaired file
+    second_sql = conn2.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
+
+    assert first_sql == second_sql
+    assert conn2.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+    # No extra live backup table was created for this migration -- the
+    # file-level backup taken before running it is the recovery path.
+    tables = {r[0] for r in conn2.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "events_fk_repair_new" not in tables
+    assert "events_pre_fk_repair_backup" not in tables
+    # The pre-existing jobs backup table from the earlier migration is left
+    # untouched, not deleted, by this unrelated repair.
+    assert "jobs_pre_source_scoped_unique_backup" in tables
+
+
+def test_events_fk_repair_passes_foreign_key_check_and_integrity_check(tmp_path):
+    db_path = tmp_path / "drifted.db"
+    _build_drifted_pre_repair_db(db_path)
+
+    conn = storage.connect(db_path)
+
+    assert conn.execute("PRAGMA foreign_key_check(events)").fetchall() == []
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_foreign_keys_enforcement_is_enabled_after_repair_on_clean_data(tmp_path):
+    db_path = tmp_path / "drifted.db"
+    _build_drifted_pre_repair_db(db_path)
+
+    conn = storage.connect(db_path)
+
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO events (job_id, ticket_number, raw_message, message_type, source, created_at) "
+            "VALUES (9999, 'NOPE', 'raw', 'NEW', 'AGN', '2026-07-28T00:00:00+00:00')"
+        )
+
+
+def test_foreign_keys_enforcement_is_on_for_a_brand_new_database(tmp_path):
+    conn = storage.connect(tmp_path / "fresh.db")
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_fk_repair_refuses_when_a_view_references_events(tmp_path):
+    """Safety guard: never rename/drop the table out from under a view or
+    trigger that still names it -- this is exactly the class of bug being
+    fixed here, applied to *this* migration's own safety."""
+    db_path = tmp_path / "drifted_with_view.db"
+    _build_drifted_pre_repair_db(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute("CREATE VIEW events_summary AS SELECT id, message_type FROM events")
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(RuntimeError, match="events_summary"):
+        storage.connect(db_path)
+
+
+def test_fk_repair_aborts_and_reports_orphans_without_enabling_enforcement(tmp_path):
+    """If an orphan job_id somehow exists, the repair must abort rather
+    than silently drop/rewrite data, and foreign_keys enforcement must not
+    be turned on for connections against still-dirty data."""
+    db_path = tmp_path / "drifted_with_orphan.db"
+    _build_drifted_pre_repair_db(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO events (id, job_id, ticket_number, raw_message, message_type, source, "
+        "final_action, created_at, channel) VALUES "
+        "(3, 9999, 'ORPHAN', 'raw orphan', 'NEW', 'AGN', 'Approve', '2026-07-28T00:00:00+00:00', 'manual')"
+    )
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(RuntimeError, match="orphan"):
+        storage.connect(db_path)
+
+    # The original (unrepaired) table must be untouched -- verified via a
+    # fresh raw connection, bypassing storage.connect() entirely so this
+    # check can't accidentally re-trigger/hide behind the migration itself.
+    raw2 = sqlite3.connect(db_path)
+    assert raw2.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 3
+    schema_sql = raw2.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
+    assert "jobs_pre_source_scoped_unique_backup" in schema_sql  # still drifted, repair rolled back

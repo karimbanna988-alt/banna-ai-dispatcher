@@ -60,6 +60,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     # is safe.
     conn = sqlite3.connect(path, check_same_thread=False)
     _ensure_schema(conn)
+    _configure_foreign_key_enforcement(conn)
     return conn
 
 
@@ -112,6 +113,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "channel" not in existing_columns:
         conn.execute("ALTER TABLE events ADD COLUMN channel TEXT DEFAULT 'manual'")
+    _repair_events_job_id_foreign_key(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -216,6 +218,154 @@ def _migrate_jobs_to_source_scoped_unique(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+
+def _repair_events_job_id_foreign_key(conn: sqlite3.Connection) -> None:
+    """2026-07-28: events.job_id's FOREIGN KEY clause was left pointing at
+    "jobs_pre_source_scoped_unique_backup" instead of "jobs". SQLite's
+    ALTER TABLE ... RENAME automatically rewrites FOREIGN KEY clauses in
+    OTHER tables to keep following a renamed table -- the earlier jobs
+    migration (_migrate_jobs_to_source_scoped_unique) renamed jobs itself
+    away and back, and events.job_id's declaration silently followed the
+    away-rename. PRAGMA foreign_keys defaults OFF per connection, so this
+    was never enforced, but it was still wrong.
+
+    Deliberately does NOT repeat that rename-old-table-first sequence.
+    Instead it follows SQLite's own recommended pattern for schema changes
+    ALTER TABLE can't express directly: build the corrected table fresh
+    under a temporary name, copy every row across with id/timestamps
+    preserved, verify row counts and zero orphan job_id values, only then
+    drop the (already-copied) old table and rename the temporary one into
+    place -- the rename here targets a table nothing else references yet,
+    so it cannot trigger the same class of bug. Idempotent: a no-op once
+    already repaired. Whole operation is one transaction: any failure
+    rolls back everything, leaving the original events table untouched.
+    """
+    current_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    if current_sql_row is None or "jobs_pre_source_scoped_unique_backup" not in current_sql_row[0]:
+        return  # no events table yet, or already repaired -- idempotent no-op
+
+    # Prove nothing else references "events" by name before any rename --
+    # a view, trigger, or another table's foreign key pointing at "events"
+    # could otherwise be silently broken/rewritten by SQLite's
+    # rename-follows behavior, the exact bug class being fixed here.
+    referencing_objects = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master WHERE name != 'events' AND sql LIKE '%events%'"
+    ).fetchall()
+    for obj_type, obj_name, obj_sql in referencing_objects:
+        normalized = " ".join((obj_sql or "").split())
+        if obj_type in ("view", "trigger"):
+            raise RuntimeError(
+                f"Refusing automatic events table repair: {obj_type} {obj_name!r} references "
+                "'events' -- resolve manually before migrating."
+            )
+        if obj_type == "table" and "REFERENCES events" in normalized:
+            raise RuntimeError(
+                f"Refusing automatic events table repair: table {obj_name!r} has a foreign key "
+                "referencing 'events' -- resolve manually before migrating."
+            )
+        # An index on events (e.g. idx_events_job_id_id) is expected and
+        # harmless -- it's recreated below after the swap, not a blocker.
+
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            CREATE TABLE events_fk_repair_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                ticket_number TEXT,
+                raw_message TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence INTEGER,
+                confidence_reasons_json TEXT,
+                decision_verdict TEXT,
+                decision_reasons_json TEXT,
+                suggested_quo_reply TEXT,
+                luxor_message TEXT,
+                dispatcher_edits TEXT,
+                final_action TEXT,
+                created_at TEXT NOT NULL,
+                channel TEXT DEFAULT 'manual',
+                FOREIGN KEY (job_id) REFERENCES jobs (id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO events_fk_repair_new (
+                id, job_id, ticket_number, raw_message, message_type, source,
+                confidence, confidence_reasons_json, decision_verdict,
+                decision_reasons_json, suggested_quo_reply, luxor_message,
+                dispatcher_edits, final_action, created_at, channel
+            )
+            SELECT
+                id, job_id, ticket_number, raw_message, message_type, source,
+                confidence, confidence_reasons_json, decision_verdict,
+                decision_reasons_json, suggested_quo_reply, luxor_message,
+                dispatcher_edits, final_action, created_at, channel
+            FROM events
+            """
+        )
+
+        src_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        dst_count = conn.execute("SELECT COUNT(*) FROM events_fk_repair_new").fetchone()[0]
+        if src_count != dst_count:
+            raise RuntimeError(
+                f"events FK repair row-count mismatch: source={src_count} destination={dst_count}"
+            )
+
+        orphans = conn.execute(
+            """
+            SELECT COUNT(*) FROM events_fk_repair_new
+            WHERE job_id IS NOT NULL AND job_id NOT IN (SELECT id FROM jobs)
+            """
+        ).fetchone()[0]
+        if orphans:
+            raise RuntimeError(
+                f"events FK repair found {orphans} orphan job_id value(s) -- aborting migration; "
+                "resolve manually (see report of orphan rows before this migration is retried)"
+            )
+
+        # Old table is fully copied and verified -- safe to drop now. Not
+        # kept as a live backup table (per instruction: prefer the
+        # file-level database backup taken before this migration ran, over
+        # cluttering the live schema with another backup table). The
+        # pre-existing jobs_pre_source_scoped_unique_backup table from the
+        # earlier migration is left untouched.
+        conn.execute("DROP TABLE events")
+        conn.execute("ALTER TABLE events_fk_repair_new RENAME TO events")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_job_id_id ON events (job_id, id)")
+
+        fk_violations = conn.execute("PRAGMA foreign_key_check(events)").fetchall()
+        if fk_violations:
+            raise RuntimeError(f"events FK repair failed PRAGMA foreign_key_check: {fk_violations}")
+
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"events FK repair failed PRAGMA integrity_check: {integrity}")
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _configure_foreign_key_enforcement(conn: sqlite3.Connection) -> None:
+    """PRAGMA foreign_keys is a per-connection setting, never persisted in
+    the database file -- SQLite defaults it OFF, so it must be set
+    explicitly on every connection, not just once during migration. Only
+    turned on when events.job_id is currently known-clean against jobs.id
+    (cheap indexed check via idx_events_job_id_id + the jobs primary key),
+    so enforcement can never itself break on data it hasn't verified."""
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE job_id IS NOT NULL AND job_id NOT IN (SELECT id FROM jobs)"
+    ).fetchone()[0]
+    if orphans == 0:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _now() -> str:
