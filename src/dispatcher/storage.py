@@ -25,6 +25,7 @@ from typing import List, Optional
 from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
+from .rules.service_areas import ServiceAreaRecord, find_service_area
 from .updates import map_status_to_reply
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "dispatcher.db"
@@ -40,6 +41,10 @@ class MessageType(str, Enum):
     CANCELLATION = "CANCELLATION"
     CLOSING_WITHOUT_DISPATCH = "CLOSING_WITHOUT_DISPATCH"
     UNRECOGNIZED = "UNRECOGNIZED"
+    # Dispatcher-initiated (not derived from an inbound message classification):
+    # a technician was assigned, reassigned, or removed for this job. See
+    # assign_technician() and derive_job_status().
+    ASSIGNMENT = "ASSIGNMENT"
 
 
 @dataclass
@@ -115,6 +120,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE events ADD COLUMN channel TEXT DEFAULT 'manual'")
     _repair_events_job_id_foreign_key(conn)
     _add_job_status_columns_and_backfill(conn)
+    _add_technician_assignment_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -359,13 +365,17 @@ def _configure_foreign_key_enforcement(conn: sqlite3.Connection) -> None:
     """PRAGMA foreign_keys is a per-connection setting, never persisted in
     the database file -- SQLite defaults it OFF, so it must be set
     explicitly on every connection, not just once during migration. Only
-    turned on when events.job_id is currently known-clean against jobs.id
-    (cheap indexed check via idx_events_job_id_id + the jobs primary key),
-    so enforcement can never itself break on data it hasn't verified."""
-    orphans = conn.execute(
+    turned on when every known foreign key relationship is currently
+    clean (cheap indexed checks), so enforcement can never itself break on
+    data it hasn't verified."""
+    event_orphans = conn.execute(
         "SELECT COUNT(*) FROM events WHERE job_id IS NOT NULL AND job_id NOT IN (SELECT id FROM jobs)"
     ).fetchone()[0]
-    if orphans == 0:
+    technician_orphans = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE assigned_technician_id IS NOT NULL "
+        "AND assigned_technician_id NOT IN (SELECT id FROM technicians)"
+    ).fetchone()[0]
+    if event_orphans == 0 and technician_orphans == 0:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
@@ -420,6 +430,43 @@ def _add_job_status_columns_and_backfill(conn: sqlite3.Connection) -> None:
         )
     if unbackfilled_job_ids:
         conn.commit()
+
+
+def _add_technician_assignment_support(conn: sqlite3.Connection) -> None:
+    """Additive only: a technicians roster table (nothing like it existed
+    anywhere in the codebase or rules/ config before this) plus a nullable
+    jobs.assigned_technician_id column recording the *current* assignment --
+    mirroring how jobs.status/last_event_id already track current state
+    while events holds the full history. Every assignment/reassignment/
+    removal is also recorded as an events row (see assign_technician());
+    this column is only ever a fast-lookup mirror of the latest one, never
+    an alternate source of truth.
+
+    Idempotent via the same PRAGMA table_info / CREATE TABLE IF NOT EXISTS
+    pattern used by every other migration in this module."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS technicians (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            areas_json TEXT NOT NULL DEFAULT '[]',
+            skills_json TEXT NOT NULL DEFAULT '[]',
+            vehicle_restrictions_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "assigned_technician_id" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN assigned_technician_id INTEGER REFERENCES technicians (id)"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_assigned_technician_id ON jobs (assigned_technician_id)"
+    )
+    conn.commit()
 
 
 def _now() -> str:
@@ -573,6 +620,15 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
             return prev
         return "Needs Review"
 
+    if message_type == MessageType.ASSIGNMENT.value:
+        # Who's assigned is orthogonal to what lifecycle stage the job is
+        # in -- assigning/reassigning/removing a technician never changes
+        # status on its own (Handle Manually, from rule 1 above, is the
+        # only way an assignment event can move status at all).
+        if final_action in ("Assign", "Reassign", "Remove"):
+            return prev
+        return "Needs Review"
+
     return "Needs Review"  # unknown/malformed message_type -- safest fallback
 
 
@@ -715,8 +771,11 @@ def list_jobs(
 
     sql = (
         "SELECT jobs.id, jobs.source, jobs.ticket_number, jobs.status, "
-        "jobs.created_at, jobs.updated_at, jobs.last_event_at, events.final_action AS latest_action "
-        "FROM jobs LEFT JOIN events ON events.id = jobs.last_event_id "
+        "jobs.created_at, jobs.updated_at, jobs.last_event_at, events.final_action AS latest_action, "
+        "technicians.name AS assigned_technician_name "
+        "FROM jobs "
+        "LEFT JOIN events ON events.id = jobs.last_event_id "
+        "LEFT JOIN technicians ON technicians.id = jobs.assigned_technician_id "
         "WHERE " + " AND ".join(clauses) + " "
         "ORDER BY COALESCE(jobs.last_event_at, jobs.updated_at) DESC"
     )
@@ -724,6 +783,231 @@ def list_jobs(
     rows = cur.fetchall()
     columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+# ------------------------------------------------ Technician assignment ----
+# No technician-identity concept existed anywhere in this codebase or in
+# rules/ config before this section (confirmed by inspection 2026-07-28) --
+# the only prior notion was an area-level default_technician_availability
+# flag in service_areas.yaml plus a freeform per-shift override in
+# rules/daily.py, neither of which names an individual technician. This is
+# a minimal, additive roster + per-job assignment layer on top of the
+# existing jobs/events model -- not a parallel storage system.
+
+def _parse_json_string_list(raw: Optional[str]) -> List[str]:
+    try:
+        value = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _technician_row_to_dict(columns: List[str], row: tuple) -> dict:
+    d = dict(zip(columns, row))
+    d["areas"] = _parse_json_string_list(d.pop("areas_json"))
+    d["skills"] = _parse_json_string_list(d.pop("skills_json"))
+    d["vehicle_restrictions"] = _parse_json_string_list(d.pop("vehicle_restrictions_json"))
+    d["active"] = bool(d["active"])
+    return d
+
+
+def add_technician(
+    conn: sqlite3.Connection,
+    name: str,
+    areas: List[str],
+    skills: Optional[List[str]] = None,
+    vehicle_restrictions: Optional[List[str]] = None,
+) -> int:
+    """Adds a technician to the roster. `areas` must be dispatch_group names
+    -- the same regional grouping rules/service_areas.yaml and rules.decide()
+    already use -- not free-text city names, so eligibility checks stay
+    anchored to the one existing area concept instead of inventing a second
+    one. `skills`/`vehicle_restrictions` are optional and explicit: empty
+    means "no additional restriction beyond the global vehicle-restriction
+    rules rules.decide() already enforces before a job ever reaches
+    assignment" -- never inferred or assumed."""
+    now = _now()
+    cur = conn.execute(
+        """
+        INSERT INTO technicians (
+            name, active, areas_json, skills_json, vehicle_restrictions_json, created_at, updated_at
+        ) VALUES (?, 1, ?, ?, ?, ?, ?)
+        """,
+        (name, json.dumps(areas or []), json.dumps(skills or []), json.dumps(vehicle_restrictions or []), now, now),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def set_technician_active(conn: sqlite3.Connection, technician_id: int, active: bool) -> None:
+    conn.execute(
+        "UPDATE technicians SET active = ?, updated_at = ? WHERE id = ?",
+        (1 if active else 0, _now(), technician_id),
+    )
+    conn.commit()
+
+
+def list_technicians(conn: sqlite3.Connection, active_only: bool = False) -> List[dict]:
+    sql = "SELECT * FROM technicians" + (" WHERE active = 1" if active_only else "") + " ORDER BY name ASC"
+    cur = conn.execute(sql)
+    rows = cur.fetchall()
+    columns = [d[0] for d in cur.description]
+    return [_technician_row_to_dict(columns, row) for row in rows]
+
+
+def get_technician(conn: sqlite3.Connection, technician_id: int) -> Optional[dict]:
+    cur = conn.execute("SELECT * FROM technicians WHERE id = ?", (technician_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in cur.description]
+    return _technician_row_to_dict(columns, row)
+
+
+@dataclass
+class AssignmentResult:
+    outcome: str  # "assigned" | "reassigned" | "removed" | "handle_manually"
+    reason: str
+    technician_id: Optional[int] = None
+    technician_name: Optional[str] = None
+
+
+def assign_technician(
+    conn: sqlite3.Connection,
+    job_id: int,
+    technician_id: Optional[int],
+    service_areas: List[ServiceAreaRecord],
+) -> AssignmentResult:
+    """The sole entry point for changing a job's technician assignment --
+    always writes a permanent events row (message_type=ASSIGNMENT), exactly
+    like every other action in this system. `technician_id=None` removes
+    the current assignment (always allowed -- removing is the safe
+    direction and needs no eligibility checks).
+
+    Never invents technician availability, skill match, acceptance, ETA, or
+    completion -- only checks facts already on record: technician.active,
+    technician.areas against the job's own freshly re-derived dispatch_group
+    (via the same find_service_area() the rest of the pipeline already uses
+    -- never a stale or duplicated area concept), and technician.skills/
+    vehicle_restrictions if explicitly configured. Falls back to "Handle
+    Manually" the moment any of those facts don't unambiguously allow the
+    assignment -- including when the job's own data is too incomplete to
+    verify a configured restriction -- exactly like rules.decide() already
+    does for the rest of the pipeline."""
+    job_row = conn.execute(
+        "SELECT id, source, ticket_number, latest_fields_json, assigned_technician_id "
+        "FROM jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    if job_row is None:
+        raise ValueError(f"No job with id {job_id}")
+    _, source, ticket_number, fields_json, current_technician_id = job_row
+    fields = json.loads(fields_json)
+
+    if technician_id is None:
+        return _apply_assignment_decision(
+            conn, job_id=job_id, source=source, ticket_number=ticket_number,
+            technician_id=None, final_action="Remove",
+            reason="Assignment removed by dispatcher.",
+        )
+
+    tech = get_technician(conn, technician_id)
+    if tech is None:
+        raise ValueError(f"No technician with id {technician_id}")
+
+    problems: List[str] = []
+    if not tech["active"]:
+        problems.append(f"technician {tech['name']!r} is marked inactive")
+
+    city, state = fields.get("city"), fields.get("state")
+    if not city and not state:
+        problems.append("job has no city/state on record -- cannot verify area eligibility")
+    else:
+        area_lookup = find_service_area(city, state, service_areas)
+        if area_lookup.status != "confirmed":
+            problems.append(f"job's service area is not confirmed for dispatch ({area_lookup.reason})")
+        elif not tech["areas"]:
+            problems.append(f"technician {tech['name']!r} has no configured coverage areas")
+        elif area_lookup.dispatch_group not in tech["areas"]:
+            problems.append(
+                f"technician {tech['name']!r} does not cover dispatch group "
+                f"{area_lookup.dispatch_group!r} (covers: {', '.join(tech['areas'])})"
+            )
+
+    service_type = (fields.get("service_type") or "").lower()
+    if tech["skills"]:
+        if not service_type:
+            problems.append(f"job has no service type on record -- cannot verify technician {tech['name']!r}'s configured skills")
+        elif not any(skill.lower() in service_type for skill in tech["skills"]):
+            problems.append(f"technician {tech['name']!r}'s configured skills don't cover this job's service type")
+
+    vehicle = (fields.get("vehicle") or "").lower()
+    if tech["vehicle_restrictions"]:
+        if not vehicle:
+            problems.append(
+                f"job has no vehicle info on record -- cannot verify technician {tech['name']!r}'s configured vehicle restrictions"
+            )
+        elif any(r.lower() in vehicle for r in tech["vehicle_restrictions"]):
+            problems.append(f"technician {tech['name']!r} is explicitly restricted from this job's vehicle")
+
+    if problems:
+        return _apply_assignment_decision(
+            conn, job_id=job_id, source=source, ticket_number=ticket_number,
+            technician_id=None, final_action="Handle Manually",
+            reason="; ".join(problems),
+        )
+
+    action = "Reassign" if current_technician_id and current_technician_id != technician_id else "Assign"
+    return _apply_assignment_decision(
+        conn, job_id=job_id, source=source, ticket_number=ticket_number,
+        technician_id=technician_id, final_action=action,
+        reason=f"{'Reassigned' if action == 'Reassign' else 'Assigned'} to {tech['name']}.",
+    )
+
+
+def _apply_assignment_decision(
+    conn: sqlite3.Connection, *, job_id: int, source: str, ticket_number: str,
+    technician_id: Optional[int], final_action: str, reason: str,
+) -> AssignmentResult:
+    now = _now()
+    previous_status_row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    previous_status = previous_status_row[0] if previous_status_row else "New"
+    new_status = derive_job_status(previous_status, MessageType.ASSIGNMENT.value, final_action)
+
+    cur = conn.execute(
+        """
+        INSERT INTO events (
+            job_id, ticket_number, raw_message, message_type, source, final_action, created_at, channel
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual')
+        """,
+        (job_id, ticket_number, reason, MessageType.ASSIGNMENT.value, source, final_action, now),
+    )
+    event_id = cur.lastrowid
+
+    conn.execute(
+        "UPDATE jobs SET status = ?, last_event_id = ?, last_event_at = ? WHERE id = ?",
+        (new_status, event_id, now, job_id),
+    )
+    result_technician_id = technician_id if final_action in ("Assign", "Reassign") else None
+    if final_action in ("Assign", "Reassign", "Remove"):
+        # Only a *successful* change touches the current-assignment mirror
+        # column -- a blocked (Handle Manually) attempt must never silently
+        # clear or alter whatever assignment already existed.
+        conn.execute(
+            "UPDATE jobs SET assigned_technician_id = ? WHERE id = ?", (result_technician_id, job_id),
+        )
+    conn.commit()
+
+    tech_name = None
+    if result_technician_id:
+        row = conn.execute("SELECT name FROM technicians WHERE id = ?", (result_technician_id,)).fetchone()
+        tech_name = row[0] if row else None
+
+    outcome_map = {"Assign": "assigned", "Reassign": "reassigned", "Remove": "removed", "Handle Manually": "handle_manually"}
+    return AssignmentResult(
+        outcome=outcome_map[final_action], reason=reason,
+        technician_id=result_technician_id, technician_name=tech_name,
+    )
 
 
 def get_quo_checkpoint(conn: sqlite3.Connection) -> Optional[str]:
