@@ -126,6 +126,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Every Quo message id that has ever been fetched, recorded at fetch
     # time (not at Approve/Reject time) -- makes overlapping poll windows
     # or an app restart structurally unable to re-queue the same message.
+    # This id-level dedup ledger is intentionally kept separate from
+    # quo_pending_messages below: a message id is only ever inserted here
+    # in the same transaction as its full content being durably stored
+    # (see save_pending_and_mark_processed), so "processed" always implies
+    # "content is safe," never the reverse.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS quo_processed_messages (
@@ -134,6 +139,38 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             fetched_at TEXT NOT NULL
         )
         """
+    )
+    # Durable Quo review queue -- the source of truth for what's waiting to
+    # be reviewed, superseding the old design where this only lived in
+    # st.session_state (lost on every app/laptop restart). Lifecycle:
+    # pending (fetched, not yet opened) -> loaded (open in the review
+    # screen; also the state a restart-interrupted review is found in, so
+    # "load next" still picks it up) -> actioned (Approve/Edit/Reject/
+    # Handle Manually successfully saved an audit event for it). Rows are
+    # never deleted in this phase.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quo_pending_messages (
+            message_id TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            group_label TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            from_number TEXT,
+            received_at TEXT,
+            fetched_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            loaded_at TEXT,
+            actioned_at TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_quo_pending_status_received "
+        "ON quo_pending_messages (status, received_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_job_id_id ON events (job_id, id)"
     )
     conn.commit()
 
@@ -358,5 +395,88 @@ def mark_quo_message_processed(conn: sqlite3.Connection, message_id: str, conver
     conn.execute(
         "INSERT OR IGNORE INTO quo_processed_messages (message_id, conversation_id, fetched_at) VALUES (?, ?, ?)",
         (message_id, conversation_id, _now()),
+    )
+    conn.commit()
+
+
+def save_pending_and_mark_processed(
+    conn: sqlite3.Connection,
+    *,
+    message_id: str,
+    conversation_id: Optional[str],
+    group_label: str,
+    raw_text: str,
+    from_number: Optional[str],
+    received_at: Optional[str],
+) -> None:
+    """Durably store a message's full content and mark its Quo id processed
+    in one transaction -- a message id is never marked processed unless its
+    content was already safely written. On any failure both writes are
+    rolled back and the exception propagates, so the caller
+    (quo_ingest.poll_for_new_messages) can hold its poll checkpoint back and
+    retry this exact message on the next poll instead of silently losing it."""
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO quo_pending_messages (
+                message_id, conversation_id, group_label, raw_text, from_number,
+                received_at, fetched_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (message_id, conversation_id, group_label, raw_text, from_number, received_at, _now()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO quo_processed_messages (message_id, conversation_id, fetched_at) VALUES (?, ?, ?)",
+            (message_id, conversation_id, _now()),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+
+
+def get_pending_quo_messages(conn: sqlite3.Connection, limit: int = 10) -> List[dict]:
+    """The oldest not-yet-actioned messages (pending or loaded), for display."""
+    rows = conn.execute(
+        "SELECT * FROM quo_pending_messages WHERE status IN ('pending', 'loaded') "
+        "ORDER BY fetched_at ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    columns = [d[0] for d in conn.execute("SELECT * FROM quo_pending_messages LIMIT 0").description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def count_pending_quo_messages(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM quo_pending_messages WHERE status IN ('pending', 'loaded')"
+    ).fetchone()[0]
+
+
+def get_next_pending_quo_message(conn: sqlite3.Connection) -> Optional[dict]:
+    """The single oldest not-yet-actioned message -- also recovers a row left
+    'loaded' by an app/laptop restart that interrupted an in-progress review,
+    rather than stranding it."""
+    row = conn.execute(
+        "SELECT * FROM quo_pending_messages WHERE status IN ('pending', 'loaded') "
+        "ORDER BY fetched_at ASC, message_id ASC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in conn.execute("SELECT * FROM quo_pending_messages LIMIT 0").description]
+    return dict(zip(columns, row))
+
+
+def mark_quo_pending_message_loaded(conn: sqlite3.Connection, message_id: str) -> None:
+    conn.execute(
+        "UPDATE quo_pending_messages SET status = 'loaded', loaded_at = ? WHERE message_id = ?",
+        (_now(), message_id),
+    )
+    conn.commit()
+
+
+def mark_quo_pending_message_actioned(conn: sqlite3.Connection, message_id: str) -> None:
+    conn.execute(
+        "UPDATE quo_pending_messages SET status = 'actioned', actioned_at = ? WHERE message_id = ?",
+        (_now(), message_id),
     )
     conn.commit()

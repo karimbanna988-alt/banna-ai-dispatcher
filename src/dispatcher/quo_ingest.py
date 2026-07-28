@@ -68,6 +68,12 @@ class QueuedQuoMessage:
     group_label: str
 
 
+@dataclass(frozen=True)
+class PollOutcome:
+    queued: List[QueuedQuoMessage]
+    failed_count: int
+
+
 def load_dispatch_groups(path: Optional[Path] = None) -> QuoPollConfig:
     with open(path or DISPATCH_GROUPS_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
@@ -99,12 +105,25 @@ def _is_inbound(msg: QuoMessage) -> bool:
 
 def poll_for_new_messages(
     conn: sqlite3.Connection, client: QuoClient, config: Optional[QuoPollConfig] = None,
-) -> List[QueuedQuoMessage]:
+) -> PollOutcome:
+    """Fetches new inbound messages and durably stores each one's full
+    content *before* marking its Quo id processed (storage.
+    save_pending_and_mark_processed does both in one transaction) -- a
+    database failure can never result in a message being marked processed
+    without its content being safely recoverable.
+
+    If any message in this poll fails to persist, the poll checkpoint is
+    NOT advanced (the whole poll's checkpoint update is skipped), so the
+    next poll re-scans the same window: messages that already succeeded are
+    skipped again via the untouched quo_processed_messages dedup ledger
+    (unaffected by this poll's rollback), while the message(s) that failed
+    -- never marked processed -- are naturally retried."""
     config = config or load_dispatch_groups()
     poll_started_at = _now()
     checkpoint = storage.get_quo_checkpoint(conn) or _initial_checkpoint()
 
     queued: List[QueuedQuoMessage] = []
+    failed_count = 0
     for group in config.dispatch_groups:
         contact = client.get_contact(group.quo_contact_id)
         if not contact.phone_numbers:
@@ -118,21 +137,31 @@ def poll_for_new_messages(
                     continue
                 if not msg.id or storage.is_quo_message_processed(conn, msg.id):
                     continue
-                # Recorded immediately at fetch time, before we even look at
-                # the text -- this is what makes an overlapping poll window
-                # or an app restart structurally unable to re-queue the
-                # same message.
-                storage.mark_quo_message_processed(conn, msg.id, msg.conversation_id)
                 if not msg.text:
+                    # Nothing to lose -- metadata-only processed marker is
+                    # sufficient, matches the pre-existing documented
+                    # behavior (see test_message_with_no_text_is_marked_
+                    # processed_but_not_queued).
+                    storage.mark_quo_message_processed(conn, msg.id, msg.conversation_id)
+                    continue
+                try:
+                    storage.save_pending_and_mark_processed(
+                        conn, message_id=msg.id, conversation_id=msg.conversation_id,
+                        group_label=group.label, raw_text=msg.text,
+                        from_number=msg.from_number, received_at=msg.created_at,
+                    )
+                except Exception:
+                    failed_count += 1
                     continue
                 queued.append(QueuedQuoMessage(
                     message_id=msg.id, conversation_id=msg.conversation_id, raw_text=msg.text,
                     received_at=msg.created_at, from_number=msg.from_number, group_label=group.label,
                 ))
 
-    new_checkpoint = poll_started_at - timedelta(seconds=_OVERLAP_BUFFER_SECONDS)
-    storage.set_quo_checkpoint(conn, _iso(new_checkpoint))
-    return queued
+    if failed_count == 0:
+        new_checkpoint = poll_started_at - timedelta(seconds=_OVERLAP_BUFFER_SECONDS)
+        storage.set_quo_checkpoint(conn, _iso(new_checkpoint))
+    return PollOutcome(queued=queued, failed_count=failed_count)
 
 
 def render_quo_live_tab(conn: sqlite3.Connection) -> None:
@@ -141,12 +170,18 @@ def render_quo_live_tab(conn: sqlite3.Connection) -> None:
     queued message, hands it to the review screen through the exact same
     `sim_pending_delivery` mechanism the fake-inbox simulator uses --
     `simulator.apply_pending_delivery` doesn't know or care whether the text
-    came from a scenario fixture or a real Quo message."""
+    came from a scenario fixture or a real Quo message.
+
+    The queue itself is backed entirely by storage.quo_pending_messages, not
+    session state -- every render re-reads it fresh, so the displayed queue
+    is correct immediately after an app or laptop restart, not just within
+    one browser session."""
     st.subheader("Quo inbox (live, read-only)")
     st.caption(
         "Polls the known dispatch-group contacts (rules/quo_dispatch_groups.yaml) for new inbound "
         "messages and feeds them into the same review screen as every other message. This only ever "
-        "makes GET requests -- nothing is ever sent, replied to, or modified on Quo from this tab."
+        "makes GET requests -- nothing is ever sent, replied to, or modified on Quo from this tab. "
+        "The queue is stored durably and survives an app or laptop restart."
     )
 
     api_key = os.environ.get(API_KEY_ENV_VAR)
@@ -154,30 +189,34 @@ def render_quo_live_tab(conn: sqlite3.Connection) -> None:
         st.error(f"{API_KEY_ENV_VAR} is not set in this environment -- see .env.example.")
         return
 
-    if "quo_pending_queue" not in st.session_state:
-        st.session_state.quo_pending_queue = []
-
     if st.button("Poll Quo now", type="primary"):
         try:
             client = QuoClient(api_key=api_key)
-            new_messages = poll_for_new_messages(conn, client)
-            st.session_state.quo_pending_queue.extend(new_messages)
-            st.success(f"Found {len(new_messages)} new message(s).")
+            outcome = poll_for_new_messages(conn, client)
+            st.success(f"Found {len(outcome.queued)} new message(s).")
+            if outcome.failed_count:
+                st.error(
+                    f"{outcome.failed_count} message(s) could not be saved durably and were "
+                    "NOT marked as processed -- they will be retried on the next poll."
+                )
         except QuoConfigError as exc:
             st.error(str(exc))
         except QuoAPIError as exc:
             st.error(f"Quo API error: {exc}")
 
-    queue = st.session_state.quo_pending_queue
-    st.write(f"**{len(queue)} message(s) queued for review.**")
-    for item in queue[:10]:
-        with st.expander(f"[{item.group_label}] {item.received_at or '(unknown time)'}"):
-            st.code(item.raw_text)
+    pending = storage.get_pending_quo_messages(conn)
+    total_pending = storage.count_pending_quo_messages(conn)
+    st.write(f"**{total_pending} message(s) queued for review.**")
+    for item in pending:
+        with st.expander(f"[{item['group_label']}] {item['received_at'] or '(unknown time)'} -- {item['status']}"):
+            st.code(item["raw_text"])
 
-    if st.button("Load next Quo message into review", disabled=not queue):
-        next_item = queue[0]
-        st.session_state.quo_pending_queue = queue[1:]
-        st.session_state.sim_pending_delivery = {
-            "kind": "message", "content": next_item.raw_text, "channel": SHADOW_MODE_CHANNEL,
-        }
-        st.rerun()
+    if st.button("Load next Quo message into review", disabled=total_pending == 0):
+        next_item = storage.get_next_pending_quo_message(conn)
+        if next_item is not None:
+            storage.mark_quo_pending_message_loaded(conn, next_item["message_id"])
+            st.session_state.sim_pending_delivery = {
+                "kind": "message", "content": next_item["raw_text"], "channel": SHADOW_MODE_CHANNEL,
+                "quo_message_id": next_item["message_id"],
+            }
+            st.rerun()

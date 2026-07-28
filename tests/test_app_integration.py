@@ -316,3 +316,76 @@ def test_quo_live_message_flows_through_same_pipeline_and_audit_log(app, monkeyp
     quo_tab.button[0].click().run()
     quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
     assert "Found 0 new message" in quo_tab.success[0].value
+
+
+# -------------------------------------------- Durable Quo queue (Phase 1) --
+def _setup_quo_stub(app, monkeypatch, message_id, ticket_text=None):
+    monkeypatch.setenv("QUO_API_KEY", "test-key-not-real")
+    real_config = load_dispatch_groups()
+    agn_phone = "+15550109900"
+    contacts_by_id = {
+        g.quo_contact_id: Contact(
+            id=g.quo_contact_id, first_name=g.label, last_name=None, company=None,
+            phone_numbers=[agn_phone] if g.label == "AGN" else [],
+        )
+        for g in real_config.dispatch_groups
+    }
+    text = ticket_text or QUO_AGN_TEXT
+    inbound = QuoMessage(
+        id=message_id, to="PNus", from_number=agn_phone, text=text,
+        phone_number_id=real_config.our_phone_number_id, conversation_id="CONVDUR1", direction="incoming",
+        status="delivered", created_at="2026-07-27T10:00:00Z", updated_at="2026-07-27T10:00:00Z",
+    )
+    monkeypatch.setattr(quo_ingest, "QuoClient", _fake_quo_client_factory(contacts_by_id, {agn_phone: [inbound]}))
+    app.run()
+
+
+def test_approving_a_quo_message_marks_its_durable_queue_row_actioned(app, monkeypatch):
+    _setup_quo_stub(app, monkeypatch, "MSGACT1")
+
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    quo_tab.button[0].click().run()  # "Poll Quo now"
+
+    conn = storage.connect(storage.DB_PATH)
+    assert storage.count_pending_quo_messages(conn) == 1
+
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    quo_tab.button[1].click().run()  # "Load next Quo message into review"
+    assert storage.count_pending_quo_messages(conn) == 1  # still counted -- now 'loaded'
+    assert storage.get_pending_quo_messages(conn)[0]["status"] == "loaded"
+
+    click_process_action(app, "Approve")
+
+    assert storage.count_pending_quo_messages(conn) == 0  # now 'actioned'
+
+
+def test_quo_pending_queue_survives_a_simulated_app_restart(app, monkeypatch):
+    """The queue must be recoverable from a fresh app instance pointed at
+    the same database file, without ever re-polling Quo -- proves the
+    durable table, not st.session_state, is the source of truth."""
+    _setup_quo_stub(app, monkeypatch, "MSGRESTART1")
+
+    quo_tab = app.tabs[QUO_LIVE_TAB_INDEX]
+    quo_tab.button[0].click().run()  # "Poll Quo now" -- content durably written
+
+    # Simulate an app/laptop restart: a brand-new AppTest instance against
+    # the same (still-monkeypatched) database path.
+    st.cache_resource.clear()
+    restarted = AppTest.from_file("app.py", default_timeout=30)
+    restarted.run()
+    assert len(restarted.exception) == 0
+
+    quo_tab2 = restarted.tabs[QUO_LIVE_TAB_INDEX]
+    assert any("1 message(s) queued for review" in md.value for md in quo_tab2.markdown)
+
+    # Load it without re-polling -- proves the content itself (not just the
+    # count) survived the restart.
+    quo_tab2.button[1].click().run()
+    process_tab = restarted.tabs[PROCESS_TAB_INDEX]
+    assert any("AGN" in md.value for md in process_tab.markdown)
+    click_process_action(restarted, "Approve")
+
+    timeline = timeline_for("QLIVE1")
+    assert len(timeline) == 1
+    assert timeline[0]["raw_message"] == QUO_AGN_TEXT
+    assert timeline[0]["channel"] == quo_ingest.SHADOW_MODE_CHANNEL

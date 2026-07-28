@@ -172,6 +172,10 @@ def apply_pending_delivery(conn, vehicle_rules, service_areas) -> None:
         # this module's own delivery path; quo_ingest tags its own real,
         # read-only deliveries with "shadow_mode_quo_live" explicitly.
         st.session_state.current_channel = delivery.get("channel", "simulator")
+        # Links this review back to its durable quo_pending_messages row
+        # (None for simulator/manual deliveries) so _finalize() in app.py
+        # can mark that row "actioned" once the audit save succeeds.
+        st.session_state.current_quo_pending_message_id = delivery.get("quo_message_id")
 
     elif kind == "status_phrase":
         st.session_state.status_text_input = content

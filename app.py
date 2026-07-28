@@ -55,8 +55,8 @@ for key, default in (
     ("current_luxor_message", None),
     ("status_reply", None),
     ("last_closing_result", None),
-    ("quo_pending_queue", []),
     ("current_channel", "manual"),
+    ("current_quo_pending_message_id", None),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -101,6 +101,9 @@ with tab_process:
         # simulator/Quo-live deliveries (via apply_pending_delivery) tag a
         # different channel.
         st.session_state.current_channel = "manual"
+        # Not linked to any durable Quo queue row -- clears any stale
+        # pointer left over from a previously reviewed Quo-live message.
+        st.session_state.current_quo_pending_message_id = None
         # The "edit_message" text_area below is keyed, so Streamlit ignores
         # its value= on rerun once session_state already holds that key --
         # without this, processing a second job leaves the box showing the
@@ -186,6 +189,13 @@ with tab_process:
                 final_action=action,
                 channel=channel,
             )
+            # Only reached if save_audit_entry() succeeded above -- a durable
+            # queue row is marked actioned only once a real audit event
+            # exists for it, never before.
+            pending_message_id = st.session_state.current_quo_pending_message_id
+            if pending_message_id:
+                storage.mark_quo_pending_message_actioned(conn, pending_message_id)
+                st.session_state.current_quo_pending_message_id = None
             if channel == quo_ingest.SHADOW_MODE_CHANNEL:
                 st.success(f"Recorded locally as SHADOW MODE — {action}. Nothing was sent to Quo.")
             else:
