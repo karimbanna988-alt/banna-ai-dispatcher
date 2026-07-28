@@ -498,15 +498,33 @@ def _looks_like_closing(raw_text: str) -> bool:
 # a cancellation that never says "cancel" fell through to UNRECOGNIZED.
 # Closes it with a small, explicit set of conservative, deterministic
 # patterns for the exact reworded phrasings observed in real messages,
-# plus a narrow guard so a hedged or interrogative mention of
-# cancellation ("customer may cancel", "asked whether cancellation is
-# possible") is NOT treated as a confident cancellation -- deliberately
-# no attempt at broad natural-language understanding; anything not
-# matched here still falls through to UNRECOGNIZED for manual review,
-# exactly like before.
+# plus narrow guards so a hedged/interrogative mention of cancellation
+# ("customer may cancel", "asked whether cancellation is possible") or a
+# "found keys" message that goes on to say the underlying need is still
+# there ("found her keys but still needs the lock repaired") is NOT
+# treated as a confident cancellation -- deliberately no attempt at broad
+# natural-language understanding; anything not matched here still falls
+# through to UNRECOGNIZED for manual review, exactly like before.
+#
+# Hardened 2026-07-29 (same day): the original hedge guard only matched a
+# modal immediately adjacent to "cancel" ("may cancel", "may just
+# cancel"), so "may need to cancel" / "might have to cancel" / "could
+# decide to cancel" (two words between the modal and "cancel") slipped
+# through and were wrongly classified as CANCELLATION -- widened the gap
+# to up to 4 words. Also added the "found keys" continuation guard below,
+# for the same reason: "customer found her keys" alone is a confident
+# signal, but "found her keys but still needs the lock repaired" is not.
 _CANCELLATION_HEDGE_RE = re.compile(
-    r"\b(?:may|might|could|possibly)\s+\w*\s*cancel"  # "may cancel", "might just cancel"
+    r"\b(?:may|might|could|possibly)\b(?:\s+\w+){0,4}\s+cancel"  # "may cancel", "might have to cancel"
     r"|\bwhether\s+\w*\s*cancel",  # "whether cancellation is possible"
+    re.IGNORECASE,
+)
+
+# A "found keys" message that goes on to say the underlying need is still
+# there is not a cancellation -- narrowly scoped to this one shape (found
+# keys + a later still/now/but ... needs), not a general "needs" guard.
+_CANCELLATION_FOUND_KEYS_STILL_NEEDS_RE = re.compile(
+    r"\bfound\s+(?:her|his|their|the)\s+keys?\b.*\b(?:still|now|but)\b.*\bneeds?\b",
     re.IGNORECASE,
 )
 
@@ -524,6 +542,8 @@ _REWORDED_CANCELLATION_PATTERNS = (
 
 def _is_confident_cancellation(raw_text: str) -> bool:
     if _CANCELLATION_HEDGE_RE.search(raw_text):
+        return False
+    if _CANCELLATION_FOUND_KEYS_STILL_NEEDS_RE.search(raw_text):
         return False
     if re.search(r"\bcancel(?:led|ed)?\b", raw_text, re.IGNORECASE) or re.search(r"\bcancellation\b", raw_text, re.IGNORECASE):
         return True

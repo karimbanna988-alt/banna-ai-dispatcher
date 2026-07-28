@@ -176,6 +176,41 @@ def test_reworded_cancellation_false_positive_protections(conn, vehicle_rules, t
     assert result.message_type == MessageType.UNRECOGNIZED
 
 
+# ------------------------------------- Regression: hardening 2026-07-29 ---
+# The original hedge guard only caught a modal immediately adjacent to
+# "cancel" ("may cancel"), missing "may need to cancel" (words between).
+# The "found keys" pattern also didn't account for a continuation showing
+# the underlying need is still there ("found her keys but still needs the
+# lock repaired"). Both were caught and fixed same-day, before any real
+# technician/dispatch data existed.
+
+@pytest.mark.parametrize("text", [
+    "Customer does not need us anymore",
+    "Customer does not need us any more",
+])
+def test_hardening_confirms_positive_cases_still_classify(conn, vehicle_rules, text):
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.CANCELLATION
+
+
+@pytest.mark.parametrize("text", [
+    "Customer may need to cancel",
+    "Customer might have to cancel",
+    "Customer could decide to cancel",
+    "Customer found her keys but still needs the lock repaired",
+    "Customer found his keys and now needs a duplicate made",
+    "Customer found the keys, but the ignition still needs service",
+])
+def test_hardening_catches_wider_hedges_and_still_needs_continuations(conn, vehicle_rules, text):
+    """Before the 2026-07-29 hardening, all six of these were wrongly
+    classified as CANCELLATION -- a modal separated from "cancel" by more
+    than one word, or a "found keys" message that goes on to say the
+    underlying need is still there, must stay UNRECOGNIZED for manual
+    review instead."""
+    result = _classify_followup(conn, vehicle_rules, text)
+    assert result.message_type == MessageType.UNRECOGNIZED
+
+
 def test_status_message_is_classified(conn, vehicle_rules):
     raw = load("agn_clean.txt")
     job = extract_job(raw, vehicle_rules)
