@@ -414,10 +414,13 @@ with tab_jobs:
                 st.error(f"Could not assign -- Handle Manually: {assignment_result.reason}")
             else:
                 st.success(f"{assignment_result.outcome.capitalize()}: {assignment_result.reason}")
-                if assignment_result.dispatch_group or assignment_result.closing_group:
+                if assignment_result.outcome in ("assigned", "reassigned"):
+                    # Missing dispatch/closing group never affects the
+                    # assignment decision above -- purely informational,
+                    # delivery stays manual either way.
                     st.info(
-                        f"Use dispatch group: {assignment_result.dispatch_group or '(not set)'} | "
-                        f"closing group: {assignment_result.closing_group or '(not set)'}"
+                        f"Dispatch group: {assignment_result.dispatch_group or 'Destination not configured'} | "
+                        f"Closing group: {assignment_result.closing_group or 'Destination not configured'}"
                     )
 
 # ------------------------------------------------------------ Technicians --
