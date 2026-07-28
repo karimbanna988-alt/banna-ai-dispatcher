@@ -5,7 +5,6 @@ area luxor_demo.py adds: the password gate, masking, absence of any
 mutation control, and that the refresh action only ever touches the
 existing durable pending-queue bookkeeping, never jobs/events directly."""
 
-import json
 from pathlib import Path
 
 import pytest
@@ -39,7 +38,13 @@ def app_env(db_path, monkeypatch):
     # Keep the real QUO_API_KEY out of the test process entirely -- same
     # reasoning as test_app_integration.py's own `app` fixture.
     monkeypatch.setenv("QUO_API_KEY", "")
-    monkeypatch.delenv("LUXOR_DEMO_PASSWORD", raising=False)
+    # Set (not delete) to empty: the real .env now legitimately carries a
+    # generated LUXOR_DEMO_PASSWORD for the live demo. python-dotenv's
+    # load_dotenv() (called at the top of luxor_demo.py, override=False)
+    # only fills in a key that is *absent* from os.environ -- an empty
+    # string already counts as present, so this keeps tests isolated from
+    # whatever real value happens to be in .env.
+    monkeypatch.setenv("LUXOR_DEMO_PASSWORD", "")
     st.cache_resource.clear()
     return db_path
 
@@ -114,12 +119,11 @@ def test_sensitive_identifiers_are_masked_in_timeline(app_env, monkeypatch):
     select_box.select(select_box.options[0]).run()
     at.button(key="luxor_demo_show_timeline").click().run()
 
-    assert len(at.json) == 1
-    event = json.loads(at.json[0].value)
-    assert "555-010-3000" not in event["raw_message"]
-    assert "[phone masked]" in event["raw_message"]
-    assert "123" not in event["raw_message"] or "[extension masked]" in event["raw_message"]
-    assert "[extension masked]" in event["raw_message"]
+    rendered_text = "\n".join(m.value for m in at.markdown)
+    assert "555-010-3000" not in rendered_text
+    assert "[phone masked]" in rendered_text
+    assert "123" not in rendered_text or "[extension masked]" in rendered_text
+    assert "[extension masked]" in rendered_text
 
 
 def test_masking_function_directly():
