@@ -288,6 +288,8 @@ with tab_closing:
     amount = st.text_input("Final amount (verbatim from technician)", key="closing_amount")
     payment_method = st.text_input("Payment method (e.g. CC)", key="closing_payment")
     parts_amount = st.text_input("Parts amount (optional, verbatim)", key="closing_parts")
+    company_share = st.text_input("Company share (optional, verbatim, if reported)", key="closing_company_share")
+    technician_share = st.text_input("Technician share (optional, verbatim, if reported)", key="closing_technician_share")
 
     if st.button("Render closing"):
         if st.session_state.current_job is None:
@@ -313,6 +315,9 @@ with tab_closing:
                 storage.save_audit_entry(
                     conn, job, classify_result, luxor_message=result.text, final_action="Approve",
                     channel=st.session_state.current_channel,
+                    closing_amount=amount or None, closing_payment_method=payment_method or None,
+                    closing_parts_amount=parts_amount or None, closing_company_share=company_share or None,
+                    closing_technician_share=technician_share or None,
                 )
                 st.success("Closing recorded in the audit log.")
         else:

@@ -123,6 +123,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_technician_assignment_support(conn)
     _add_whatsapp_handoff_support(conn)
     _add_outbound_log_support(conn)
+    _add_closing_and_reconciliation_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -545,6 +546,34 @@ def _add_outbound_log_support(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _add_closing_and_reconciliation_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same idempotent PRAGMA table_info pattern as every
+    other migration in this module. The minimum structured closing record
+    requested: five nullable amount/share columns on `events` (only ever
+    populated on a CLOSING-type event a dispatcher actually recorded --
+    never invented, matching closing.py's existing "verbatim only"
+    philosophy), plus one nullable `reconciliation_state` column on `jobs`
+    that is deliberately separate from `jobs.status`/derive_job_status():
+    a job's operational lifecycle (New -> Approved -> ... -> Closed) and
+    whether it's been financially settled are orthogonal facts, and
+    keeping them in separate columns means adding "Settled" can never
+    require touching the existing, already-tested status state machine.
+    NULL reconciliation_state on a Closed job means "awaiting
+    reconciliation" -- not stored as its own literal value since that
+    would just be restating "not yet settled" a second way."""
+    existing_event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    for column in (
+        "closing_amount", "closing_payment_method", "closing_parts_amount",
+        "closing_company_share", "closing_technician_share",
+    ):
+        if column not in existing_event_columns:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
+    existing_job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "reconciliation_state" not in existing_job_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN reconciliation_state TEXT")
+    conn.commit()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -774,6 +803,11 @@ def save_audit_entry(
     dispatcher_edits: Optional[str] = None,
     final_action: Optional[str] = None,
     channel: str = "manual",
+    closing_amount: Optional[str] = None,
+    closing_payment_method: Optional[str] = None,
+    closing_parts_amount: Optional[str] = None,
+    closing_company_share: Optional[str] = None,
+    closing_technician_share: Optional[str] = None,
 ) -> int:
     now = _now()
     ticket = job.ticket_number.value
@@ -829,8 +863,10 @@ def save_audit_entry(
             job_id, ticket_number, raw_message, message_type, source,
             confidence, confidence_reasons_json, decision_verdict,
             decision_reasons_json, suggested_quo_reply, luxor_message,
-            dispatcher_edits, final_action, created_at, channel
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            dispatcher_edits, final_action, created_at, channel,
+            closing_amount, closing_payment_method, closing_parts_amount,
+            closing_company_share, closing_technician_share
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id, ticket, job.raw_text, message_type_value, job.source.value,
@@ -838,6 +874,8 @@ def save_audit_entry(
             decision.verdict.value if decision else None,
             json.dumps(decision.reasons) if decision else None,
             suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now, channel,
+            closing_amount, closing_payment_method, closing_parts_amount,
+            closing_company_share, closing_technician_share,
         ),
     )
     event_id = cur.lastrowid
@@ -850,6 +888,41 @@ def save_audit_entry(
 
     conn.commit()
     return job_id
+
+
+def mark_job_settled(conn: sqlite3.Connection, job_id: int) -> None:
+    """The only writer of jobs.reconciliation_state -- deliberately never
+    touches jobs.status, so marking a job financially settled can never
+    alter its operational lifecycle. Only meaningful for a job that is
+    already Closed, but not restricted to that here: an out-of-order
+    settlement is a business-process question, not something this
+    function should silently refuse to record."""
+    conn.execute(
+        "UPDATE jobs SET reconciliation_state = 'Settled', updated_at = ? WHERE id = ?",
+        (_now(), job_id),
+    )
+    conn.commit()
+
+
+def get_latest_closing_details(conn: sqlite3.Connection, job_id: int) -> Optional[dict]:
+    """Most recent event for this job that actually recorded a closing
+    amount -- None if no closing has ever been recorded with structured
+    details. Never invents a value for a job whose closing predates this
+    schema, or whose closing was recorded without amount details."""
+    row = conn.execute(
+        """
+        SELECT closing_amount, closing_payment_method, closing_parts_amount,
+               closing_company_share, closing_technician_share, created_at
+        FROM events
+        WHERE job_id = ? AND closing_amount IS NOT NULL
+        ORDER BY id DESC LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    columns = ("amount", "payment_method", "parts_amount", "company_share", "technician_share", "recorded_at")
+    return dict(zip(columns, row))
 
 
 def get_audit_timeline(conn: sqlite3.Connection, ticket_number: str) -> List[dict]:
