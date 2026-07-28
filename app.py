@@ -79,9 +79,9 @@ _hours = check_business_hours()
 _hours_label = f"Business hours: {'OPEN' if _hours.within_hours else 'CLOSED'} — {_hours.local_time.strftime('%A %H:%M %Z')}"
 (st.success if _hours.within_hours else st.error)(_hours_label)
 
-tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator, tab_quo_live, tab_jobs = st.tabs(
+tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator, tab_quo_live, tab_jobs, tab_technicians = st.tabs(
     ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline",
-     "Fake Inbox (Simulator)", "Quo Inbox (Live)", "Jobs"]
+     "Fake Inbox (Simulator)", "Quo Inbox (Live)", "Jobs", "Technicians"]
 )
 
 
@@ -371,6 +371,7 @@ with tab_jobs:
                 "Created": j["created_at"],
                 "Last activity": j["last_event_at"] or j["updated_at"],
                 "Latest action": j["latest_action"] or "(none)",
+                "Assigned": j["assigned_technician_name"] or "(unassigned)",
             }
             for j in jobs
         ]
@@ -381,6 +382,103 @@ with tab_jobs:
         selected_job_label = st.selectbox(
             "Select a job to view its full timeline", options=list(job_options.keys()), key="jobs_selected_job",
         )
+        selected_job_id = job_options[selected_job_label]
+        selected_job_row = next((j for j in jobs if j["id"] == selected_job_id), None)
+
         if st.button("Show job timeline", key="jobs_show_timeline"):
-            timeline = storage.get_audit_timeline_by_job_id(conn, job_options[selected_job_label])
+            timeline = storage.get_audit_timeline_by_job_id(conn, selected_job_id)
             _render_event_timeline(timeline)
+
+        st.subheader("Assign technician")
+        st.caption(
+            "Never auto-assigns and never invents availability, skill match, or acceptance -- "
+            "eligibility is re-checked fresh every time against the technician's active status, "
+            "configured coverage areas (re-derived via the same service-area lookup rules.decide() "
+            "already uses), and any explicit skills/vehicle restrictions. Ineligible or ambiguous "
+            "combinations are recorded as Handle Manually, never silently allowed."
+        )
+        current_assignment = selected_job_row["assigned_technician_name"] if selected_job_row else None
+        st.write(f"Current assignment: **{current_assignment or '(unassigned)'}**")
+
+        active_technicians = storage.list_technicians(conn, active_only=True)
+        assign_options = ["(remove assignment)"] + [t["name"] for t in active_technicians]
+        chosen_technician = st.selectbox("Technician", options=assign_options, key="jobs_assign_technician_select")
+
+        if st.button("Apply assignment", key="jobs_apply_assignment"):
+            if chosen_technician == "(remove assignment)":
+                assignment_result = storage.assign_technician(conn, selected_job_id, None, service_areas)
+            else:
+                chosen_id = next(t["id"] for t in active_technicians if t["name"] == chosen_technician)
+                assignment_result = storage.assign_technician(conn, selected_job_id, chosen_id, service_areas)
+            if assignment_result.outcome == "handle_manually":
+                st.error(f"Could not assign -- Handle Manually: {assignment_result.reason}")
+            else:
+                st.success(f"{assignment_result.outcome.capitalize()}: {assignment_result.reason}")
+
+# ------------------------------------------------------------ Technicians --
+with tab_technicians:
+    st.subheader("Technicians")
+    st.caption(
+        "A minimal roster: name, active/inactive, dispatch-group coverage areas, and optional "
+        "explicit skills/vehicle restrictions. Areas must match confirmed dispatch_group names "
+        "from rules/service_areas.yaml -- every one is currently unconfirmed there, so no real "
+        "job can be successfully assigned yet (the same limitation the rest of the app already "
+        "has, not a new one introduced here)."
+    )
+
+    tech_status_message = st.session_state.pop("tech_status_message", None)
+    if tech_status_message:
+        st.success(tech_status_message)
+
+    st.write("Add a technician")
+    new_tech_name = st.text_input("Name", key="tech_new_name")
+    new_tech_areas = st.text_input("Coverage areas (comma-separated dispatch_group names)", key="tech_new_areas")
+    new_tech_skills = st.text_input("Skills (optional, comma-separated)", key="tech_new_skills")
+    new_tech_vehicle_restrictions = st.text_input(
+        "Vehicle restrictions (optional, comma-separated)", key="tech_new_vehicle_restrictions",
+    )
+    if st.button("Add technician", key="tech_add_button"):
+        if not new_tech_name.strip():
+            st.error("Name is required.")
+        else:
+            areas = [a.strip() for a in new_tech_areas.split(",") if a.strip()]
+            skills = [s.strip() for s in new_tech_skills.split(",") if s.strip()]
+            vehicle_restrictions = [v.strip() for v in new_tech_vehicle_restrictions.split(",") if v.strip()]
+            try:
+                storage.add_technician(conn, new_tech_name.strip(), areas, skills or None, vehicle_restrictions or None)
+                st.success(f"Added {new_tech_name.strip()}.")
+            except Exception as exc:
+                st.error(f"Could not add technician (name may already exist): {exc}")
+
+    technicians = storage.list_technicians(conn)
+    st.write(f"**{len(technicians)} technician(s).**")
+    st.table(
+        [
+            {
+                "Name": t["name"],
+                "Active": "Yes" if t["active"] else "No",
+                "Areas": ", ".join(t["areas"]) or "(none configured)",
+                "Skills": ", ".join(t["skills"]) or "(none -- no restriction beyond global rules)",
+                "Vehicle restrictions": ", ".join(t["vehicle_restrictions"]) or "(none)",
+            }
+            for t in technicians
+        ]
+    )
+
+    if technicians:
+        tech_toggle_name = st.selectbox(
+            "Toggle active status for", options=[t["name"] for t in technicians], key="tech_toggle_select",
+        )
+        if st.button("Toggle active status", key="tech_toggle_button"):
+            selected_tech = next(t for t in technicians if t["name"] == tech_toggle_name)
+            storage.set_technician_active(conn, selected_tech["id"], not selected_tech["active"])
+            new_state = "active" if not selected_tech["active"] else "inactive"
+            # The roster table above was already rendered earlier in this
+            # same script pass (with the pre-toggle data) -- st.rerun() is
+            # needed so the next pass re-fetches technicians and shows the
+            # updated state immediately, same pattern as
+            # simulator.py's sim_pending_delivery. st.success() itself
+            # wouldn't survive the rerun, so the message is stashed and
+            # shown at the top of this tab instead.
+            st.session_state.tech_status_message = f"{tech_toggle_name} is now {new_state}."
+            st.rerun()

@@ -23,6 +23,7 @@ STATUS_TAB_INDEX = 2
 CLOSING_TAB_INDEX = 3
 QUO_LIVE_TAB_INDEX = 6
 JOBS_TAB_INDEX = 7
+TECHNICIANS_TAB_INDEX = 8
 
 
 @pytest.fixture()
@@ -402,7 +403,9 @@ def test_jobs_tab_lists_one_row_per_job_and_masks_pii(app):
 
     jobs_tab = app.tabs[JOBS_TAB_INDEX]
     table = jobs_tab.table[0].value
-    assert set(table.columns) == {"Source", "Ticket", "Status", "Created", "Last activity", "Latest action"}
+    assert set(table.columns) == {
+        "Source", "Ticket", "Status", "Created", "Last activity", "Latest action", "Assigned",
+    }
     assert "SIM2AG" in table["Ticket"].values
     row = table[table["Ticket"] == "SIM2AG"].iloc[0]
     assert row["Source"] == "AGN"
@@ -480,3 +483,111 @@ def test_jobs_tab_selecting_a_job_shows_its_full_unmasked_timeline(app):
     assert "600 Fake Blvd" in event["raw_message"]
     assert event["message_type"] == "NEW"
     assert event["final_action"] == "Approve"
+
+
+# ------------------------------------------------------- Technicians tab ---
+def add_technician_via_ui(at, name, areas="", skills="", vehicle_restrictions=""):
+    tech_tab = at.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.text_input(key="tech_new_name").set_value(name).run()
+    tech_tab = at.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.text_input(key="tech_new_areas").set_value(areas).run()
+    tech_tab = at.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.text_input(key="tech_new_skills").set_value(skills).run()
+    tech_tab = at.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.text_input(key="tech_new_vehicle_restrictions").set_value(vehicle_restrictions).run()
+    tech_tab = at.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.button(key="tech_add_button").click().run()
+
+
+def test_technicians_tab_add_and_list(app):
+    add_technician_via_ui(app, "Alex", areas="Charlotte, Raleigh", skills="lockout")
+
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    assert any("Added Alex" in s.value for s in tech_tab.success)
+    table = tech_tab.table[0].value
+    assert "Alex" in table["Name"].values
+    row = table[table["Name"] == "Alex"].iloc[0]
+    assert row["Active"] == "Yes"
+    assert "Charlotte" in row["Areas"] and "Raleigh" in row["Areas"]
+    assert row["Skills"] == "lockout"
+
+
+def test_technicians_tab_rejects_duplicate_name(app):
+    add_technician_via_ui(app, "Alex", areas="Charlotte")
+    add_technician_via_ui(app, "Alex", areas="Raleigh")
+
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    assert any("already exist" in e.value for e in tech_tab.error)
+    table = tech_tab.table[0].value
+    assert (table["Name"] == "Alex").sum() == 1  # not duplicated
+
+
+def test_technicians_tab_requires_a_name(app):
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.button(key="tech_add_button").click().run()
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    assert any("Name is required" in e.value for e in tech_tab.error)
+
+
+def test_technicians_tab_toggle_active(app):
+    add_technician_via_ui(app, "Alex", areas="Charlotte")
+
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.selectbox(key="tech_toggle_select").select("Alex").run()
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    tech_tab.button(key="tech_toggle_button").click().run()
+
+    tech_tab = app.tabs[TECHNICIANS_TAB_INDEX]
+    assert any("now inactive" in s.value for s in tech_tab.success)
+    table = tech_tab.table[0].value
+    assert table[table["Name"] == "Alex"].iloc[0]["Active"] == "No"
+
+
+# ------------------------------------------ Jobs tab: assign technician ----
+def test_jobs_tab_assignment_is_blocked_for_a_real_unconfirmed_service_area(app):
+    """rules/service_areas.yaml has every dispatch_group unconfirmed today
+    -- confirmed by direct inspection. So even a technician whose
+    configured area matches the job's city exactly must still come back
+    Handle Manually through the real app config, never a silent success.
+    This is the correct, inherited behavior, not a gap in this feature."""
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    add_technician_via_ui(app, "Alex", areas="Faketown")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    select_box = jobs_tab.selectbox(key="jobs_selected_job")
+    matching = [opt for opt in select_box.options if "SIM2AG" in opt]
+    select_box.select(matching[0]).run()
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.selectbox(key="jobs_assign_technician_select").select("Alex").run()
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.button(key="jobs_apply_assignment").click().run()
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    assert any("Handle Manually" in e.value for e in jobs_tab.error)
+    timeline = timeline_for("SIM2AG")
+    assignment_events = [e for e in timeline if e["message_type"] == "ASSIGNMENT"]
+    assert len(assignment_events) == 1
+    assert assignment_events[0]["final_action"] == "Handle Manually"
+
+
+def test_jobs_tab_assignment_removal_always_allowed(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    select_box = jobs_tab.selectbox(key="jobs_selected_job")
+    matching = [opt for opt in select_box.options if "SIM2AG" in opt]
+    select_box.select(matching[0]).run()
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.selectbox(key="jobs_assign_technician_select").select("(remove assignment)").run()
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.button(key="jobs_apply_assignment").click().run()
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    assert any("Removed" in s.value for s in jobs_tab.success)
