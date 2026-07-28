@@ -95,10 +95,13 @@ Implemented in `storage.py`: a `jobs` table (latest field snapshot per ticket, f
 - The Luxor Locksmith formatter never leaks source-company branding and preserves every field verbatim.
 - The technician status/company-question mapper, including the "did anyone call" / "any update" fallback to "no confirmed status" when nothing is known.
 
-69 tests passing as of the last full run.
+221 tests passing as of the last full run (2026-07-28) -- see
+`docs/architecture.md` sections 5, 8, and 9 for the simulator, receive-only
+Quo integration, and Phase 1 CRM foundation work added since this count
+was last 69.
 
 ## Open items carried over from the interview
 
 - Exact Luxor Locksmith technician message template — Version 1 rule is implemented (`src/dispatcher/formatter.py`), but the business owner hasn't reviewed the actual field order/labels yet.
-- Full permanent service-area mapping — `rules/service_areas.yaml` has the 12 named areas as a placeholder, but every dispatch/closing group is unconfirmed; this forces `HANDLE_MANUALLY` for every job today until real group names are filled in.
-- AGN's closing template — now assumed to share Lucky's format (per the business owner's 2026-07-26 correction that the shape is the same across companies), but still with zero real AGN closing examples seen.
+- Full permanent service-area mapping — `rules/service_areas.yaml` has 13 named areas as a placeholder (the original 12 plus Raleigh, NC, added 2026-07-27), but every dispatch/closing group is unconfirmed; this forces `HANDLE_MANUALLY` for every job today until real group names are filled in.
+- AGN's closing template — confirmed 2026-07-27 to share Lucky's shared format against a real AGN closing example (ticket UQ9DI, `$690 Cash`); see `docs/architecture.md` section 4.

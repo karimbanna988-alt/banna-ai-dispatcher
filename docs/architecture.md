@@ -438,7 +438,235 @@ source and asserting none of those verbs appear.
   Extended `tests/test_app_integration.py` with the same AppTest-driven
   pattern used for every simulator scenario, using a monkeypatched fake
   `QuoClient`.
-- **Not yet done**: an actual real message hasn't been run through the
-  live "Poll Quo now" button in the running app and approved end-to-end
-  yet -- confirmed only via direct read-only API probing so far, plus the
-  full mocked test suite exercising the identical code path.
+- **Confirmed working end-to-end 2026-07-27/28**: this line previously
+  said a real message hadn't been run through "Poll Quo now" and approved
+  yet -- that's since happened multiple times against the real account
+  (real AGN and Main Leads jobs, correctly extracted/classified/formatted/
+  audited, tagged `channel=shadow_mode_quo_live`, zero Quo writes). See
+  section 9 for what was built on top of this since then.
+
+## 9. Phase 1 CRM foundation (2026-07-28)
+
+Three additive, independently-committed changes layered on top of the
+receive-only Quo integration (section 8) and the crash-fix/shadow-mode
+work: a durable review queue, a database schema repair, and a job-status
+state machine plus a "Jobs" list view. None of this touches the parser,
+decision engine, formatter, or the `events` table's role as the one
+append-only audit source of truth -- this is still a **local, human-in-
+the-loop prototype**: nothing sends, replies to, acknowledges, or
+modifies anything in Quo, no action happens without a dispatcher clicking
+Approve/Edit/Reject/Handle Manually, and none of this is autonomous or
+production-ready.
+
+### 9a. Durable Quo pending queue (fixes silent message loss on restart)
+
+Before this change, a message polled from Quo lived only in
+`st.session_state.quo_pending_queue` (Streamlit session memory) once
+fetched, while its Quo message id was already recorded in
+`quo_processed_messages` at fetch time. If the app or laptop restarted
+before the dispatcher acted on a polled message, its content was gone --
+but its id was already marked processed, so it would never be re-fetched
+either. Silent, permanent, unrecoverable loss of that one message's
+content.
+
+**Fix**: a new `quo_pending_messages` table (`src/dispatcher/storage.py`)
+is now the sole source of truth for the review queue -- the "Quo Inbox
+(Live)" tab reads it fresh from the database on every render, not from
+session state. Columns: `message_id` (Quo's own id, primary key),
+`conversation_id`, `group_label`, `raw_text`, `from_number`,
+`received_at`, `fetched_at`, `status`, `loaded_at`, `actioned_at`,
+`last_error` (reserved for future use -- see the honest limitation note
+below).
+
+**Queue state transitions**:
+
+```
+pending --[Load next Quo message into review]--> loaded --[Approve/Edit/Reject/
+                                                             Handle Manually
+                                                             succeeds]--> actioned
+   ^                                                  |
+   +---- a restart-interrupted review (row left       |
+         "loaded", never actioned) is picked up       |
+         again by the *next* "Load next" click,       |
+         not stranded ---------------------------------+
+```
+
+No row is ever deleted in this phase (an append-only ledger, matching the
+`events` table's own philosophy).
+
+**Atomic persistence** (`storage.save_pending_and_mark_processed`): the
+full message content (`quo_pending_messages`) and the id-level dedup
+marker (`quo_processed_messages`) are written in **one transaction** -- a
+message id is never marked processed unless its content was already
+safely stored. Verified empirically (not assumed) that Python's stdlib
+`sqlite3`, with an explicit `BEGIN`, treats a mix of `INSERT`s as fully
+rollback-able together. Any failure calls `conn.rollback()` and
+re-raises.
+
+**Checkpoint failure behavior**: `quo_ingest.poll_for_new_messages` now
+returns `PollOutcome(queued, failed_count)`. If **any** message in a poll
+fails to persist, the poll's checkpoint update is skipped entirely for
+that whole poll cycle (the existing design has one global checkpoint
+across all four dispatch groups, not a per-contact one -- see the honest
+limitation note below for why). On the next poll, the same time window is
+re-scanned: messages that already succeeded are skipped again via the
+untouched `quo_processed_messages` ledger (their ids are already marked,
+regardless of this poll's checkpoint decision), while the message that
+failed -- never marked processed -- is naturally retried. The "Quo Inbox
+(Live)" tab surfaces a failure count (e.g. "2 message(s) could not be
+saved durably...") without ever displaying the failed message's content.
+
+**Honest limitations, not hidden**:
+- `last_error` is in the schema per the original design brief but isn't
+  populated by the current write path -- a failed *initial* persist is
+  fully rolled back (both inserts undone together), so there is no row
+  left to attach an error string to. It exists for forward compatibility,
+  not decoration.
+- The checkpoint is global across all four configured dispatch groups
+  (unchanged from section 8's design), not per-contact -- "hold the
+  checkpoint back on any failure" was implemented at the whole-poll level
+  rather than introducing per-contact checkpoint columns, which would
+  have been a larger, unrequested schema change. The dedup ledger still
+  guarantees no message is ever lost or double-queued regardless.
+
+Tests: `tests/test_quo_ingest.py` (durable persistence, restart survival,
+a simulated database-write failure leaving the checkpoint untouched and
+the message unprocessed, retry-without-duplication on the next poll,
+pending/loaded/actioned transitions including restart-interrupted-review
+recovery) and `tests/test_app_integration.py` (the same, driven through
+the real `app.py` UI via `AppTest`, including a fresh `AppTest` instance
+against the same database file to simulate a restart).
+
+### 9b. `events.job_id` foreign-key schema repair
+
+**Root cause**: the earlier jobs-table migration (section on the
+UNIQUE-constraint crash fix) renamed `jobs` away and back
+(`ALTER TABLE jobs RENAME TO jobs_pre_source_scoped_unique_backup`, then
+`CREATE TABLE jobs ...`). SQLite's `ALTER TABLE ... RENAME` automatically
+rewrites `FOREIGN KEY` clauses in *other* tables to keep following the
+renamed table -- so `events.job_id`'s persisted schema ended up
+referencing `jobs_pre_source_scoped_unique_backup` instead of `jobs`.
+`PRAGMA foreign_keys` defaults OFF per connection in SQLite, so this was
+never enforced, but it was still wrong, and `PRAGMA foreign_key_check`
+against the live database confirmed a real violation once you checked
+against the *correct* table.
+
+**Repair** (`storage._repair_events_job_id_foreign_key`): deliberately
+does **not** repeat the rename-old-table-first sequence that caused the
+original bug. Follows SQLite's own recommended generalized pattern for
+schema changes `ALTER TABLE` can't express directly: build the corrected
+table fresh under a temporary name, copy every row across with `id`s
+preserved, verify row counts match and there are zero orphan `job_id`
+values, only then drop the already-copied original and rename the
+temporary table into place -- that rename targets a table nothing else
+references yet, so it cannot trigger the same class of bug. Before any of
+that, it also refuses to proceed automatically if any view, trigger, or
+other table's foreign key still references `"events"` by name. The whole
+operation is one transaction, gated by `PRAGMA foreign_key_check` and
+`PRAGMA integrity_check` before commit; any failure rolls back
+everything, leaving the original table completely untouched.
+
+**Backup method**: a timestamped file-level copy of `data/dispatcher.db`
+was taken (kept outside Git, in a sibling directory to the repo) before
+running this migration against the real database -- deliberately
+*instead of* adding another live backup table, since the file-level
+backup already provides full recoverability without cluttering the live
+schema. The pre-existing `jobs_pre_source_scoped_unique_backup` table
+from the earlier migration is left in place, untouched (not deleted).
+
+**Enforcement**: `storage.connect()` now explicitly sets
+`PRAGMA foreign_keys = ON` on every connection -- but only after
+verifying `events.job_id` is currently clean against `jobs.id` (a cheap
+indexed check, since the pragma is a per-connection setting, never
+persisted in the database file, and SQLite defaults it OFF). Self-healing
+rather than blind: if orphans were ever found, enforcement simply isn't
+turned on for that connection rather than crashing.
+
+Applied to the real `data/dispatcher.db`: all 6 event rows preserved with
+their original ids, zero `foreign_key_check` violations, `integrity_check`
+`"ok"`, enforcement now on.
+
+Tests: `tests/test_storage.py` (migration correctness against a hand-built
+pre-repair schema, idempotency, no extra live backup table created,
+existing `jobs` backup left alone, `foreign_key_check`/`integrity_check`
+pass, enforcement rejects an invalid `job_id`, and two safety-guard tests
+-- refuses to migrate automatically when a view references `events`, and
+aborts/reports orphan rows without enabling enforcement if any are found).
+
+### 9c. Job status state machine
+
+`jobs.status` is derived by **one** deterministic function,
+`storage.derive_job_status(previous_status, message_type, final_action)`,
+used identically by the live `save_audit_entry()` save path, the one-time
+backfill, and every test -- never inferred ad hoc from only a job's
+latest event.
+
+| `final_action` | `message_type` | -> `status` |
+|---|---|---|
+| Handle Manually | *(any)* | **Handle Manually** (always wins) |
+| Approve / Edit | NEW | **Approved** |
+| Reject | NEW | **Rejected** (the *only* path to Rejected) |
+| Approve / Edit | STATUS | **In Progress** |
+| Approve / Edit | CLOSING | **Closed** |
+| Approve / Edit | CANCELLATION | **Cancelled** |
+| Reject | STATUS / CLOSING / CANCELLATION | preserves the job's current status |
+| Approve / Edit / Reject | CORRECTION / UPDATE_REQUEST / DUPLICATE / UNRECOGNIZED | preserves the job's current status |
+| *(any)* | CLOSING_WITHOUT_DISPATCH | **Needs Review** (anomalous by construction) |
+| unknown action, unknown message type, or no valid previous status to preserve | -- | **Needs Review** (safe fallback) |
+
+The eight status values are fixed and deterministic: New, Needs Review,
+Approved, Handle Manually, Rejected, In Progress, Closed, Cancelled.
+"New" is the seed value for a job's first-ever event (and the fallback a
+malformed/out-of-order history preserves if its very first recorded event
+is something other than NEW) -- in normal operation every real job leaves
+"New" on its first save.
+
+`jobs.status`, `jobs.last_event_id`, `jobs.last_event_at` are set
+together on every `save_audit_entry()` call, and backfilled for existing
+jobs by **replaying each job's events chronologically** through
+`derive_job_status` (not by reading only the latest event -- proven by a
+test where only full replay can produce the correct answer, since several
+transitions depend on knowing the status *before* the current event).
+Backfill is idempotent and resumable: `last_event_id IS NULL` is the "not
+yet backfilled" marker, so an interrupted backfill safely continues on
+the next `connect()` rather than silently stopping partway. Applied to
+the real database: all 5 jobs' backfilled statuses match their event
+history exactly.
+
+Tests: `tests/test_job_status.py` -- the full transition table above
+including every fallback/ambiguous case, live-save status progression
+through a realistic NEW -> STATUS -> CLOSING sequence, confirmation that
+rejecting a later status report preserves an already-approved job's
+status, chronological-replay-vs-latest-event-only backfill correctness,
+and backfill idempotency/resumability.
+
+### 9d. "Jobs" tab
+
+Appended as an 8th tab (existing tab indices for Process/Daily/Status/
+Closing/Audit/Simulator/Quo-Live are unchanged). One row per
+`(source, ticket_number)` via `storage.list_jobs()` (parameterized
+filters: ticket search, source, status, "active since" date). The list
+view selects only `source`/`ticket_number`/`status`/timestamps/
+`latest_action` -- it never selects `raw_message` or `latest_fields_json`
+at all, so phone numbers, addresses, and full message text cannot leak
+into the list by construction; no separate masking step was needed.
+Selecting a job shows its full, unmasked chronological timeline via
+`storage.get_audit_timeline_by_job_id()` (parameterized, keyed by
+`job_id` rather than `ticket_number` so it can't cross-source-collide),
+rendered through the same `_render_event_timeline()` helper the existing
+Audit Timeline tab uses -- the `events` table remains the one audit
+source of truth for both.
+
+Not built in this phase (explicitly out of scope): a `customers` table,
+analytics/revenue reporting, structured closing-amount storage, data
+export, or any change to Quo's write capability.
+
+### 9e. Quo access is still strictly GET-only
+
+None of sections 9a-9d add, modify, or enable any HTTP method other than
+GET against Quo. `src/dispatcher/quo_client.py` and
+`src/dispatcher/quo_ingest.py` were re-verified (structural grep guard
+test, `tests/test_quo_client.py::test_module_source_contains_no_write_http_verbs`)
+to contain zero `.post(`, `.put(`, `.delete(`, or `.patch(` calls after
+every change in this phase. Nothing here sends, replies to, acknowledges,
+or modifies anything in the real Quo account.
