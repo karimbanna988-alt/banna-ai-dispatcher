@@ -121,6 +121,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _repair_events_job_id_foreign_key(conn)
     _add_job_status_columns_and_backfill(conn)
     _add_technician_assignment_support(conn)
+    _add_whatsapp_handoff_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -478,6 +479,34 @@ def _add_technician_assignment_support(conn: sqlite3.Connection) -> None:
         )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_assigned_technician_id ON jobs (assigned_technician_id)"
+    )
+    conn.commit()
+
+
+def _add_whatsapp_handoff_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same pattern as every other migration in this module.
+
+    Deliberately a separate table rather than an `events` row: a WhatsApp
+    handoff confirmation is a dispatcher noting "I sent this manually" --
+    it must never flow through derive_job_status()'s final_action
+    matching (which has no branch for this action and would fall through
+    to its safest-fallback "Needs Review", incorrectly resetting an
+    already-approved/in-progress job's status). Keeping it fully separate
+    makes that impossible by construction, not by convention."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_handoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            technician_id INTEGER,
+            marked_sent_at TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES jobs (id),
+            FOREIGN KEY (technician_id) REFERENCES technicians (id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_handoffs_job_id ON whatsapp_handoffs (job_id)"
     )
     conn.commit()
 
@@ -943,6 +972,26 @@ def get_technician(conn: sqlite3.Connection, technician_id: int) -> Optional[dic
         return None
     columns = [d[0] for d in cur.description]
     return _technician_row_to_dict(columns, row)
+
+
+def record_whatsapp_handoff(conn: sqlite3.Connection, job_id: int, technician_id: Optional[int]) -> None:
+    """Records that a dispatcher manually sent the Luxor message via
+    WhatsApp -- see _add_whatsapp_handoff_support's docstring for why this
+    is a separate table rather than an events row. Never sends anything
+    itself; this only records that a human did."""
+    conn.execute(
+        "INSERT INTO whatsapp_handoffs (job_id, technician_id, marked_sent_at) VALUES (?, ?, ?)",
+        (job_id, technician_id, _now()),
+    )
+    conn.commit()
+
+
+def get_whatsapp_handoffs(conn: sqlite3.Connection, job_id: int) -> List[dict]:
+    cur = conn.execute(
+        "SELECT * FROM whatsapp_handoffs WHERE job_id = ? ORDER BY id DESC", (job_id,)
+    )
+    columns = [d[0] for d in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 @dataclass

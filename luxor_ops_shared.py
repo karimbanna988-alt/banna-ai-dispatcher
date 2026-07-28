@@ -173,11 +173,15 @@ def fetch_timeline(conn: sqlite3.Connection, job_id: int) -> list[dict]:
     return events
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=5)
 def fetch_pending_messages(_conn: sqlite3.Connection, group_label: Optional[str] = None, limit: int = 100) -> list[dict]:
     """Newest-first pending (not yet actioned) messages, optionally scoped
-    to one operational stream. Cached; invalidated explicitly after a
-    successful refresh (see clear_pending_caches)."""
+    to one operational stream. Cached with a short TTL (in addition to the
+    explicit clear on refresh, see clear_pending_caches) since the
+    Operator Console and Management CRM can run as separate processes
+    sharing one database -- each has its own process-local cache, so a
+    short TTL keeps the two reasonably in sync without any cross-process
+    invalidation mechanism."""
     if group_label:
         rows = _conn.execute(
             "SELECT * FROM quo_pending_messages WHERE status IN ('pending', 'loaded') AND group_label = ? "
@@ -194,7 +198,7 @@ def fetch_pending_messages(_conn: sqlite3.Connection, group_label: Optional[str]
     return [dict(zip(columns, row)) for row in rows]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=5)
 def fetch_last_refresh(_conn: sqlite3.Connection) -> Optional[str]:
     row = _conn.execute("SELECT updated_at FROM quo_poll_state WHERE id = 1").fetchone()
     return row[0] if row else None
