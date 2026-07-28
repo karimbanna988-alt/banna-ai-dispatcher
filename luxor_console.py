@@ -77,15 +77,19 @@ conn = get_db()
 
 # ---------------------------------------------------------------- Header --
 _connected = bool(os.environ.get(API_KEY_ENV_VAR))
+_state, _state_label = shared.connection_state(conn, _connected)
 header_col, status_col = st.columns([3, 2])
 with header_col:
     st.markdown("### LUXOR LOCKSMITH")
     st.caption("Operator Console")
 with status_col:
-    label = "🟢 Connected" if _connected else "🔴 Not configured"
-    st.caption(label)
+    st.caption(_state_label)
 last_refresh = shared.fetch_last_refresh(conn)
 st.caption(f"Last synced: {shared.humanize_timestamp(last_refresh) if last_refresh else 'Never'}")
+if _state == "stalled":
+    st.warning("Ingestion has not succeeded in over an hour -- check the connection.")
+elif _state == "error":
+    st.warning(f"Last poll failed: {storage.get_poll_error(conn)}")
 st.divider()
 
 # -------------------------------------------------------------- Refresh --
@@ -103,9 +107,11 @@ if st.button("Refresh", type="secondary", key="luxor_console_refresh", width="st
             st.session_state.luxor_console_refresh_message = (
                 "success", f"Refreshed -- {len(outcome.queued)} new message(s) found.",
             )
-        except QuoConfigError:
+        except QuoConfigError as exc:
+            storage.record_poll_error(conn, str(exc))
             st.session_state.luxor_console_refresh_message = ("error", "Quo is not configured in this environment.")
-        except QuoAPIError:
+        except QuoAPIError as exc:
+            storage.record_poll_error(conn, str(exc))
             st.session_state.luxor_console_refresh_message = ("error", "Quo is temporarily unavailable. Please try again shortly.")
         shared.clear_pending_caches()
     st.rerun()

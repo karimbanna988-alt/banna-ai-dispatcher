@@ -146,9 +146,13 @@ if st.button("Refresh", type="primary", key="luxor_ops_refresh", width="stretch"
                 st.session_state.luxor_ops_refresh_message = (
                     "error", f"{outcome.failed_count} message(s) could not be saved and will be retried.",
                 )
-        except QuoConfigError:
+        except QuoConfigError as exc:
+            if write_conn is not None:
+                storage.record_poll_error(write_conn, str(exc))
             st.session_state.luxor_ops_refresh_message = ("error", "Quo is not configured in this environment.")
-        except QuoAPIError:
+        except QuoAPIError as exc:
+            if write_conn is not None:
+                storage.record_poll_error(write_conn, str(exc))
             st.session_state.luxor_ops_refresh_message = ("error", "Quo is temporarily unavailable. Please try again shortly.")
         finally:
             if write_conn is not None:

@@ -135,6 +135,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Additive: durable last-poll-failure message for the connection-state
+    # UI (Operator Console/Management CRM) -- idempotent for databases
+    # created before this column existed, same pattern as every other
+    # migration in this module.
+    existing_poll_state_columns = {row[1] for row in conn.execute("PRAGMA table_info(quo_poll_state)")}
+    if "last_error" not in existing_poll_state_columns:
+        conn.execute("ALTER TABLE quo_poll_state ADD COLUMN last_error TEXT")
     # Every Quo message id that has ever been fetched, recorded at fetch
     # time (not at Approve/Reject time) -- makes overlapping poll windows
     # or an app restart structurally unable to re-queue the same message.
@@ -1301,14 +1308,43 @@ def get_quo_checkpoint(conn: sqlite3.Connection) -> Optional[str]:
 
 
 def set_quo_checkpoint(conn: sqlite3.Connection, iso_ts: str) -> None:
+    # Only ever called after a fully successful poll (see
+    # quo_ingest.poll_for_new_messages) -- clears any previously recorded
+    # error at the same time, so a subsequent success promptly restores
+    # the connection-state UI to "Connected" without a separate call.
     conn.execute(
         """
-        INSERT INTO quo_poll_state (id, last_checkpoint, updated_at) VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET last_checkpoint = excluded.last_checkpoint, updated_at = excluded.updated_at
+        INSERT INTO quo_poll_state (id, last_checkpoint, updated_at, last_error) VALUES (1, ?, ?, NULL)
+        ON CONFLICT(id) DO UPDATE SET last_checkpoint = excluded.last_checkpoint, updated_at = excluded.updated_at, last_error = NULL
         """,
         (iso_ts, _now()),
     )
     conn.commit()
+
+
+def record_poll_error(conn: sqlite3.Connection, message: str) -> None:
+    """Records the most recent poll failure for the connection-state UI
+    (Operator Console/CRM) -- including a failure on the very first-ever
+    poll attempt, before any checkpoint exists. last_checkpoint is NOT
+    NULL, so a fresh insert uses '' (empty string) as a checkpoint
+    placeholder -- get_quo_checkpoint()/quo_ingest.py's `checkpoint or
+    _initial_checkpoint()` already treats any falsy value the same as
+    NULL, so this is behaviorally identical to "no checkpoint yet" and
+    changes nothing about how the next successful poll computes its
+    lookback window."""
+    conn.execute(
+        """
+        INSERT INTO quo_poll_state (id, last_checkpoint, updated_at, last_error) VALUES (1, '', ?, ?)
+        ON CONFLICT(id) DO UPDATE SET last_error = excluded.last_error, updated_at = excluded.updated_at
+        """,
+        (_now(), message),
+    )
+    conn.commit()
+
+
+def get_poll_error(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT last_error FROM quo_poll_state WHERE id = 1").fetchone()
+    return row[0] if row else None
 
 
 def is_quo_message_processed(conn: sqlite3.Connection, message_id: str) -> bool:

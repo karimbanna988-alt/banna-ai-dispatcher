@@ -76,8 +76,10 @@ with header_col:
     st.caption("Operations CRM · Rule-based Dispatch Assistant")
 with status_col:
     _connected = bool(os.environ.get(API_KEY_ENV_VAR))
-    _connection_label = "🟢 Connected" if _connected else "🔴 Not configured"
-    st.caption(f"{_connection_label} · 🔵 Automated dispatch preview")
+    _header_conn = shared.get_readonly_connection()
+    _state, _state_label = shared.connection_state(_header_conn, _connected)
+    _header_conn.close()
+    st.caption(f"{_state_label} · 🔵 Automated dispatch preview")
 st.caption(f"**{pg.title}**")
 st.divider()
 

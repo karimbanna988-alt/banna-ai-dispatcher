@@ -204,6 +204,52 @@ def fetch_last_refresh(_conn: sqlite3.Connection) -> Optional[str]:
     return row[0] if row else None
 
 
+CONNECTION_DELAYED_THRESHOLD_SECONDS = 600  # 10 min
+CONNECTION_STALLED_THRESHOLD_SECONDS = 3600  # 60 min
+
+
+def connection_state(conn: sqlite3.Connection, api_key_configured: bool) -> tuple[str, str]:
+    """One shared connection-state computation for every surface (Operator
+    Console, Management CRM). States, in priority order:
+    - "not_configured": no QUO_API_KEY at all
+    - "error": the most recent poll attempt (from any surface -- console,
+      CRM refresh button, or the standalone background poller script)
+      recorded a failure via storage.record_poll_error(), not yet cleared
+      by a subsequent success
+    - "never_synced": no poll has ever succeeded
+    - "stalled": last success was over an hour ago
+    - "delayed": last success was over 10 minutes ago
+    - "connected": everything nominal
+    Never hides a failure behind stale-but-present data -- "error" is
+    checked before staleness would otherwise just read as "delayed"."""
+    if not api_key_configured:
+        return "not_configured", "🔴 Not configured"
+
+    error = storage.get_poll_error(conn)
+    if error:
+        return "error", "🔴 API error"
+
+    last_refresh = fetch_last_refresh(conn)
+    if not last_refresh:
+        return "never_synced", "⚪ Never synced"
+
+    try:
+        text = last_refresh.replace("Z", "+00:00")
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - dt).total_seconds()
+    except ValueError:
+        return "never_synced", "⚪ Never synced"
+
+    if elapsed > CONNECTION_STALLED_THRESHOLD_SECONDS:
+        return "stalled", "🟠 Ingestion delayed"
+    if elapsed > CONNECTION_DELAYED_THRESHOLD_SECONDS:
+        return "delayed", "🟡 Ingestion delayed"
+    return "connected", "🟢 Connected"
+
+
 def clear_pending_caches() -> None:
     """Refresh only ever writes quo_pending_messages/quo_poll_state (see
     quo_ingest.poll_for_new_messages) -- only caches reading those tables
