@@ -7,6 +7,8 @@ st.cache_resource.clear()) so runs never touch the real data/dispatcher.db
 and never leak cached connections between tests.
 """
 
+import json
+
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
@@ -20,6 +22,7 @@ PROCESS_TAB_INDEX = 0
 STATUS_TAB_INDEX = 2
 CLOSING_TAB_INDEX = 3
 QUO_LIVE_TAB_INDEX = 6
+JOBS_TAB_INDEX = 7
 
 
 @pytest.fixture()
@@ -389,3 +392,91 @@ def test_quo_pending_queue_survives_a_simulated_app_restart(app, monkeypatch):
     assert len(timeline) == 1
     assert timeline[0]["raw_message"] == QUO_AGN_TEXT
     assert timeline[0]["channel"] == quo_ingest.SHADOW_MODE_CHANNEL
+
+
+# ------------------------------------------------------------- Jobs tab ----
+def test_jobs_tab_lists_one_row_per_job_and_masks_pii(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")  # SIM2AG, phone "555-010-5500", addr "600 Fake Blvd"
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    table = jobs_tab.table[0].value
+    assert set(table.columns) == {"Source", "Ticket", "Status", "Created", "Last activity", "Latest action"}
+    assert "SIM2AG" in table["Ticket"].values
+    row = table[table["Ticket"] == "SIM2AG"].iloc[0]
+    assert row["Source"] == "AGN"
+    assert row["Status"] == "Approved"
+    assert row["Latest action"] == "Approve"
+
+    # Masking: no full phone number or street address anywhere in the list.
+    table_text = table.to_string()
+    assert "555-010-5500" not in table_text
+    assert "600 Fake Blvd" not in table_text
+
+
+def test_jobs_tab_status_reflects_handle_manually(app):
+    select_scenario(app, "New job -- Lucky")
+    deliver_next(app)
+    click_process_action(app, "Handle Manually")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    table = jobs_tab.table[0].value
+    row = table[table["Ticket"] == "SIM3LK"].iloc[0]
+    assert row["Status"] == "Handle Manually"
+
+
+def test_jobs_tab_status_filter(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    select_scenario(app, "New job -- Lucky")
+    deliver_next(app)
+    click_process_action(app, "Handle Manually")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.selectbox(key="jobs_status_filter").select("Handle Manually").run()
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    table = jobs_tab.table[0].value
+    assert set(table["Ticket"].values) == {"SIM3LK"}
+
+
+def test_jobs_tab_ticket_search_filter(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    select_scenario(app, "New job -- Lucky")
+    deliver_next(app)
+    click_process_action(app, "Handle Manually")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.text_input(key="jobs_ticket_search").set_value("SIM2AG").run()
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    table = jobs_tab.table[0].value
+    assert set(table["Ticket"].values) == {"SIM2AG"}
+
+
+def test_jobs_tab_selecting_a_job_shows_its_full_unmasked_timeline(app):
+    select_scenario(app, "New job -- AGN")
+    deliver_next(app)
+    click_process_action(app, "Approve")
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    select_box = jobs_tab.selectbox(key="jobs_selected_job")
+    matching = [opt for opt in select_box.options if "SIM2AG" in opt]
+    assert len(matching) == 1
+    select_box.select(matching[0]).run()
+
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+    jobs_tab.button(key="jobs_show_timeline").click().run()
+    jobs_tab = app.tabs[JOBS_TAB_INDEX]
+
+    # Full, unmasked detail in this authorized view -- same raw content the
+    # Audit Timeline tab already shows for the same event.
+    assert len(jobs_tab.json) == 1
+    event = json.loads(jobs_tab.json[0].value)
+    assert "600 Fake Blvd" in event["raw_message"]
+    assert event["message_type"] == "NEW"
+    assert event["final_action"] == "Approve"

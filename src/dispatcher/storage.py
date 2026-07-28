@@ -114,6 +114,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if "channel" not in existing_columns:
         conn.execute("ALTER TABLE events ADD COLUMN channel TEXT DEFAULT 'manual'")
     _repair_events_job_id_foreign_key(conn)
+    _add_job_status_columns_and_backfill(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -368,6 +369,59 @@ def _configure_foreign_key_enforcement(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _add_job_status_columns_and_backfill(conn: sqlite3.Connection) -> None:
+    """Adds jobs.status/last_event_id/last_event_at (idempotent ALTER TABLE,
+    same PRAGMA table_info pattern as the events.channel migration) and
+    backfills every existing job by REPLAYING its events chronologically
+    through derive_job_status() -- not by reading only its latest event --
+    so a job's backfilled status matches exactly what the live save path
+    would have produced had status tracking existed from the start.
+
+    Re-runnable/idempotent via last_event_id IS NULL as the "not yet
+    backfilled" marker (rather than gating on column-existence alone),
+    so an interrupted backfill safely resumes on the next connect() instead
+    of silently leaving some jobs stuck at the default."""
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "status" not in existing_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'New'")
+    if "last_event_id" not in existing_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN last_event_id INTEGER")
+    if "last_event_at" not in existing_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN last_event_at TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status_last_event_at ON jobs (status, last_event_at)"
+    )
+
+    unbackfilled_job_ids = [
+        row[0] for row in conn.execute(
+            """
+            SELECT id FROM jobs
+            WHERE last_event_id IS NULL
+              AND EXISTS (SELECT 1 FROM events WHERE events.job_id = jobs.id)
+            """
+        ).fetchall()
+    ]
+    for job_id in unbackfilled_job_ids:
+        events_for_job = conn.execute(
+            "SELECT id, message_type, final_action, created_at FROM events "
+            "WHERE job_id = ? ORDER BY id ASC",
+            (job_id,),
+        ).fetchall()
+        status = "New"
+        last_event_id = None
+        last_event_at = None
+        for event_id, message_type, final_action, created_at in events_for_job:
+            status = derive_job_status(status, message_type, final_action)
+            last_event_id = event_id
+            last_event_at = created_at
+        conn.execute(
+            "UPDATE jobs SET status = ?, last_event_id = ?, last_event_at = ? WHERE id = ?",
+            (status, last_event_id, last_event_at, job_id),
+        )
+    if unbackfilled_job_ids:
+        conn.commit()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -446,6 +500,82 @@ def classify_incoming(conn: sqlite3.Connection, job: ExtractedJob) -> ClassifyRe
     )
 
 
+VALID_JOB_STATUSES = frozenset({
+    "New", "Needs Review", "Approved", "Handle Manually",
+    "Rejected", "In Progress", "Closed", "Cancelled",
+})
+
+_APPROVE_LIKE_ACTIONS = frozenset({"Approve", "Edit"})
+
+# message_type values that don't advance a job's operational lifecycle on
+# their own -- approving or rejecting one of these just confirms/dismisses
+# that particular report without changing what stage the job is at.
+_NON_LIFECYCLE_MESSAGE_TYPES = frozenset({
+    MessageType.CORRECTION.value, MessageType.UPDATE_REQUEST.value,
+    MessageType.DUPLICATE.value, MessageType.UNRECOGNIZED.value,
+})
+
+
+def derive_job_status(previous_status: Optional[str], message_type: str, final_action: Optional[str]) -> str:
+    """The single, deterministic job-status state machine -- used identically
+    for a live save_audit_entry() call, the one-time chronological-replay
+    backfill, and every test. Never derive status from only the latest
+    event elsewhere; always go through this function so behavior can't
+    silently drift between the two call sites.
+
+    See docs/architecture.md for the full transition table and the
+    ambiguous cases this resolves (e.g. rejecting a later STATUS/CLOSING/
+    CANCELLATION/correction report preserves the job's existing status
+    rather than rejecting the whole job -- only rejecting the original NEW
+    message does that).
+    """
+    prev = previous_status if previous_status in VALID_JOB_STATUSES else "Needs Review"
+
+    if final_action == "Handle Manually":
+        return "Handle Manually"
+
+    if message_type == MessageType.NEW.value:
+        if final_action in _APPROVE_LIKE_ACTIONS:
+            return "Approved"
+        if final_action == "Reject":
+            return "Rejected"
+        return "Needs Review"  # unknown/missing final_action -- safest fallback
+
+    if message_type == MessageType.STATUS.value:
+        if final_action in _APPROVE_LIKE_ACTIONS:
+            return "In Progress"
+        if final_action == "Reject":
+            return prev
+        return "Needs Review"
+
+    if message_type == MessageType.CLOSING.value:
+        if final_action in _APPROVE_LIKE_ACTIONS:
+            return "Closed"
+        if final_action == "Reject":
+            return prev
+        return "Needs Review"
+
+    if message_type == MessageType.CANCELLATION.value:
+        if final_action in _APPROVE_LIKE_ACTIONS:
+            return "Cancelled"
+        if final_action == "Reject":
+            return prev
+        return "Needs Review"
+
+    if message_type == MessageType.CLOSING_WITHOUT_DISPATCH.value:
+        # Anomalous by construction (classify_incoming already flags this
+        # as "no prior dispatch exists for this ticket") -- always flagged
+        # for review, regardless of what action was taken on it.
+        return "Needs Review"
+
+    if message_type in _NON_LIFECYCLE_MESSAGE_TYPES:
+        if final_action in _APPROVE_LIKE_ACTIONS or final_action == "Reject":
+            return prev
+        return "Needs Review"
+
+    return "Needs Review"  # unknown/malformed message_type -- safest fallback
+
+
 def save_audit_entry(
     conn: sqlite3.Connection,
     job: ExtractedJob,
@@ -460,6 +590,7 @@ def save_audit_entry(
     now = _now()
     ticket = job.ticket_number.value
     fields_snapshot = json.dumps(_current_fields(job))
+    message_type_value = classify_result.message_type.value
 
     if ticket:
         # Deliberately does NOT trust classify_result.existing_job_id for
@@ -471,15 +602,23 @@ def save_audit_entry(
         # re-saving the same job any number of times updates the same row
         # instead of attempting a second INSERT and crashing on the
         # UNIQUE constraint. job_id is always resolved fresh afterward.
+        existing = conn.execute(
+            "SELECT id, status FROM jobs WHERE source = ? AND ticket_number = ?",
+            (job.source.value, ticket),
+        ).fetchone()
+        previous_status = existing[1] if existing else "New"
+        new_status = derive_job_status(previous_status, message_type_value, final_action)
+
         conn.execute(
             """
-            INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at, status)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (source, ticket_number) DO UPDATE SET
                 latest_fields_json = excluded.latest_fields_json,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                status = excluded.status
             """,
-            (ticket, job.source.value, fields_snapshot, now, now),
+            (ticket, job.source.value, fields_snapshot, now, now, new_status),
         )
         job_id = conn.execute(
             "SELECT id FROM jobs WHERE source = ? AND ticket_number = ?",
@@ -490,8 +629,13 @@ def save_audit_entry(
         # caller already resolved (e.g. a status/closing entry attached to
         # an already-known job_id).
         job_id = classify_result.existing_job_id
+        new_status = None
+        if job_id is not None:
+            row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            previous_status = row[0] if row else "New"
+            new_status = derive_job_status(previous_status, message_type_value, final_action)
 
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO events (
             job_id, ticket_number, raw_message, message_type, source,
@@ -501,13 +645,21 @@ def save_audit_entry(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            job_id, ticket, job.raw_text, classify_result.message_type.value, job.source.value,
+            job_id, ticket, job.raw_text, message_type_value, job.source.value,
             job.overall_confidence, json.dumps(job.status_reasons),
             decision.verdict.value if decision else None,
             json.dumps(decision.reasons) if decision else None,
             suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now, channel,
         ),
     )
+    event_id = cur.lastrowid
+
+    if job_id is not None and new_status is not None:
+        conn.execute(
+            "UPDATE jobs SET status = ?, last_event_id = ?, last_event_at = ? WHERE id = ?",
+            (new_status, event_id, now, job_id),
+        )
+
     conn.commit()
     return job_id
 
@@ -517,6 +669,60 @@ def get_audit_timeline(conn: sqlite3.Connection, ticket_number: str) -> List[dic
         "SELECT * FROM events WHERE ticket_number = ? ORDER BY id ASC", (ticket_number,)
     ).fetchall()
     columns = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def get_audit_timeline_by_job_id(conn: sqlite3.Connection, job_id: int) -> List[dict]:
+    """Same events table, same append-only source of truth as
+    get_audit_timeline() -- keyed by job_id instead of ticket_number so the
+    Jobs tab can look up a specific job unambiguously (ticket numbers are
+    only unique within one source, not globally)."""
+    rows = conn.execute(
+        "SELECT * FROM events WHERE job_id = ? ORDER BY id ASC", (job_id,)
+    ).fetchall()
+    columns = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def list_jobs(
+    conn: sqlite3.Connection,
+    *,
+    ticket_search: Optional[str] = None,
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+) -> List[dict]:
+    """One row per (source, ticket_number) job, for the Jobs tab list view.
+    Deliberately selects only id/source/ticket_number/status/timestamps/
+    latest_action -- never raw_message, latest_fields_json, or any other
+    column that could carry a phone number, address, or full message text,
+    so the list view can't leak that data by construction, without needing
+    a separate masking step."""
+    clauses = ["1 = 1"]
+    params: List[object] = []
+    if ticket_search:
+        clauses.append("jobs.ticket_number LIKE ?")
+        params.append(f"%{ticket_search}%")
+    if source:
+        clauses.append("jobs.source = ?")
+        params.append(source)
+    if status:
+        clauses.append("jobs.status = ?")
+        params.append(status)
+    if since:
+        clauses.append("jobs.last_event_at IS NOT NULL AND jobs.last_event_at >= ?")
+        params.append(since)
+
+    sql = (
+        "SELECT jobs.id, jobs.source, jobs.ticket_number, jobs.status, "
+        "jobs.created_at, jobs.updated_at, jobs.last_event_at, events.final_action AS latest_action "
+        "FROM jobs LEFT JOIN events ON events.id = jobs.last_event_id "
+        "WHERE " + " AND ".join(clauses) + " "
+        "ORDER BY COALESCE(jobs.last_event_at, jobs.updated_at) DESC"
+    )
+    cur = conn.execute(sql, params)
+    rows = cur.fetchall()
+    columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in rows]
 
 

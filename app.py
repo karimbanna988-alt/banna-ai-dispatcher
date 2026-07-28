@@ -21,7 +21,7 @@ import streamlit as st
 
 from dispatcher import quo_ingest, simulator, storage, updates
 from dispatcher.closing import ClosingInput, render_closing
-from dispatcher.models import ExtractionStatus
+from dispatcher.models import ExtractionStatus, Source
 from dispatcher.parser import load_vehicle_rules
 from dispatcher.pipeline import process_raw_message
 from dispatcher.rules.daily import parse_daily_rules
@@ -79,10 +79,23 @@ _hours = check_business_hours()
 _hours_label = f"Business hours: {'OPEN' if _hours.within_hours else 'CLOSED'} — {_hours.local_time.strftime('%A %H:%M %Z')}"
 (st.success if _hours.within_hours else st.error)(_hours_label)
 
-tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator, tab_quo_live = st.tabs(
+tab_process, tab_daily, tab_status, tab_closing, tab_audit, tab_simulator, tab_quo_live, tab_jobs = st.tabs(
     ["Process Job", "Daily Rules", "Status Update", "Closing", "Audit Timeline",
-     "Fake Inbox (Simulator)", "Quo Inbox (Live)"]
+     "Fake Inbox (Simulator)", "Quo Inbox (Live)", "Jobs"]
 )
+
+
+def _render_event_timeline(timeline) -> None:
+    """Shared by the Audit Timeline tab and the new Jobs tab -- both show
+    the exact same full, unmasked event detail from the same events table;
+    only how a job/ticket is looked up differs between the two."""
+    if not timeline:
+        st.info("No events found.")
+    for event in timeline:
+        channel = event.get("channel") or "manual"
+        badge = "\U0001F512 SHADOW MODE — NOT SENT — " if channel == quo_ingest.SHADOW_MODE_CHANNEL else ""
+        with st.expander(f"{badge}{event['created_at']} — {event['message_type']} — {event['final_action']}"):
+            st.json(event)
 
 # ---------------------------------------------------------------- Process --
 with tab_process:
@@ -312,13 +325,7 @@ with tab_audit:
 
     if st.button("Show timeline"):
         timeline = storage.get_audit_timeline(conn, ticket_lookup)
-        if not timeline:
-            st.info("No events found for this ticket.")
-        for event in timeline:
-            channel = event.get("channel") or "manual"
-            badge = "🔒 SHADOW MODE — NOT SENT — " if channel == quo_ingest.SHADOW_MODE_CHANNEL else ""
-            with st.expander(f"{badge}{event['created_at']} — {event['message_type']} — {event['final_action']}"):
-                st.json(event)
+        _render_event_timeline(timeline)
 
 # --------------------------------------------------------- Fake inbox (sim) --
 with tab_simulator:
@@ -327,3 +334,53 @@ with tab_simulator:
 # ------------------------------------------------------- Quo inbox (live) --
 with tab_quo_live:
     quo_ingest.render_quo_live_tab(conn)
+
+# ------------------------------------------------------------------- Jobs --
+with tab_jobs:
+    st.subheader("Jobs")
+    st.caption(
+        "One row per source + ticket number, derived from the same append-only events table as the "
+        "Audit Timeline tab. Full message content, phone numbers, and addresses are never shown in "
+        "this list -- select a job below to see its full timeline in the same authorized review view."
+    )
+
+    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+    jobs_ticket_search = fcol1.text_input("Ticket search", key="jobs_ticket_search")
+    jobs_source_filter = fcol2.selectbox(
+        "Source", options=["(all)"] + [s.value for s in Source], key="jobs_source_filter",
+    )
+    jobs_status_filter = fcol3.selectbox(
+        "Status", options=["(all)"] + sorted(storage.VALID_JOB_STATUSES), key="jobs_status_filter",
+    )
+    jobs_since_date = fcol4.date_input("Active since", value=None, key="jobs_since_date")
+
+    jobs = storage.list_jobs(
+        conn,
+        ticket_search=jobs_ticket_search or None,
+        source=None if jobs_source_filter == "(all)" else jobs_source_filter,
+        status=None if jobs_status_filter == "(all)" else jobs_status_filter,
+        since=jobs_since_date.isoformat() if jobs_since_date else None,
+    )
+    st.write(f"**{len(jobs)} job(s).**")
+    st.table(
+        [
+            {
+                "Source": j["source"],
+                "Ticket": j["ticket_number"],
+                "Status": j["status"],
+                "Created": j["created_at"],
+                "Last activity": j["last_event_at"] or j["updated_at"],
+                "Latest action": j["latest_action"] or "(none)",
+            }
+            for j in jobs
+        ]
+    )
+
+    if jobs:
+        job_options = {f"{j['source']} | {j['ticket_number']} ({j['status']})": j["id"] for j in jobs}
+        selected_job_label = st.selectbox(
+            "Select a job to view its full timeline", options=list(job_options.keys()), key="jobs_selected_job",
+        )
+        if st.button("Show job timeline", key="jobs_show_timeline"):
+            timeline = storage.get_audit_timeline_by_job_id(conn, job_options[selected_job_label])
+            _render_event_timeline(timeline)
