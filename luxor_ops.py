@@ -64,8 +64,11 @@ crm_jobs = st.Page("luxor_ops_pages/crm_jobs.py", title="CRM Jobs", url_path="cr
 closings_payments = st.Page("luxor_ops_pages/closings_payments.py", title="Closings & Payments", url_path="closings-payments")
 activity = st.Page("luxor_ops_pages/activity.py", title="Activity", url_path="activity")
 technicians = st.Page("luxor_ops_pages/technicians.py", title="Technicians", url_path="technicians")
+routing_preview = st.Page("luxor_ops_pages/routing_preview.py", title="Technicians & Coverage", url_path="routing-preview")
 
-pg = st.navigation([operations, company_inbox, job_workspace, crm_jobs, closings_payments, activity, technicians])
+pg = st.navigation([
+    operations, company_inbox, job_workspace, crm_jobs, closings_payments, activity, technicians, routing_preview,
+])
 
 # Shared frame: rendered on every page, above the selected page's own
 # content. Deliberately compact -- one title line, one caption line, one

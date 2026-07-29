@@ -221,6 +221,23 @@ def parse_technician_csv(csv_text: str, existing_names: set, service_areas: list
     return proposed, errors
 
 
+# Main Leads messages carry an advertising/market label as the line
+# right after the "Power By Ucallz App" header, before the Ticket: line
+# (confirmed against real fixture shape -- see tests/fixtures/main_leads_*.txt).
+# Display-only: never fed into parser.py/ExtractedJob or any
+# classification/decision logic, so it carries zero risk to the existing,
+# already-tested extraction pipeline.
+_MARKET_LABEL_RE = re.compile(r"Power By Ucallz App\s*\n+\s*(?P<label>[^\n]+)\n+\s*(?:Ticket|PDL):", re.IGNORECASE)
+
+
+def extract_market_label(raw_text: str) -> Optional[str]:
+    match = _MARKET_LABEL_RE.search(raw_text or "")
+    if not match:
+        return None
+    label = match.group("label").strip()
+    return label or None
+
+
 def fetch_pending_message_by_id(conn: sqlite3.Connection, message_id: str) -> Optional[dict]:
     row = conn.execute("SELECT * FROM quo_pending_messages WHERE message_id = ?", (message_id,)).fetchone()
     if row is None:
