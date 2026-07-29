@@ -275,13 +275,15 @@ def render_job_workspace(conn, entry) -> None:
     import streamlit as st
 
     import luxor_desk_read_model as rm
-    from dispatcher import outbound, storage
+    from dispatcher import outbound
+    from dispatcher.application import DispatcherService
     from dispatcher.policy import get_policy
     from dispatcher.rules.sla_config import format_age
 
     job, classify_result, result, tracking = entry.job, entry.classify_result, entry.result, entry.tracking
     item = entry.item
     mid = item["message_id"]
+    service = DispatcherService(conn)
 
     resolution, eligible, market_label = rm.resolve_job_routing(conn, job, item["raw_text"])
     area_label = resolution.canonical_area or "Area unresolved"
@@ -327,13 +329,11 @@ def render_job_workspace(conn, entry) -> None:
         if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
             if not tracking["acknowledged_at"]:
                 if st.button("SEND K", key=f"desk_k_{mid}", type="primary", width="stretch"):
-                    storage.mark_acknowledged(conn, mid)
-                    req = outbound.build_request(
-                        source=job.source.value, job_id=classify_result.existing_job_id,
+                    ack_result = service.attempt_quo_acknowledgment(
+                        mid, source=job.source.value, job_id=classify_result.existing_job_id,
                         quo_contact_id=item["group_label"], text="K",
                     )
-                    out_result = outbound.propose_send(conn, req, approved_by="dispatcher-tap")
-                    st.caption(f"Outbound: {out_result.outcome} — {out_result.reason}")
+                    st.caption(ack_result.user_message)
                     st.rerun()
             else:
                 st.success("✅ K acknowledged")
@@ -343,7 +343,7 @@ def render_job_workspace(conn, entry) -> None:
                 st.code("K")
             with k_cols[1]:
                 if st.button("MARK K SENT MANUALLY", key=f"desk_k_{mid}", width="stretch"):
-                    storage.mark_acknowledged(conn, mid)
+                    service.acknowledge_job_manually(mid)
                     st.rerun()
         else:
             st.success("✅ K acknowledged")
@@ -364,19 +364,12 @@ def render_job_workspace(conn, entry) -> None:
         if not destination:
             st.caption("WhatsApp destination not configured")
         if st.button("DISPATCH IN WHATSAPP", key=f"desk_wa_{mid}", type="primary", width="stretch", disabled=not destination):
-            storage.mark_copied(conn, mid)
-            storage.mark_whatsapp_opened(conn, mid)
+            service.prepare_technician_dispatch(mid)
             st.rerun()
         if tracking["whatsapp_opened_at"] and not tracking["dispatched_manually_at"]:
             if st.button("CONFIRM DISPATCHED", key=f"desk_confirm_dispatch_{mid}", type="primary", width="stretch"):
-                storage.save_audit_entry(
-                    conn, job, classify_result, decision=result.decision,
-                    suggested_quo_reply=result.decision.quo_reply_suggestion,
-                    luxor_message=result.luxor_message, final_action="Approve", channel="manual",
-                )
-                storage.mark_quo_pending_message_actioned(conn, mid)
-                storage.mark_dispatched_manually(conn, mid)
-                st.success("Marked dispatched.")
+                dispatch_result = service.confirm_whatsapp_dispatch(mid, job, classify_result, result.luxor_message)
+                st.success(dispatch_result.user_message)
                 st.rerun()
 
     with st.expander("View details"):
@@ -423,23 +416,16 @@ def _render_details(conn, item, job, area_label, market_label, eligible, resolut
 
 def _render_secondary_actions(conn, mid, job, classify_result, result) -> None:
     import streamlit as st
-    from dispatcher import storage
 
+    from dispatcher.application import DispatcherService
+
+    service = DispatcherService(conn)
     if st.button("Handle Manually", key=f"desk_hm_{mid}"):
-        storage.save_audit_entry(
-            conn, job, classify_result, decision=result.decision,
-            luxor_message=result.luxor_message, final_action="Handle Manually", channel="manual",
-        )
-        storage.mark_quo_pending_message_actioned(conn, mid)
+        service.reject_pending_message(mid, job, classify_result, result.luxor_message)
         st.rerun()
     reason = st.text_input("Reason (required to pass/cancel)", key=f"desk_pass_reason_{mid}")
     if st.button("Pass / Cancel Job", key=f"desk_reject_{mid}", disabled=not reason.strip()):
-        storage.save_audit_entry(
-            conn, job, classify_result, decision=result.decision,
-            luxor_message=result.luxor_message, final_action="Reject", channel="manual",
-            dispatcher_edits=f"Reason: {reason.strip()}",
-        )
-        storage.mark_quo_pending_message_actioned(conn, mid)
+        service.reject_pending_message(mid, job, classify_result, result.luxor_message, reason=reason.strip())
         st.rerun()
 
 
@@ -509,10 +495,12 @@ def render_active_job_workspace(conn, job_id: int) -> None:
 
     import luxor_desk_read_model as rm
     import luxor_ops_shared as shared
-    from dispatcher import storage, updates
-    from dispatcher.storage import InvalidJobActionError
+    from dispatcher import updates
+    from dispatcher.app_models import TechnicianUpdateCommand
+    from dispatcher.application import DispatcherService
 
-    job = storage.get_job_by_id(conn, job_id)
+    service = DispatcherService(conn)
+    job = service.get_job_workspace(job_id)
     if job is None:
         st.error("This job no longer exists.")
         return
@@ -551,10 +539,11 @@ def render_active_job_workspace(conn, job_id: int) -> None:
             if not raw_update.strip():
                 st.error("Paste the technician's actual reply first.")
             else:
-                storage.record_technician_update(
-                    conn, job_id, update_type, raw_update,
+                command = TechnicianUpdateCommand(
+                    job_id=job_id, update_type=update_type, raw_update=raw_update,
                     eta_minutes=int(eta_minutes) if eta_minutes else None,
                 )
+                service.record_technician_update(command)
                 st.rerun()
 
     if latest:
@@ -570,19 +559,20 @@ def render_active_job_workspace(conn, job_id: int) -> None:
             action_cols = st.columns(2)
             with action_cols[0]:
                 if st.button("PREPARE COMPANY UPDATE", key=f"active_prepare_update_{job_id}", width="stretch"):
-                    try:
-                        storage.mark_company_update_prepared(conn, job_id, prepared_text)
+                    manual_text = prepared_text if not reply.confirmed else None
+                    result = service.prepare_company_update(job_id, latest["update_type"], latest.get("eta_minutes"), manual_text=manual_text)
+                    if result.success:
                         st.rerun()
-                    except InvalidJobActionError as exc:
-                        st.error(str(exc))
+                    else:
+                        st.error(result.user_message)
             with action_cols[1]:
                 if st.button("MARK UPDATE SENT MANUALLY", key=f"active_sent_update_{job_id}", width="stretch"):
-                    try:
-                        storage.mark_company_update_sent_manually(conn, job_id, prepared_text)
-                        st.success("Recorded as sent.")
+                    result = service.confirm_company_update_sent(job_id, prepared_text)
+                    if result.success:
+                        st.success(result.user_message)
                         st.rerun()
-                    except InvalidJobActionError as exc:
-                        st.error(str(exc))
+                    else:
+                        st.error(result.user_message)
 
     if latest and latest["update_type"] == "Completed":
         # st.page_link() requires a real st.navigation() page-registry
@@ -596,12 +586,12 @@ def render_active_job_workspace(conn, job_id: int) -> None:
     with st.expander("PASS / CANCEL"):
         reason = st.text_input("Reason (required)", key=f"active_pass_reason_{job_id}")
         if st.button("PASS / CANCEL JOB", key=f"active_pass_{job_id}", disabled=not reason.strip()):
-            try:
-                storage.pass_or_cancel_job(conn, job_id, "Cancel", reason)
-                st.success("Job passed/cancelled.")
+            result = service.pass_or_cancel_job(job_id, "Cancel", reason)
+            if result.success:
+                st.success(result.user_message)
                 st.rerun()
-            except InvalidJobActionError as exc:
-                st.error(str(exc))
+            else:
+                st.error(result.user_message)
 
     with st.expander("View details"):
         st.markdown(f"Phone: {job['fields'].get('phone') or '—'}")
@@ -620,10 +610,13 @@ def render_closing_workspace(conn, job_id: int) -> None:
     import streamlit as st
 
     from dispatcher import storage
+    from dispatcher.action_names import ActionName
+    from dispatcher.app_models import ClosingCommand
+    from dispatcher.application import DispatcherService
     from dispatcher.closing import ClosingInput, render_closing_from_persisted_fields
-    from dispatcher.storage import InvalidJobActionError
 
-    job = storage.get_job_by_id(conn, job_id)
+    service = DispatcherService(conn)
+    job = service.get_job_workspace(job_id)
     if job is None:
         st.error("This job no longer exists.")
         return
@@ -651,16 +644,17 @@ def render_closing_workspace(conn, job_id: int) -> None:
             company_share = st.text_input("Company share (optional)", key=f"closing_company_share_{job_id}")
             technician_share = st.text_input("Technician share (optional)", key=f"closing_tech_share_{job_id}")
             if st.button("RECORD CLOSING", key=f"closing_record_{job_id}", width="stretch"):
-                if not raw_closing.strip():
-                    st.error("Paste the technician's actual closing first.")
-                else:
-                    storage.record_job_closing(
-                        conn, job_id, raw_closing,
-                        final_amount=amount or None, payment_method=payment_method or None,
-                        parts=parts or None, company_share=company_share or None,
-                        technician_share=technician_share or None,
-                    )
+                command = ClosingCommand(
+                    job_id=job_id, raw_closing=raw_closing,
+                    final_amount=amount or None, payment_method=payment_method or None,
+                    parts=parts or None, company_share=company_share or None,
+                    technician_share=technician_share or None,
+                )
+                result = service.record_closing(command)
+                if result.success:
                     st.rerun()
+                else:
+                    st.error(result.user_message or "Paste the technician's actual closing first.")
         return
 
     details = storage.get_latest_closing_details(conn, job_id)
@@ -710,32 +704,32 @@ def render_closing_workspace(conn, job_id: int) -> None:
     action_cols = st.columns(2)
     with action_cols[0]:
         if st.button("PREPARE COMPANY CLOSING", key=f"closing_prepare_{job_id}", width="stretch"):
-            try:
-                storage.mark_company_closing_prepared(conn, job_id, result.text)
+            prep_result = service.prepare_company_closing(job_id)
+            if prep_result.success:
                 st.rerun()
-            except InvalidJobActionError as exc:
-                st.error(str(exc))
+            else:
+                st.error(prep_result.user_message)
     with action_cols[1]:
         if st.button("MARK CLOSING SENT MANUALLY", key=f"closing_sent_{job_id}", width="stretch"):
-            try:
-                storage.mark_company_closing_sent_manually(conn, job_id, result.text)
-                st.success("Recorded as sent.")
+            sent_result = service.confirm_company_closing_sent(job_id, result.text)
+            if sent_result.success:
+                st.success(sent_result.user_message)
                 st.rerun()
-            except InvalidJobActionError as exc:
-                st.error(str(exc))
+            else:
+                st.error(sent_result.user_message)
 
     sent_confirmed = conn.execute(
-        "SELECT 1 FROM events WHERE job_id = ? AND message_type = ? AND final_action = 'Company Closing Sent Manually' LIMIT 1",
-        (job_id, storage.MessageType.OPERATIONAL_NOTE.value),
+        "SELECT 1 FROM events WHERE job_id = ? AND message_type = ? AND final_action = ? LIMIT 1",
+        (job_id, storage.MessageType.OPERATIONAL_NOTE.value, ActionName.COMPANY_CLOSING_SENT_MANUALLY.value),
     ).fetchone()
     if sent_confirmed:
         if st.button("COMPLETE JOB", key=f"closing_complete_{job_id}", type="primary", width="stretch"):
-            try:
-                storage.complete_job(conn, job_id)
-                st.success("Job completed.")
+            complete_result = service.complete_job(job_id)
+            if complete_result.success:
+                st.success(complete_result.user_message)
                 st.rerun()
-            except InvalidJobActionError as exc:
-                st.error(str(exc))
+            else:
+                st.error(complete_result.user_message)
     else:
         st.caption("COMPLETE JOB is available once the company closing has been marked sent.")
 

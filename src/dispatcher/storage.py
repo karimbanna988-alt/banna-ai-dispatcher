@@ -22,6 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
+from .action_names import TECHNICIAN_UPDATE_TYPES, ActionName
 from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
@@ -30,6 +31,14 @@ from .rules.service_categories import KNOWN_SERVICE_CATEGORIES, classify_service
 from .updates import map_status_to_reply
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "dispatcher.db"
+
+# Bumped only when the *shape* of an events row changes in a way future
+# code needs to distinguish from older rows (new required interpretation
+# of an existing column, a column repurposed, etc.) -- not for every
+# additive, backward-compatible column (those need no version bump,
+# since old readers already tolerate an extra NULL column). See
+# docs/EVENT_CONTRACT.md.
+EVENT_SCHEMA_VERSION = 1
 
 
 class MessageType(str, Enum):
@@ -133,6 +142,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_outbound_log_support(conn)
     _add_closing_and_reconciliation_support(conn)
     _add_technician_update_support(conn)
+    _add_idempotency_and_schema_version_support(conn)
     _add_dispatch_tracking_support(conn)
     _add_console_activation_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
@@ -608,6 +618,36 @@ def _add_technician_update_support(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _add_idempotency_and_schema_version_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same idempotent PRAGMA table_info pattern as every
+    other migration in this module. `idempotency_key` is an opaque,
+    caller-computed string (see application.py) that, when supplied,
+    makes save_audit_entry()/the operational job actions above safe to
+    call any number of times with the same key -- a Streamlit rerun,
+    double-click, or poller retry that resubmits the exact same logical
+    action finds its already-recorded event instead of inserting a
+    duplicate. NULL keys (every event before this migration, and any
+    caller that doesn't pass one) are never treated as colliding with
+    each other -- SQLite's UNIQUE index intentionally does not enforce
+    uniqueness across NULLs, and the partial index below only indexes
+    non-NULL keys anyway, so old/unkeyed call sites are completely
+    unaffected. `schema_version` records which shape of this table a row
+    was written under -- see EVENT_SCHEMA_VERSION and
+    docs/EVENT_CONTRACT.md."""
+    existing_event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "idempotency_key" not in existing_event_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN idempotency_key TEXT")
+    if "schema_version" not in existing_event_columns:
+        conn.execute(
+            f"ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT {EVENT_SCHEMA_VERSION}"
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency_key "
+        "ON events (idempotency_key) WHERE idempotency_key IS NOT NULL"
+    )
+    conn.commit()
+
+
 def _add_dispatch_tracking_support(conn: sqlite3.Connection) -> None:
     """Additive only, same pattern as every other migration in this
     module. Speed Dispatch Console lifecycle timestamps -- keyed by
@@ -915,7 +955,7 @@ VALID_JOB_STATUSES = frozenset({
     "Rejected", "In Progress", "Closed", "Cancelled",
 })
 
-_APPROVE_LIKE_ACTIONS = frozenset({"Approve", "Edit"})
+_APPROVE_LIKE_ACTIONS = frozenset({ActionName.APPROVE.value, ActionName.EDIT.value})
 
 # message_type values that don't advance a job's operational lifecycle on
 # their own -- approving or rejecting one of these just confirms/dismisses
@@ -972,7 +1012,7 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
         # report; there is deliberately no behavioral difference between
         # "Pass" and "Cancel" here, matching the combined PASS / CANCEL
         # button in the Active Jobs workspace.
-        if final_action in _APPROVE_LIKE_ACTIONS or final_action in ("Pass", "Cancel"):
+        if final_action in _APPROVE_LIKE_ACTIONS or final_action in (ActionName.PASS.value, ActionName.CANCEL.value):
             return "Cancelled"
         if final_action == "Reject":
             return prev
@@ -1025,7 +1065,20 @@ def save_audit_entry(
     closing_parts_amount: Optional[str] = None,
     closing_company_share: Optional[str] = None,
     closing_technician_share: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> int:
+    if idempotency_key:
+        existing_event = conn.execute(
+            "SELECT job_id FROM events WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        if existing_event is not None:
+            # Idempotent replay: the exact same logical action (a
+            # Streamlit rerun, double-click, or poller retry resubmitting
+            # this key) was already recorded -- return the job_id it
+            # produced without writing a second event or re-deriving
+            # status again.
+            return existing_event[0]
+
     now = _now()
     ticket = job.ticket_number.value
     fields_snapshot = json.dumps(_current_fields(job))
@@ -1074,27 +1127,42 @@ def save_audit_entry(
             previous_status = row[0] if row else "New"
             new_status = derive_job_status(previous_status, message_type_value, final_action)
 
-    cur = conn.execute(
-        """
-        INSERT INTO events (
-            job_id, ticket_number, raw_message, message_type, source,
-            confidence, confidence_reasons_json, decision_verdict,
-            decision_reasons_json, suggested_quo_reply, luxor_message,
-            dispatcher_edits, final_action, created_at, channel,
-            closing_amount, closing_payment_method, closing_parts_amount,
-            closing_company_share, closing_technician_share
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            job_id, ticket, job.raw_text, message_type_value, job.source.value,
-            job.overall_confidence, json.dumps(job.status_reasons),
-            decision.verdict.value if decision else None,
-            json.dumps(decision.reasons) if decision else None,
-            suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now, channel,
-            closing_amount, closing_payment_method, closing_parts_amount,
-            closing_company_share, closing_technician_share,
-        ),
-    )
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO events (
+                job_id, ticket_number, raw_message, message_type, source,
+                confidence, confidence_reasons_json, decision_verdict,
+                decision_reasons_json, suggested_quo_reply, luxor_message,
+                dispatcher_edits, final_action, created_at, channel,
+                closing_amount, closing_payment_method, closing_parts_amount,
+                closing_company_share, closing_technician_share,
+                idempotency_key, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id, ticket, job.raw_text, message_type_value, job.source.value,
+                job.overall_confidence, json.dumps(job.status_reasons),
+                decision.verdict.value if decision else None,
+                json.dumps(decision.reasons) if decision else None,
+                suggested_quo_reply, luxor_message, dispatcher_edits, final_action, now, channel,
+                closing_amount, closing_payment_method, closing_parts_amount,
+                closing_company_share, closing_technician_share,
+                idempotency_key, EVENT_SCHEMA_VERSION,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # Race: another call inserted the same idempotency_key between our
+        # check above and this INSERT (two near-simultaneous reruns) --
+        # recover by returning the row that already exists instead of
+        # raising, since the write it represents already happened.
+        if idempotency_key:
+            existing_event = conn.execute(
+                "SELECT job_id FROM events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if existing_event is not None:
+                return existing_event[0]
+        raise
     event_id = cur.lastrowid
 
     if job_id is not None and new_status is not None:
@@ -1160,6 +1228,20 @@ def get_audit_timeline_by_job_id(conn: sqlite3.Connection, job_id: int) -> List[
     ).fetchall()
     columns = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+def get_event_by_idempotency_key(conn: sqlite3.Connection, idempotency_key: str) -> Optional[dict]:
+    """The read-side counterpart to save_audit_entry()'s/the operational
+    job actions' idempotency check -- lets a caller (application.py)
+    determine *before* issuing a command whether it would be a replay,
+    for reporting purposes (ActionResult.idempotent_replay). The
+    storage-layer dedup itself does not depend on this being called
+    first; it re-checks independently at write time."""
+    row = conn.execute("SELECT * FROM events WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
+    return dict(zip(columns, row))
 
 
 def list_jobs(
@@ -1273,7 +1355,7 @@ def _insert_operational_event(
     closing_amount: Optional[str] = None, closing_payment_method: Optional[str] = None,
     closing_parts_amount: Optional[str] = None, closing_company_share: Optional[str] = None,
     closing_technician_share: Optional[str] = None, set_reconciliation_state: Optional[str] = None,
-    channel: str = "manual",
+    channel: str = "manual", idempotency_key: Optional[str] = None,
 ) -> int:
     """The one transactional write path every operational method below
     uses: insert one append-only events row, derive the new job status
@@ -1281,7 +1363,20 @@ def _insert_operational_event(
     save_audit_entry() already uses), and update the jobs snapshot --
     event insert + status/reconciliation update all in one SQLite
     transaction, so a job can never end up with an audit event recorded
-    but its snapshot left stale, or vice versa."""
+    but its snapshot left stale, or vice versa.
+
+    When `idempotency_key` is supplied and an event with that key
+    already exists, this is a no-op: returns the existing event_id
+    without inserting a second event or re-deriving status/
+    reconciliation again -- safe to call any number of times with the
+    same key (Streamlit reruns, double-clicks, poller retries)."""
+    if idempotency_key:
+        existing = conn.execute(
+            "SELECT id FROM events WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        if existing is not None:
+            return existing[0]
+
     now = _now()
     previous_status_row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
     previous_status = previous_status_row[0] if previous_status_row else "New"
@@ -1293,15 +1388,15 @@ def _insert_operational_event(
             INSERT INTO events (
                 job_id, ticket_number, raw_message, message_type, source,
                 luxor_message, dispatcher_edits, final_action, created_at, channel,
-                update_type, eta_minutes,
+                update_type, eta_minutes, idempotency_key, schema_version,
                 closing_amount, closing_payment_method, closing_parts_amount,
                 closing_company_share, closing_technician_share
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id, ticket_number, raw_message, message_type, source,
                 luxor_message, dispatcher_edits, final_action, now, channel,
-                update_type, eta_minutes,
+                update_type, eta_minutes, idempotency_key, EVENT_SCHEMA_VERSION,
                 closing_amount, closing_payment_method, closing_parts_amount,
                 closing_company_share, closing_technician_share,
             ),
@@ -1318,22 +1413,28 @@ def _insert_operational_event(
                 (new_status, event_id, now, now, job_id),
             )
         conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        if idempotency_key:
+            existing = conn.execute(
+                "SELECT id FROM events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if existing is not None:
+                return existing[0]
+        raise
     except Exception:
         conn.rollback()
         raise
     return event_id
 
 
-_TECHNICIAN_UPDATE_TYPES = frozenset({
-    "Going", "ETA", "No Answer", "No Show", "Not Available",
-    "Customer Cancelled", "Completed", "Custom",
-})
+_TECHNICIAN_UPDATE_TYPES = frozenset(TECHNICIAN_UPDATE_TYPES)
 _TERMINAL_NO_FURTHER_ACTION_STATUSES = frozenset({"Cancelled", "Rejected"})
 
 
 def record_technician_update(
     conn: sqlite3.Connection, job_id: int, update_type: str, raw_update: str,
-    eta_minutes: Optional[int] = None,
+    eta_minutes: Optional[int] = None, idempotency_key: Optional[str] = None,
 ) -> dict:
     """Records a technician's real WhatsApp reply against an already-
     committed job. `update_type` is always dispatcher-selected from the
@@ -1362,16 +1463,19 @@ def record_technician_update(
             f"Cannot record a technician update for job {job_id} -- status is {job['status']!r}"
         )
 
-    final_action = "Approve" if update_type != "Custom" else None
+    final_action = ActionName.APPROVE.value if update_type != "Custom" else None
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
         message_type=MessageType.STATUS.value, final_action=final_action,
         raw_message=raw_update.strip(), update_type=update_type, eta_minutes=eta_minutes,
+        idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-def mark_company_update_prepared(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+def mark_company_update_prepared(
+    conn: sqlite3.Connection, job_id: int, prepared_text: str, idempotency_key: Optional[str] = None,
+) -> dict:
     """Records that a company-facing status update was prepared -- never
     claims it was sent (see mark_company_update_sent_manually for that
     separate, explicit confirmation)."""
@@ -1390,13 +1494,15 @@ def mark_company_update_prepared(conn: sqlite3.Connection, job_id: int, prepared
         )
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Update Prepared",
-        luxor_message=prepared_text.strip(),
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.COMPANY_UPDATE_PREPARED.value,
+        luxor_message=prepared_text.strip(), idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-def mark_company_update_sent_manually(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+def mark_company_update_sent_manually(
+    conn: sqlite3.Connection, job_id: int, prepared_text: str, idempotency_key: Optional[str] = None,
+) -> dict:
     """Only explicit confirmation -- this call -- ever records that a
     company update was actually sent. Preparing or copying it never does."""
     if not prepared_text or not prepared_text.strip():
@@ -1406,16 +1512,19 @@ def mark_company_update_sent_manually(conn: sqlite3.Connection, job_id: int, pre
         raise ValueError(f"No job with id {job_id}")
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Update Sent Manually",
-        luxor_message=prepared_text.strip(),
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.COMPANY_UPDATE_SENT_MANUALLY.value,
+        luxor_message=prepared_text.strip(), idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-_PASS_CANCEL_ACTIONS = frozenset({"Pass", "Cancel"})
+_PASS_CANCEL_ACTIONS = frozenset({ActionName.PASS.value, ActionName.CANCEL.value})
 
 
-def pass_or_cancel_job(conn: sqlite3.Connection, job_id: int, final_action: str, reason: str) -> dict:
+def pass_or_cancel_job(
+    conn: sqlite3.Connection, job_id: int, final_action: str, reason: str,
+    idempotency_key: Optional[str] = None,
+) -> dict:
     """The single dispatcher-initiated pass/cancel action for an already-
     active job -- always requires a reason, always creates an audit
     event. "Pass" and "Cancel" are both accepted (matching the combined
@@ -1433,7 +1542,7 @@ def pass_or_cancel_job(conn: sqlite3.Connection, job_id: int, final_action: str,
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
         message_type=MessageType.CANCELLATION.value, final_action=final_action,
-        raw_message="", dispatcher_edits=f"Reason: {reason.strip()}",
+        raw_message="", dispatcher_edits=f"Reason: {reason.strip()}", idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
@@ -1442,7 +1551,7 @@ def record_job_closing(
     conn: sqlite3.Connection, job_id: int, raw_closing: str,
     final_amount: Optional[str] = None, payment_method: Optional[str] = None,
     parts: Optional[str] = None, company_share: Optional[str] = None,
-    technician_share: Optional[str] = None,
+    technician_share: Optional[str] = None, idempotency_key: Optional[str] = None,
 ) -> dict:
     """Records a real closing -- from an incoming Quo closing/reply, a
     technician closing pasted from WhatsApp, or a dispatcher-entered
@@ -1461,16 +1570,18 @@ def record_job_closing(
         raise InvalidJobActionError(f"Cannot record a closing for job {job_id} -- status is {job['status']!r}")
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.CLOSING.value, final_action="Approve",
+        message_type=MessageType.CLOSING.value, final_action=ActionName.APPROVE.value,
         raw_message=raw_closing.strip(),
         closing_amount=final_amount or None, closing_payment_method=payment_method or None,
         closing_parts_amount=parts or None, closing_company_share=company_share or None,
-        closing_technician_share=technician_share or None,
+        closing_technician_share=technician_share or None, idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-def mark_company_closing_prepared(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+def mark_company_closing_prepared(
+    conn: sqlite3.Connection, job_id: int, prepared_text: str, idempotency_key: Optional[str] = None,
+) -> dict:
     """Requires a closing to already be on record (job.status == "Closed",
     set by record_job_closing()) -- never claims a closing was prepared
     for a job that was never actually closed."""
@@ -1486,13 +1597,15 @@ def mark_company_closing_prepared(conn: sqlite3.Connection, job_id: int, prepare
         )
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Closing Prepared",
-        luxor_message=prepared_text.strip(),
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.COMPANY_CLOSING_PREPARED.value,
+        luxor_message=prepared_text.strip(), idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-def mark_company_closing_sent_manually(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+def mark_company_closing_sent_manually(
+    conn: sqlite3.Connection, job_id: int, prepared_text: str, idempotency_key: Optional[str] = None,
+) -> dict:
     """Only explicit confirmation -- this call -- ever records that a
     company closing was actually sent. Preparing or copying it never does."""
     if not prepared_text or not prepared_text.strip():
@@ -1504,13 +1617,13 @@ def mark_company_closing_sent_manually(conn: sqlite3.Connection, job_id: int, pr
         raise InvalidJobActionError(f"Cannot mark a company closing sent for job {job_id} -- status is {job['status']!r}")
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Closing Sent Manually",
-        luxor_message=prepared_text.strip(),
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.COMPANY_CLOSING_SENT_MANUALLY.value,
+        luxor_message=prepared_text.strip(), idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
 
-def complete_job(conn: sqlite3.Connection, job_id: int) -> dict:
+def complete_job(conn: sqlite3.Connection, job_id: int, idempotency_key: Optional[str] = None) -> dict:
     """The final terminal action -- requires the job to already be
     "Closed" (i.e. a real closing was recorded via record_job_closing())
     per the existing deterministic transition authority; raises
@@ -1531,8 +1644,8 @@ def complete_job(conn: sqlite3.Connection, job_id: int) -> dict:
         return job
     _insert_operational_event(
         conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
-        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Job Completed",
-        set_reconciliation_state="Settled",
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.JOB_COMPLETED.value,
+        set_reconciliation_state="Settled", idempotency_key=idempotency_key,
     )
     return get_job_by_id(conn, job_id)
 
