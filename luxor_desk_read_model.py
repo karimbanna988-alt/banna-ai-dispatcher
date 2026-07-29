@@ -17,6 +17,7 @@ independent forks of the same rules.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -76,21 +77,41 @@ def queue_bucket(message_type: str, urgency: str) -> str:
     return "Corrections & Cancellations"
 
 
+def _content_fingerprint(raw_text: str) -> str:
+    """Whitespace/case-normalized hash -- two messages with trivially
+    different formatting but the same real content still fingerprint the
+    same; two messages that actually say different things never do."""
+    normalized = " ".join((raw_text or "").split()).strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 def canonicalize(entries: list) -> list:
-    """One queue row per canonical (source, ticket) identity, not one per
-    raw message row -- repeated raw copies of the same job (reminders/
-    re-sends) fold into a single row with a "+N related messages" count.
-    A message with no usable ticket is never grouped with anything else
-    (no text-similarity guessing); it always stands alone. The earliest-
-    received member of a group is canonical (so displayed age reflects
-    the true original event); later members are folded in as a visible
-    count, never deleted, never dropped from the database."""
+    """One queue row per canonical *lifecycle event* -- (source, ticket,
+    message_type, content fingerprint) -- not one row per (source,
+    ticket) alone. A ticket's original new-job message, a later
+    correction, a cancellation, a status request, and a closing are
+    DIFFERENT lifecycle events for the same ticket and must each remain
+    individually visible and actionable; only truly repeated raw copies
+    of the exact same event (identical type + normalized content --
+    reminders, re-sends) fold together into one row with a "+N related
+    messages" count. A message with no usable ticket is never grouped
+    with anything else (no text-similarity guessing across tickets); it
+    always stands alone. The earliest-received member of a group is
+    canonical (so displayed age reflects the true original event);
+    later members are folded in as a visible count, never deleted,
+    never dropped from the database."""
     groups: dict = {}
     order = []
     for entry in entries:
-        item, job, *_ = entry
+        item, job, classify_result, *_ = entry
         ticket = job.ticket_number.value
-        key = (job.source.value, ticket) if ticket else (job.source.value, f"__no_ticket_{item['message_id']}")
+        if ticket:
+            key = (
+                job.source.value, ticket, classify_result.message_type.value,
+                _content_fingerprint(item["raw_text"]),
+            )
+        else:
+            key = (job.source.value, f"__no_ticket_{item['message_id']}")
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -139,9 +160,19 @@ def get_operational_counts(conn: sqlite3.Connection) -> dict:
 
 def get_live_dispatch_queue(conn: sqlite3.Connection) -> tuple[list[QueueEntry], list[dict], list[dict]]:
     """Returns (live_canonical_entries, backlog_pending, other_messages).
-    live_canonical_entries is deduplicated by (source, ticket) and sorted
-    oldest-first within urgency (urgent first). Every entry traces to a
-    real quo_pending_messages row -- nothing here is invented."""
+    live_canonical_entries is deduplicated by (source, ticket,
+    message_type) -- see canonicalize()'s own docstring for why message
+    type is part of the identity -- and sorted oldest-first within
+    urgency (urgent first). Every entry traces to a real
+    quo_pending_messages row -- nothing here is invented.
+
+    Read-only: this function computes dispatch_tracking.get_dispatch_tracking()
+    reads and the pipeline preview, but never calls mark_first_seen()/
+    mark_luxor_prepared() -- those are stamped at the actual ingestion
+    boundary (dispatcher.quo_ingest.poll_for_new_messages), not here.
+    Merely opening or refreshing the Dispatch page must never change a
+    message's recorded lifecycle -- a read model reads and calculates
+    display data; it does not record operational facts."""
     live_queue_started_at = storage.ensure_live_queue_activated(conn)
     boundary_dt = parse_ts(live_queue_started_at)
 
@@ -157,7 +188,6 @@ def get_live_dispatch_queue(conn: sqlite3.Connection) -> tuple[list[QueueEntry],
             other_messages.append(item)
             continue
 
-        storage.mark_first_seen(conn, item["message_id"])
         tracking = storage.get_dispatch_tracking(conn, item["message_id"])
         acknowledged = tracking["acknowledged_at"] is not None
         dispatched = tracking["dispatched_manually_at"] is not None
@@ -165,7 +195,6 @@ def get_live_dispatch_queue(conn: sqlite3.Connection) -> tuple[list[QueueEntry],
             continue
 
         result = shared.cached_full_preview(item["raw_text"], conn)
-        storage.mark_luxor_prepared(conn, item["message_id"])
 
         received = item["received_at"] or item["fetched_at"] or tracking["first_seen_at"]
         dt = parse_ts(received)

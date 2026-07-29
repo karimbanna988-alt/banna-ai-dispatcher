@@ -240,7 +240,9 @@ def test_clicking_queue_row_opens_its_workspace(desk_env):
     seed_pending(desk_env, "WS1", agn_message("WSTICKET"))
     seed_pending(desk_env, "WS2", agn_message("WSTICKET2"))
     at = login(make_app())
-    target = next(b for b in at.button if b.key and b.key.endswith("WSTICKET2"))
+    # Queue row identity is the message_id (WS2), not the ticket text --
+    # find the row by its visible label instead.
+    target = next(b for b in at.button if b.key and b.key.startswith("desk_queue_row_") and "WSTICKET2" in (b.label or ""))
     target.click().run()
     assert len(at.exception) == 0
     rendered = "\n".join(m.value for m in at.markdown)
@@ -251,9 +253,10 @@ def test_agn_shows_k_ready_wording(desk_env):
     seed_live_boundary(desk_env)
     seed_pending(desk_env, "K1", agn_message("K1TICKET"))
     at = login(make_app())
-    rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "K ready — sending disabled" in rendered_captions
-    assert any(b.key == "desk_k_K1" for b in at.button)
+    # COPY K: the literal "K" text, shown via st.code so it has a native
+    # copy affordance -- plus MARK K SENT MANUALLY to record confirmation.
+    assert any(c.value == "K" for c in at.code)
+    assert any(b.key == "desk_k_K1" and b.label == "MARK K SENT MANUALLY" for b in at.button)
 
 
 def test_main_leads_shows_no_ack_required(desk_env):
@@ -261,7 +264,7 @@ def test_main_leads_shows_no_ack_required(desk_env):
     seed_pending(desk_env, "ML1", main_leads_message("MLTICKET"), group_label="Main Leads 2")
     at = login(make_app())
     rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "No acknowledgment required" in rendered_captions
+    assert "NO ACKNOWLEDGMENT REQUIRED" in rendered_captions
     assert not any(b.key == "desk_k_ML1" for b in at.button)
 
 
@@ -271,9 +274,11 @@ def test_missing_required_fields_shows_human_review_needed(desk_env):
     seed_pending(desk_env, "INC1", incomplete)
     at = login(make_app())
     assert len(at.exception) == 0
-    rendered = "\n".join(w.value for w in at.warning) if hasattr(at, "warning") else ""
-    combined = rendered + "\n".join(m.value for m in at.markdown)
-    assert "HUMAN_REVIEW_NEEDED" in combined
+    rendered = "\n".join(w.value for w in at.warning)
+    assert "HUMAN REVIEW NEEDED" in rendered
+    # Dispatch actions must be replaced, not merely warned alongside.
+    assert not any(b.key == "desk_wa_INC1" for b in at.button)
+    assert not any(b.key == "desk_k_INC1" for b in at.button)
 
 
 def test_multiple_eligible_technicians_all_shown(desk_env):
@@ -291,11 +296,16 @@ def test_multiple_eligible_technicians_all_shown(desk_env):
 
 
 def test_no_whatsapp_or_dispatch_claim_without_destination(desk_env):
+    """The formatted message may still be copied (it's always shown via
+    st.code), and the DISPATCH IN WHATSAPP button is visible but
+    disabled -- never claims a destination that doesn't exist, and never
+    silently hides the action either."""
     seed_live_boundary(desk_env)
     seed_pending(desk_env, "NODEST1", agn_message("NODESTTICKET", area="Charlotte, NC"))
     at = login(make_app())
-    assert not any(b.key == "desk_wa_NODEST1" for b in at.button)
-    assert not any(b.key == "desk_dispatch_NODEST1" for b in at.button)
+    wa_button = next(b for b in at.button if b.key == "desk_wa_NODEST1")
+    assert wa_button.disabled is True
+    assert not any(b.key == "desk_confirm_dispatch_NODEST1" for b in at.button)
     rendered = "\n".join(c.value for c in at.caption)
     assert "WhatsApp destination not configured" in rendered
 
@@ -397,3 +407,116 @@ def test_tests_use_temporary_database_only(desk_env, tmp_path):
     from dispatcher import storage
     assert storage.DB_PATH == desk_env
     assert "Desktop\\ai dispatcher\\data" not in str(storage.DB_PATH).replace("/", "\\")
+
+
+# ============================================================
+# Regression tests for the two architectural defects
+# ============================================================
+
+def test_rendering_dispatch_page_never_writes_dispatch_tracking(desk_env):
+    """Merely opening/refreshing the Dispatch page must not record any
+    operational timestamp -- first_seen/prepared are now stamped only at
+    the real ingestion boundary (quo_ingest.poll_for_new_messages), which
+    this test never calls. A message seeded directly (bypassing
+    ingestion, as every other test in this file also does) must show an
+    entirely untouched dispatch_tracking row before and after the page
+    renders."""
+    seed_live_boundary(desk_env)
+    seed_pending(desk_env, "SIDEFX1", agn_message("SIDEFXTICKET"))
+
+    conn = storage.connect(desk_env)
+    before = storage.get_dispatch_tracking(conn, "SIDEFX1")
+    conn.close()
+    assert before["first_seen_at"] is None
+    assert before["luxor_prepared_at"] is None
+
+    at = login(make_app())
+    assert len(at.exception) == 0
+    # Render again (simulating a refresh) to be doubly sure.
+    at.run()
+
+    conn = storage.connect(desk_env)
+    after = storage.get_dispatch_tracking(conn, "SIDEFX1")
+    conn.close()
+    assert after["first_seen_at"] is None
+    assert after["luxor_prepared_at"] is None
+
+
+def test_ingestion_boundary_is_where_first_seen_and_prepared_get_stamped(desk_env, monkeypatch):
+    """The correct boundary (quo_ingest.poll_for_new_messages) DOES stamp
+    both timestamps, exactly once, at the moment a message is actually
+    ingested -- confirming the write moved, rather than simply vanished."""
+    from unittest.mock import MagicMock
+
+    from dispatcher import quo_ingest
+    from dispatcher.quo_client import QuoMessage
+
+    conn = storage.connect(desk_env)
+    fake_client = MagicMock()
+    fake_contact = MagicMock(phone_numbers=["+15550001111"])
+    fake_client.get_contact.return_value = fake_contact
+    fake_client.iter_messages.return_value = [
+        QuoMessage(
+            id="ING1", to="PN1", from_number="+15550001111", text=agn_message("INGTICKET"),
+            phone_number_id="PN1", conversation_id="c1", direction="incoming",
+            status="delivered", created_at=future_ts(5), updated_at=future_ts(5),
+        )
+    ]
+    config = quo_ingest.QuoPollConfig(
+        our_phone_number_id="PN1",
+        dispatch_groups=[quo_ingest.DispatchGroupConfig(label="AGN", quo_contact_id="C1")],
+    )
+    quo_ingest.poll_for_new_messages(conn, fake_client, config)
+
+    tracking = storage.get_dispatch_tracking(conn, "ING1")
+    conn.close()
+    assert tracking["first_seen_at"] is not None
+    assert tracking["luxor_prepared_at"] is not None
+
+
+def test_correction_for_same_ticket_stays_separately_actionable(desk_env):
+    """A correction/cancellation/status/closing sharing (source, ticket)
+    with an already-dispatched job must render as its OWN canonical
+    queue row -- never silently folded into (and hidden behind) the
+    original new-job card."""
+    import sys
+    sys.path.insert(0, ".")
+    sys.path.insert(0, "src")
+    from dispatcher.parser import extract_job, load_vehicle_rules
+
+    seed_live_boundary(desk_env)
+    vehicle_rules = load_vehicle_rules()
+
+    original_raw = agn_message("CORRTICKET", area="Charlotte, NC")
+    conn = storage.connect(desk_env)
+    job = extract_job(original_raw, vehicle_rules)
+    result = storage.classify_incoming(conn, job)
+    storage.save_audit_entry(conn, job, result, final_action="Approve")  # commits a real jobs row
+    conn.close()
+
+    # A corrected address for the SAME ticket -- must classify as a
+    # CORRECTION (existing_job_id set), not a fresh unrelated NEW job.
+    corrected_raw = original_raw.replace("100 Fake St", "999 Other Rd")
+    seed_pending(desk_env, "CORR_NEW", original_raw, minutes_from_now=5)
+    seed_pending(desk_env, "CORR_FIX", corrected_raw, minutes_from_now=10)
+
+    at = login(make_app())
+    assert len(at.exception) == 0
+    queue_buttons = [b for b in at.button if b.key and b.key.startswith("desk_queue_row_")]
+    # Both the original new-job message and the correction are distinct
+    # canonical entries -- neither collapses into or hides the other.
+    assert len(queue_buttons) == 2
+
+
+def test_exact_reminder_of_same_event_still_collapses(desk_env):
+    """The fix for lifecycle-aware dedup must not regress the original
+    behavior: two byte-identical re-sends of the same NEW-job message
+    still fold into one canonical row with a "+1" count."""
+    seed_live_boundary(desk_env)
+    seed_pending(desk_env, "REM1", agn_message("REMTICKET"), minutes_from_now=5)
+    seed_pending(desk_env, "REM2", agn_message("REMTICKET"), minutes_from_now=10)
+    at = login(make_app())
+    assert len(at.exception) == 0
+    queue_buttons = [b for b in at.button if b.key and b.key.startswith("desk_queue_row_")]
+    assert len(queue_buttons) == 1
+    assert "(+1)" in queue_buttons[0].label

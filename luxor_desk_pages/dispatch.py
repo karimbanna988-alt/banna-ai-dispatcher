@@ -98,7 +98,13 @@ st.caption(f"Previous backlog: {len(backlog_pending)} (not urgent, not counted h
 
 
 def entry_identity(e: rm.QueueEntry) -> str:
-    return f"{e.job.source.value}::{e.job.ticket_number.value or e.item['message_id']}"
+    """The canonical representative's own message_id -- always unique
+    per canonical entry (it's quo_pending_messages' primary key, and
+    canonicalize() picks exactly one representative row per group), so
+    this stays correct now that a (source, ticket) pair can legitimately
+    canonicalize into several distinct lifecycle-event entries (original
+    new job, a correction, a cancellation, ...) rather than always one."""
+    return e.item["message_id"]
 
 
 GROUP_LABELS = {

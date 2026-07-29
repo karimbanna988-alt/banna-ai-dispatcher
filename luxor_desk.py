@@ -30,7 +30,7 @@ st.markdown(shared.DESK_CSS, unsafe_allow_html=True)
 
 shared.require_login()
 
-dispatch = st.Page("luxor_desk_pages/dispatch.py", title="Dispatch", url_path="dispatch", default=True)
+dispatch = st.Page("luxor_desk_pages/dispatch.py", title="New Jobs", url_path="new-jobs", default=True)
 active_jobs = st.Page("luxor_desk_pages/active_jobs.py", title="Active Jobs", url_path="active-jobs")
 closings = st.Page("luxor_desk_pages/closings.py", title="Closings", url_path="closings")
 technicians = st.Page("luxor_desk_pages/technicians.py", title="Technicians", url_path="technicians")

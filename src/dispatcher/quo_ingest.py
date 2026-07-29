@@ -153,6 +153,18 @@ def poll_for_new_messages(
                 except Exception:
                     failed_count += 1
                     continue
+                # "First seen" is a system-ingestion fact, not a
+                # human-viewed-it fact -- stamped here, at the moment the
+                # message actually entered our durable queue, never as a
+                # side effect of a dispatcher later opening the app (see
+                # luxor_desk_read_model.py's own docstring for why that
+                # was wrong). "Prepared" is stamped at the same boundary:
+                # the deterministic Luxor formatter is a pure function of
+                # already-stored raw_text, so nothing further needs to
+                # happen for the system to be able to prepare it on
+                # request -- this does not claim a human has seen it.
+                storage.mark_first_seen(conn, msg.id)
+                storage.mark_luxor_prepared(conn, msg.id)
                 queued.append(QueuedQuoMessage(
                     message_id=msg.id, conversation_id=msg.conversation_id, raw_text=msg.text,
                     received_at=msg.created_at, from_number=msg.from_number, group_label=group.label,
