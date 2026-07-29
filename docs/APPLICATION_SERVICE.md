@@ -46,7 +46,7 @@ if result.success:
 |---|---|
 | `get_job_workspace(job_id)` | Pure pass-through to `storage.get_job_by_id`. No Streamlit dependency. |
 | `get_job_history(job_id)` | Pure pass-through to `storage.get_audit_timeline_by_job_id`. No Streamlit dependency. |
-| `get_queue(kind)` | `kind` in `{"new_jobs", "active", "closings", "completed"}`. Lazily imports `luxor_desk_read_model` (repo root) — see `docs/ARCHITECTURE_FOUNDATION.md`'s "command vs. query" section for why this one method is different. |
+| `get_queue(kind)` | `kind` in `{"new_jobs", "active", "closings", "completed"}`. **Updated this round**: no longer imports `luxor_desk_read_model` itself. Delegates to an injected `QueueReader` (a `Protocol` defined in `application.py`); raises `RuntimeError` if none was provided. The concrete implementation, `luxor_desk_read_model.LuxorDeskQueueReader`, lives at the repo root and is constructed by the UI layer — `application.py` has zero import-time or call-time dependency on any `luxor_desk_*` module, enforced by `tests/test_dependency_boundaries.py`. See `docs/ARCHITECTURE_VERIFICATION_131ABCE.md`. |
 
 ## Important design decision: preview vs. prepare
 

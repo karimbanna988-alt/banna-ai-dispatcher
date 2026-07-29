@@ -128,6 +128,30 @@ def test_main_never_writes_to_the_database(readonly_conn):
     assert before == after
 
 
+def test_export_blank_template_has_empty_destinations(readonly_conn):
+    db_path, setup_conn = readonly_conn
+    storage.add_technician(setup_conn, name="Template Tech", areas=["Charlotte"], dispatch_group="Real Group")
+    conn = _readonly(db_path)
+    csv_text = validate_configuration.export_blank_configuration_template(conn)
+    conn.close()
+    assert "Template Tech" in csv_text
+    assert "Real Group" not in csv_text  # never fills a real destination in
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "technician_id,name,areas,dispatch_group,closing_group"
+    assert lines[1].endswith(",,")  # dispatch_group and closing_group both blank
+
+
+def test_export_template_never_writes_to_the_database(readonly_conn, tmp_path):
+    db_path, setup_conn = readonly_conn
+    storage.add_technician(setup_conn, name="Stable Tech 2", areas=["Charlotte"])
+    before = setup_conn.execute("SELECT COUNT(*) FROM technicians").fetchone()[0]
+    out_path = tmp_path / "template.csv"
+    validate_configuration.main(["--db", str(db_path), "--export-template", str(out_path)])
+    after = setup_conn.execute("SELECT COUNT(*) FROM technicians").fetchone()[0]
+    assert before == after
+    assert out_path.exists()
+
+
 def test_no_customer_data_printed(readonly_conn, capsys):
     db_path, setup_conn = readonly_conn
     storage.add_technician(setup_conn, name="Real Tech Name", areas=["Charlotte"])

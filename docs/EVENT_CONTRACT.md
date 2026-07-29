@@ -63,8 +63,25 @@ other schema change in this file).
   events row changes in a way future code needs to distinguish from
   older rows — not for every additive, backward-compatible column
   (those need no bump; old readers already tolerate an extra `NULL`
-  column). No version bump has happened yet; every row in the system
-  today is version 1.
+  column).
+
+  **Updated by the verification round following this one**: the
+  `ALTER TABLE ... DEFAULT 1` above would have silently backfilled
+  every pre-existing row to version 1 too — overstating what those rows
+  actually satisfy (they were written before `idempotency_key` existed
+  at all, so no idempotency guarantee ever applied to them).
+  `storage.migrate_schema()` corrects this explicitly: it captures
+  every event id that existed *before* this migration ran, applies the
+  migration, then overwrites exactly those rows to
+  `LEGACY_EVENT_SCHEMA_VERSION` (`0`) — never silently relabeling
+  historical meaning. Only events inserted after migration via
+  `save_audit_entry()`/the operational job actions (which explicitly
+  pass `EVENT_SCHEMA_VERSION`) are version 1. See
+  `docs/ARCHITECTURE_VERIFICATION_131ABCE.md` and
+  `tests/test_schema_migration.py::test_migrate_backfills_legacy_events_to_version_zero`.
+  Any future event reader must handle both `0` and `1` explicitly; an
+  unrecognized future version should be treated as unsupported, never
+  silently read as if it were `1`.
 
 ## Distinct lifecycle events, never collapsed by ticket alone
 

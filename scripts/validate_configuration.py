@@ -129,6 +129,26 @@ def _validate_source_policies() -> List[Finding]:
     return findings
 
 
+def export_blank_configuration_template(conn: sqlite3.Connection) -> str:
+    """A CSV listing every real technician's id/name/current areas, with
+    dispatch_group/closing_group left blank for a human to fill in and
+    apply via the existing technician-management path (storage.py's
+    add_technician/set_technician_active -- this script never writes).
+    Contains technician ids/names only -- never a customer record, never
+    a secret. A human decides the actual destination values; this
+    script never fabricates or fills one in."""
+    import csv
+    import io
+
+    technicians = storage.list_technicians(conn, active_only=False)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["technician_id", "name", "areas", "dispatch_group", "closing_group"])
+    for tech in technicians:
+        writer.writerow([tech["id"], tech["name"], ";".join(tech["areas"]), "", ""])
+    return buffer.getvalue()
+
+
 def validate(conn: sqlite3.Connection) -> List[Finding]:
     service_areas = load_service_areas()
     known_labels = _known_area_labels(service_areas)
@@ -142,11 +162,25 @@ def validate(conn: sqlite3.Connection) -> List[Finding]:
 def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", type=Path, default=storage.DB_PATH, help="Path to the SQLite database (opened strictly read-only)")
+    parser.add_argument(
+        "--export-template", type=Path, default=None,
+        help="Write a blank technician-destination CSV template (id/name/areas, empty dispatch_group/closing_group) to this path instead of validating",
+    )
     args = parser.parse_args(argv)
 
     if not args.db.exists():
         print(f"ERROR   config       Database not found at {args.db}")
         return 2
+
+    if args.export_template is not None:
+        conn = _connect_readonly(args.db)
+        try:
+            csv_text = export_blank_configuration_template(conn)
+        finally:
+            conn.close()
+        args.export_template.write_text(csv_text, encoding="utf-8")
+        print(f"Template written to {args.export_template}")
+        return 0
 
     conn = _connect_readonly(args.db)
     try:
