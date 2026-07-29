@@ -371,3 +371,29 @@ def test_no_write_http_verbs_in_dispatch_page():
     source = pathlib.Path("luxor_desk_pages/dispatch.py").read_text(encoding="utf-8")
     for forbidden in (".post(", ".put(", ".delete(", ".patch("):
         assert forbidden not in source
+
+
+def test_quo_api_key_never_hardcoded_or_logged():
+    """The real API key must only ever flow through
+    os.environ.get(API_KEY_ENV_VAR) -- never a literal, never printed,
+    never written into a caption/markdown string."""
+    for f in DESK_FILES:
+        source = pathlib.Path(f).read_text(encoding="utf-8")
+        assert "print(" not in source or "api_key" not in source.lower()
+        # The only acceptable appearance of the literal env var name is
+        # importing/referencing API_KEY_ENV_VAR, never the raw string.
+        for line in source.splitlines():
+            if "QUO_API_KEY" in line:
+                assert "API_KEY_ENV_VAR" not in line or "import" in line, (
+                    f"{f}: {line!r} -- QUO_API_KEY should only appear via the API_KEY_ENV_VAR constant"
+                )
+
+
+def test_tests_use_temporary_database_only(desk_env, tmp_path):
+    """desk_env's own fixture never points at the real DB_PATH -- this
+    guards against a future edit accidentally removing the monkeypatch."""
+    assert str(desk_env).endswith("test.db")
+    assert str(desk_env).startswith(str(tmp_path))  # pytest's own isolated tmp dir, never the real repo DB
+    from dispatcher import storage
+    assert storage.DB_PATH == desk_env
+    assert "Desktop\\ai dispatcher\\data" not in str(storage.DB_PATH).replace("/", "\\")

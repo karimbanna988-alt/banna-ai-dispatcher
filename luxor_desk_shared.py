@@ -326,7 +326,12 @@ def render_job_workspace(conn, entry) -> None:
     stream_key = rm.policy_stream_key(item["group_label"], job.source.value)
     policy = get_policy(stream_key, classify_result.message_type.value)
     if item["group_label"] == "CLOSINGS":
-        st.caption("Closings & Replies stream -- no new-job acknowledgment applies.")
+        st.caption(
+            "Closings & Replies stream -- no new-job acknowledgment applies. "
+            "Recording a confirmed closing amount/payment method is not yet available on this "
+            "screen; use the existing Closings & Payments tool for that until this workspace "
+            "grows a closing-entry action."
+        )
     elif policy.acknowledgment_required:
         mode = outbound.current_mode()
         if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
