@@ -447,6 +447,7 @@ def test_events_fk_repair_corrects_the_drifted_reference(tmp_path):
     _build_drifted_pre_repair_db(db_path)
 
     conn = storage.connect(db_path)
+    storage.migrate_schema(conn)  # connect() no longer auto-migrates an existing db -- see storage.connect()'s docstring
 
     schema_sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
     assert "jobs_pre_source_scoped_unique_backup" not in schema_sql
@@ -458,6 +459,7 @@ def test_events_fk_repair_preserves_every_row_and_id(tmp_path):
     _build_drifted_pre_repair_db(db_path)
 
     conn = storage.connect(db_path)
+    storage.migrate_schema(conn)
 
     rows = conn.execute(
         "SELECT id, job_id, ticket_number, raw_message, final_action, channel FROM events ORDER BY id"
@@ -473,9 +475,11 @@ def test_events_fk_repair_is_idempotent(tmp_path):
     _build_drifted_pre_repair_db(db_path)
 
     conn1 = storage.connect(db_path)
+    storage.migrate_schema(conn1)
     first_sql = conn1.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
 
-    conn2 = storage.connect(db_path)  # re-run migrations against the already-repaired file
+    conn2 = storage.connect(db_path)
+    storage.migrate_schema(conn2)  # re-run migration against the already-repaired file
     second_sql = conn2.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
 
     assert first_sql == second_sql
@@ -495,6 +499,7 @@ def test_events_fk_repair_passes_foreign_key_check_and_integrity_check(tmp_path)
     _build_drifted_pre_repair_db(db_path)
 
     conn = storage.connect(db_path)
+    storage.migrate_schema(conn)
 
     assert conn.execute("PRAGMA foreign_key_check(events)").fetchall() == []
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -505,6 +510,7 @@ def test_foreign_keys_enforcement_is_enabled_after_repair_on_clean_data(tmp_path
     _build_drifted_pre_repair_db(db_path)
 
     conn = storage.connect(db_path)
+    storage.migrate_schema(conn)
 
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     with pytest.raises(sqlite3.IntegrityError):
@@ -530,8 +536,9 @@ def test_fk_repair_refuses_when_a_view_references_events(tmp_path):
     raw.commit()
     raw.close()
 
+    conn = storage.connect(db_path)
     with pytest.raises(RuntimeError, match="events_summary"):
-        storage.connect(db_path)
+        storage.migrate_schema(conn)
 
 
 def test_fk_repair_aborts_and_reports_orphans_without_enabling_enforcement(tmp_path):
@@ -549,8 +556,9 @@ def test_fk_repair_aborts_and_reports_orphans_without_enabling_enforcement(tmp_p
     raw.commit()
     raw.close()
 
+    conn = storage.connect(db_path)
     with pytest.raises(RuntimeError, match="orphan"):
-        storage.connect(db_path)
+        storage.migrate_schema(conn)
 
     # The original (unrepaired) table must be untouched -- verified via a
     # fresh raw connection, bypassing storage.connect() entirely so this

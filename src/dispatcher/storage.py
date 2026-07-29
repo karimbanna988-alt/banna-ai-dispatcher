@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .action_names import TECHNICIAN_UPDATE_TYPES, ActionName
+from .clock import Clock, SystemClock, now_iso
 from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
@@ -38,7 +39,33 @@ DB_PATH = Path(__file__).resolve().parents[2] / "data" / "dispatcher.db"
 # additive, backward-compatible column (those need no version bump,
 # since old readers already tolerate an extra NULL column). See
 # docs/EVENT_CONTRACT.md.
+#
+# EVENT_SCHEMA_VERSION 0 is reserved for events written before this
+# column existed (backfilled explicitly by migrate_schema(), never by
+# DEFAULT -- see _add_idempotency_and_schema_version_support()'s
+# docstring): those rows never had a chance to be deduplicated via
+# idempotency_key, so calling them "1" would overstate what the system
+# actually guaranteed when they were written. Only rows inserted by
+# save_audit_entry()/the operational job actions AFTER this column
+# existed are stamped 1.
 EVENT_SCHEMA_VERSION = 1
+LEGACY_EVENT_SCHEMA_VERSION = 0
+
+# The current target database schema revision, tracked via SQLite's own
+# PRAGMA user_version (never a second migration-tracking table -- see
+# docs/SCHEMA_MIGRATION_RUNBOOK.md for why one isn't needed here).
+# Bumped whenever a new migration function is added to _ensure_schema().
+SCHEMA_REVISION = 2
+
+# SQLite's own busy-wait, in milliseconds, before a writer blocked by
+# another writer's transaction gives up and raises "database is
+# locked" -- see docs/SQLITE_CONNECTION_POLICY.md. Zero (SQLite's
+# default) means an immediate failure on any contention at all; this
+# app has at most two local processes (the Streamlit UI and the
+# optional standalone poller) ever writing to the same file, so a
+# short bounded wait is enough to absorb that, without masking a
+# genuinely stuck writer forever.
+BUSY_TIMEOUT_MS = 5000
 
 
 class MessageType(str, Enum):
@@ -73,6 +100,23 @@ class ClassifyResult:
 
 
 def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Opens a connection for normal application reads/writes.
+
+    Does NOT apply schema migrations to a pre-existing database -- see
+    migrate_schema() / scripts/manage_schema.py. Rendering a page,
+    logging in, refreshing, or any other read must never be the trigger
+    for a production schema change.
+
+    The one deliberate exception: a database file with no `jobs` table
+    at all is unambiguously brand new (every test fixture's
+    tmp_path/"test.db" hits this, and so does a genuine first-ever run)
+    -- there is no existing data a migration could put at risk, so it is
+    provisioned with the full current schema immediately. An existing
+    database that merely lacks newer columns/tables is left exactly as
+    it is; callers must run the explicit migration command first (see
+    docs/SCHEMA_MIGRATION_RUNBOOK.md). Use check_schema_status(conn) to
+    detect this before attempting any write that depends on a newer
+    column."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: the Streamlit UI reruns the script on a fresh
@@ -81,9 +125,147 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     # multi-writer access, so relaxing SQLite's default thread affinity here
     # is safe.
     conn = sqlite3.connect(path, check_same_thread=False)
-    _ensure_schema(conn)
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    if _is_brand_new_database(conn):
+        _ensure_schema(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
+        conn.commit()
     _configure_foreign_key_enforcement(conn)
     return conn
+
+
+def _is_brand_new_database(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
+    return row is None
+
+
+# (table, column) pairs that must all be present for the database to be
+# considered fully migrated to SCHEMA_REVISION. `column=None` means "the
+# table itself must exist". This list is intentionally the full current
+# target shape, not a step-by-step replay of every historical migration
+# -- in practice a real database that has ever been opened by an older
+# version of this app already has everything except the most recent
+# addition(s), and a from-scratch database goes through the same
+# idempotent _ensure_schema() chain regardless, so there is no need for
+# a second, independently-maintained migration-tracking table (a
+# genuine _new_ requirement would add one more line here, not a new
+# subsystem).
+_SCHEMA_MARKERS: tuple = (
+    ("jobs", "status"),
+    ("jobs", "assigned_technician_id"),
+    ("jobs", "reconciliation_state"),
+    ("events", "channel"),
+    ("events", "closing_amount"),
+    ("events", "update_type"),
+    ("events", "eta_minutes"),
+    ("events", "idempotency_key"),
+    ("events", "schema_version"),
+    ("technicians", "dispatch_group"),
+    ("technicians", "closing_group"),
+    ("whatsapp_handoffs", None),
+    ("quo_outbound_log", None),
+    ("dispatch_tracking", None),
+    ("console_activation_state", None),
+    ("quo_pending_messages", None),
+)
+
+
+@dataclass(frozen=True)
+class SchemaStatus:
+    """Read-only snapshot of a database's migration state -- never
+    produced by a function that also writes. `missing` lists
+    human-readable marker names (table.column, or table for a whole
+    missing table) for any operator/log message; never customer data."""
+
+    current_revision: int
+    required_revision: int
+    is_new_database: bool
+    missing: List[str]
+
+    @property
+    def up_to_date(self) -> bool:
+        return not self.missing and (self.is_new_database or self.current_revision >= self.required_revision)
+
+
+def check_schema_status(conn: sqlite3.Connection) -> SchemaStatus:
+    """Read-only: never calls _ensure_schema(), never writes anything,
+    safe to call on a connection opened strictly read-only (SQLite
+    `mode=ro`). Callers use this to decide whether to permit
+    state-changing actions -- see luxor_desk_shared.require_current_schema()."""
+    if _is_brand_new_database(conn):
+        return SchemaStatus(current_revision=0, required_revision=SCHEMA_REVISION, is_new_database=True, missing=[])
+
+    missing: List[str] = []
+    for table, column in _SCHEMA_MARKERS:
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if table_exists is None:
+            missing.append(f"{table} (table)")
+            continue
+        if column is not None:
+            cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                missing.append(f"{table}.{column}")
+    index_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_idempotency_key'"
+    ).fetchone()
+    if index_row is None:
+        missing.append("idx_events_idempotency_key (unique index)")
+
+    current_revision = conn.execute("PRAGMA user_version").fetchone()[0]
+    return SchemaStatus(
+        current_revision=current_revision, required_revision=SCHEMA_REVISION,
+        is_new_database=False, missing=missing,
+    )
+
+
+def migrate_schema(conn: sqlite3.Connection) -> SchemaStatus:
+    """The ONLY function in this module permitted to run _ensure_schema()
+    against a database that might already contain real rows. Never
+    called by connect(); only by scripts/manage_schema.py (which is
+    responsible for taking a backup first) or a test that explicitly
+    wants a migrated temporary database.
+
+    Idempotent: safe to run any number of times, including immediately
+    after a prior run that failed partway through. Every step inside
+    _ensure_schema() is independently idempotent (each checks "is this
+    already applied?" before acting) and each step's own DDL is atomic
+    at the SQLite level, so a failure on step N never leaves step N
+    half-applied -- it leaves steps 1..N-1 committed and N..end simply
+    not yet attempted, a safe, resumable, always-idempotent-to-retry
+    state. This is NOT the same as one all-or-nothing transaction
+    spanning the entire chain (see docs/SCHEMA_MIGRATION_RUNBOOK.md for
+    why that stronger guarantee isn't offered, and isn't needed given
+    per-step idempotency).
+
+    Also backfills LEGACY_EVENT_SCHEMA_VERSION (0) onto every events row
+    that existed before this migration added schema_version -- see
+    EVENT_SCHEMA_VERSION's own docstring for why legacy rows are never
+    silently relabeled as version 1."""
+    was_new = _is_brand_new_database(conn)
+    pre_migration_event_ids: List[int] = []
+    if not was_new:
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        if "schema_version" not in existing_columns:
+            pre_migration_event_ids = [row[0] for row in conn.execute("SELECT id FROM events").fetchall()]
+
+    _ensure_schema(conn)
+
+    if pre_migration_event_ids:
+        conn.executemany(
+            "UPDATE events SET schema_version = ? WHERE id = ?",
+            [(LEGACY_EVENT_SCHEMA_VERSION, event_id) for event_id in pre_migration_event_ids],
+        )
+        conn.commit()
+
+    conn.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
+    conn.commit()
+    # Re-evaluate now that the schema is current -- connect() may have
+    # left foreign_keys off because tables this check depends on
+    # (e.g. `technicians`) didn't exist yet before this migration ran.
+    _configure_foreign_key_enforcement(conn)
+    return check_schema_status(conn)
 
 
 JOBS_PRE_SOURCE_SCOPED_BACKUP_TABLE = "jobs_pre_source_scoped_unique_backup"
@@ -398,14 +580,25 @@ def _configure_foreign_key_enforcement(conn: sqlite3.Connection) -> None:
     explicitly on every connection, not just once during migration. Only
     turned on when every known foreign key relationship is currently
     clean (cheap indexed checks), so enforcement can never itself break on
-    data it hasn't verified."""
-    event_orphans = conn.execute(
-        "SELECT COUNT(*) FROM events WHERE job_id IS NOT NULL AND job_id NOT IN (SELECT id FROM jobs)"
-    ).fetchone()[0]
-    technician_orphans = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE assigned_technician_id IS NOT NULL "
-        "AND assigned_technician_id NOT IN (SELECT id FROM technicians)"
-    ).fetchone()[0]
+    data it hasn't verified.
+
+    Tolerates a not-yet-migrated database (e.g. connect() deliberately
+    skipping migration for a pre-existing file -- see connect()'s own
+    docstring): a missing `technicians` table means this database
+    predates that concept entirely, which is not the same thing as
+    "orphaned data" -- there's nothing to enforce yet, so this simply
+    leaves foreign_keys at SQLite's safe default (off) rather than
+    raising out of connect()."""
+    try:
+        event_orphans = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE job_id IS NOT NULL AND job_id NOT IN (SELECT id FROM jobs)"
+        ).fetchone()[0]
+        technician_orphans = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE assigned_technician_id IS NOT NULL "
+            "AND assigned_technician_id NOT IN (SELECT id FROM technicians)"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return
     if event_orphans == 0 and technician_orphans == 0:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -816,8 +1009,28 @@ def reset_live_queue_boundary(conn: sqlite3.Connection, note: str = "Manual rese
     return now
 
 
+# Module-level clock, swappable only by tests (production always uses
+# the default SystemClock) -- see clock.py. Every _now() call in this
+# file goes through it, so a test can make "now" deterministic without
+# threading a clock parameter through dozens of existing call sites.
+_CLOCK: Clock = SystemClock()
+
+
+def set_clock(clock: Clock) -> None:
+    """Test-only seam. Never called by production code -- SystemClock
+    is the permanent default. Always paired with reset_clock() in a
+    fixture teardown so one test's fixed time can't leak into another."""
+    global _CLOCK
+    _CLOCK = clock
+
+
+def reset_clock() -> None:
+    global _CLOCK
+    _CLOCK = SystemClock()
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_iso(_CLOCK)
 
 
 def _current_fields(job: ExtractedJob) -> dict:
@@ -981,7 +1194,7 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
     """
     prev = previous_status if previous_status in VALID_JOB_STATUSES else "Needs Review"
 
-    if final_action == "Handle Manually":
+    if final_action == ActionName.HANDLE_MANUALLY.value:
         return "Handle Manually"
 
     if message_type == MessageType.NEW.value:
@@ -1034,7 +1247,7 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
         # in -- assigning/reassigning/removing a technician never changes
         # status on its own (Handle Manually, from rule 1 above, is the
         # only way an assignment event can move status at all).
-        if final_action in ("Assign", "Reassign", "Remove"):
+        if final_action in (ActionName.ASSIGN.value, ActionName.REASSIGN.value, ActionName.REMOVE.value):
             return prev
         return "Needs Review"
 
@@ -1931,7 +2144,7 @@ def assign_technician(
     if technician_id is None:
         return _apply_assignment_decision(
             conn, job_id=job_id, source=source, ticket_number=ticket_number,
-            technician_id=None, final_action="Remove",
+            technician_id=None, final_action=ActionName.REMOVE.value,
             reason="Assignment removed by dispatcher.",
         )
 
@@ -1967,15 +2180,18 @@ def assign_technician(
     if problems:
         return _apply_assignment_decision(
             conn, job_id=job_id, source=source, ticket_number=ticket_number,
-            technician_id=None, final_action="Handle Manually",
+            technician_id=None, final_action=ActionName.HANDLE_MANUALLY.value,
             reason="; ".join(problems),
         )
 
-    action = "Reassign" if current_technician_id and current_technician_id != technician_id else "Assign"
+    action = (
+        ActionName.REASSIGN.value if current_technician_id and current_technician_id != technician_id
+        else ActionName.ASSIGN.value
+    )
     return _apply_assignment_decision(
         conn, job_id=job_id, source=source, ticket_number=ticket_number,
         technician_id=technician_id, final_action=action,
-        reason=f"{'Reassigned' if action == 'Reassign' else 'Assigned'} to {tech['name']}.",
+        reason=f"{'Reassigned' if action == ActionName.REASSIGN.value else 'Assigned'} to {tech['name']}.",
     )
 
 
@@ -2002,8 +2218,8 @@ def _apply_assignment_decision(
         "UPDATE jobs SET status = ?, last_event_id = ?, last_event_at = ? WHERE id = ?",
         (new_status, event_id, now, job_id),
     )
-    result_technician_id = technician_id if final_action in ("Assign", "Reassign") else None
-    if final_action in ("Assign", "Reassign", "Remove"):
+    result_technician_id = technician_id if final_action in (ActionName.ASSIGN.value, ActionName.REASSIGN.value) else None
+    if final_action in (ActionName.ASSIGN.value, ActionName.REASSIGN.value, ActionName.REMOVE.value):
         # Only a *successful* change touches the current-assignment mirror
         # column -- a blocked (Handle Manually) attempt must never silently
         # clear or alter whatever assignment already existed.
@@ -2020,7 +2236,10 @@ def _apply_assignment_decision(
         if row:
             tech_name, tech_dispatch_group, tech_closing_group = row
 
-    outcome_map = {"Assign": "assigned", "Reassign": "reassigned", "Remove": "removed", "Handle Manually": "handle_manually"}
+    outcome_map = {
+        ActionName.ASSIGN.value: "assigned", ActionName.REASSIGN.value: "reassigned",
+        ActionName.REMOVE.value: "removed", ActionName.HANDLE_MANUALLY.value: "handle_manually",
+    }
     return AssignmentResult(
         outcome=outcome_map[final_action], reason=reason,
         technician_id=result_technician_id, technician_name=tech_name,

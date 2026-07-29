@@ -235,7 +235,8 @@ def test_backfill_replays_events_chronologically_not_just_the_latest(tmp_path):
     raw.commit()
     raw.close()
 
-    conn = storage.connect(db_path)  # triggers _add_job_status_columns_and_backfill
+    conn = storage.connect(db_path)
+    storage.migrate_schema(conn)  # explicit now -- triggers _add_job_status_columns_and_backfill; connect() no longer auto-migrates an existing db
 
     row = conn.execute("SELECT status, last_event_id, last_event_at FROM jobs WHERE id = 1").fetchone()
     assert row[0] == "In Progress"
@@ -256,7 +257,8 @@ def test_backfill_is_idempotent_and_resumable(tmp_path):
     conn1.execute("UPDATE jobs SET last_event_id = NULL WHERE id = ?", (job_id,))
     conn1.commit()
 
-    conn2 = storage.connect(db_path)  # re-run _ensure_schema -- must resume, not skip
+    conn2 = storage.connect(db_path)
+    storage.migrate_schema(conn2)  # explicit re-run of _ensure_schema -- must resume, not skip
     second_status = conn2.execute("SELECT status, last_event_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
     assert second_status[0] == first_status[0]
