@@ -52,7 +52,22 @@ def seed_live_boundary(db_path, when="2020-01-01T00:00:00Z"):
     conn.close()
 
 
-def seed_pending(db_path, message_id, raw_text, group_label="AGN", received_at="2026-07-29T10:00:00Z"):
+def _default_received_at() -> str:
+    """A fixed timestamp eventually becomes "before the live boundary" as
+    real wall-clock time passes it -- computed fresh at call time instead
+    so this fixture default never goes stale. A few minutes in the future
+    (relative to the moment this is called) so it's still safely after
+    whatever boundary ensure_live_queue_activated() seeds moments later
+    when the app itself first runs -- seeding always happens strictly
+    after this fixture call, so "now" alone would work too, but the
+    buffer removes any risk of a sub-second race."""
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+
+def seed_pending(db_path, message_id, raw_text, group_label="AGN", received_at=None):
+    if received_at is None:
+        received_at = _default_received_at()
     conn = storage.connect(db_path)
     storage.save_pending_and_mark_processed(
         conn, message_id=message_id, conversation_id=f"c-{message_id}", group_label=group_label,
@@ -109,8 +124,12 @@ def test_top_navigation_configured_with_five_destinations():
 
 # ------------------------------------------------- 3. Priority + oldest-first
 def test_valid_jobs_ordered_oldest_first_within_bucket(app_env):
-    seed_pending(app_env, "NEW_OLD", agn_message("OLDONE"), received_at="2026-07-29T09:00:00Z")
-    seed_pending(app_env, "NEW_NEW", agn_message("NEWONE"), received_at="2026-07-29T09:30:00Z")
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    older = (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    newer = (now + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    seed_pending(app_env, "NEW_OLD", agn_message("OLDONE"), received_at=older)
+    seed_pending(app_env, "NEW_NEW", agn_message("NEWONE"), received_at=newer)
     at = login(make_app())
     rendered = "\n".join(m.value for m in at.markdown)
     assert rendered.index("OLDONE") < rendered.index("NEWONE")
@@ -315,7 +334,7 @@ def test_previous_backlog_excluded_from_counters_and_oldest_live(app_env):
 
 def test_live_job_counted_in_new_jobs_and_waiting(app_env):
     seed_live_boundary(app_env)
-    seed_pending(app_env, "FRESH1", agn_message("FRESH1"), received_at="2026-07-29T10:00:00Z")
+    seed_pending(app_env, "FRESH1", agn_message("FRESH1"))  # default received_at is safely "now"
     at = login(make_app())
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["New jobs"] == "1"
@@ -379,10 +398,16 @@ def test_reset_live_queue_boundary_cancel_leaves_boundary_unchanged(app_env):
 
 
 def test_repeated_raw_copies_of_same_ticket_render_one_canonical_card(app_env):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+
+    def _at(offset_minutes):
+        return (now + timedelta(minutes=offset_minutes)).isoformat().replace("+00:00", "Z")
+
     seed_live_boundary(app_env)
-    seed_pending(app_env, "DUPTICKET1", agn_message("DUPTICKET1"), received_at="2026-07-29T09:00:00Z")
-    seed_pending(app_env, "DUPTICKET1_reminder", agn_message("DUPTICKET1"), received_at="2026-07-29T09:05:00Z")
-    seed_pending(app_env, "DUPTICKET1_reminder2", agn_message("DUPTICKET1"), received_at="2026-07-29T09:10:00Z")
+    seed_pending(app_env, "DUPTICKET1", agn_message("DUPTICKET1"), received_at=_at(5))
+    seed_pending(app_env, "DUPTICKET1_reminder", agn_message("DUPTICKET1"), received_at=_at(10))
+    seed_pending(app_env, "DUPTICKET1_reminder2", agn_message("DUPTICKET1"), received_at=_at(15))
     at = login(make_app())
     assert len(at.exception) == 0
     # Substring-counting the ticket text isn't reliable (it also appears

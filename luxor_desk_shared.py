@@ -1,16 +1,21 @@
-"""Shared styling/auth helpers for LUXOR OPERATIONS DESK. Static CSS
-only -- this file contains no inline script block, no click-handler
-attribute, and no JavaScript of any kind, anywhere, by design (a prior
-candidate's custom clipboard button rendered its own JS source as
-visible page text; this prototype avoids that entire class of bug by
-never emitting JS at all, relying only on st.code()'s native copy
-control). Never imports dispatcher.storage, never opens the real
-database, never calls Quo.
+"""Shared styling/auth/rendering helpers for LUXOR OPERATIONS DESK. No
+inline script block, no click-handler attribute, and no JavaScript of
+any kind, anywhere, by design (a prior candidate's custom clipboard
+button rendered its own JS source as visible page text; this app avoids
+that entire class of bug by never emitting JS at all, relying only on
+st.code()'s native copy control).
 
 Dark navy/charcoal visual system (deliberately not Streamlit's default
 dark theme, which reads as flat black/gray) -- launched with
 --theme.base dark plus explicit --theme.* colors matching the constants
-below, then refined here."""
+below, then refined here.
+
+render_queue_row()/render_job_workspace() below DO read the real
+database (via lazily-imported dispatcher.* modules, matching this
+file's existing lazy-import convention in require_login()) -- this
+module is the real application's shared rendering layer, not a mock.
+Every field they show comes from luxor_desk_read_model, which itself
+only reads existing real tables through existing real functions."""
 
 from __future__ import annotations
 
@@ -222,3 +227,201 @@ def source_chip_html(source: str) -> str:
 def stage_chip_html(stage: str) -> str:
     color = STAGE_COLORS.get(stage, MUTED)
     return f'<span class="desk-chip" style="background:{color}">{stage.upper()}</span>'
+
+
+def _lifecycle_stage(tracking: dict) -> str:
+    if tracking["dispatched_manually_at"]:
+        return "Dispatched"
+    if tracking["acknowledged_at"]:
+        return "Acknowledged"
+    return "New"
+
+
+def render_queue_row(entry, identity: str, selected_id: str) -> None:
+    """One compact, real, clickable queue row -- every field comes
+    straight from the QueueEntry the caller built via
+    luxor_desk_read_model.get_live_dispatch_queue(). Clicking selects
+    this job as the workspace target; nothing else about it mutates."""
+    import streamlit as st
+
+    from dispatcher.rules.sla_config import format_age
+
+    job = entry.job
+    ack = "Ack" if entry.tracking["acknowledged_at"] else ("Ack req." if entry.classify_result else "")
+    dispatch = "Dispatched" if entry.tracking["dispatched_manually_at"] else "Not dispatched"
+    area = ", ".join(p for p in (job.city.value, job.state.value) if p) or "Area unresolved"
+    extra = f" (+{entry.extra_count})" if entry.extra_count else ""
+    urgency_prefix = {"urgent": "🔴 ", "warning": "🟠 "}.get(entry.urgency, "")
+    label = (
+        f"{urgency_prefix}{job.source.value} · {job.ticket_number.value or 'No ref'}{extra} — "
+        f"{area} · {job.service_type.value or 'Not specified'} — {format_age(entry.age_seconds)} — {dispatch}"
+    )
+    button_type = "primary" if identity == selected_id else "secondary"
+    if st.button(label, key=f"desk_queue_row_{identity}", width="stretch", type=button_type):
+        st.session_state.desk_dispatch_selected = identity
+        st.rerun()
+
+
+def render_job_workspace(conn, entry) -> None:
+    """The full real Job Workspace for one selected QueueEntry, in the
+    exact operational order: header, source message, extraction/
+    validation, source-company action, Luxor message, routing, then
+    stage-appropriate operating actions. Every write here calls the
+    exact same storage.save_audit_entry()/mark_quo_pending_message_actioned()/
+    dispatch_tracking path the original Speed Dispatch Console uses --
+    no second persistence layer."""
+    import streamlit as st
+
+    import luxor_desk_read_model as rm
+    from dispatcher import outbound, storage
+    from dispatcher.policy import get_policy
+
+    job, classify_result, result, tracking = entry.job, entry.classify_result, entry.result, entry.tracking
+    item = entry.item
+    mid = item["message_id"]
+
+    resolution, eligible, market_label = rm.resolve_job_routing(conn, job, item["raw_text"])
+
+    # A. Job header
+    stage = _lifecycle_stage(tracking)
+    from dispatcher.rules.sla_config import format_age
+    st.markdown(
+        f'<div class="desk-card-top">'
+        f'{source_chip_html(job.source.value)}'
+        f'<span class="desk-ticket">{job.ticket_number.value or "No reference"}</span>'
+        f'<span class="desk-age">{format_age(entry.age_seconds)} ago</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    area_label = resolution.canonical_area or "Area unresolved"
+    st.markdown(f'<div class="desk-meta">{area_label} · {job.service_type.value or "Not specified"}{" (" + market_label + ")" if market_label else ""}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div><span class="desk-chip-outline">{stage}</span> '
+        f'<span class="desk-chip-outline">{eligible[0]["name"] if len(eligible) == 1 else (str(len(eligible)) + " eligible" if eligible else "No technician configured")}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    # B. Source message
+    with st.expander("Original company message"):
+        st.code(shared_mask(item["raw_text"]))
+
+    # C. Extraction and validation
+    with st.expander("Extracted fields"):
+        st.markdown(f"**Customer:** {job.customer_name.value or '—'}")
+        phone_line = job.phone.value or "—"
+        if job.extension.value:
+            phone_line += f" ext {job.extension.value}"
+        st.markdown(f"**Phone:** {phone_line}")
+        st.markdown(f"**Address:** {job.address.value or '—'}, {area_label}")
+        if job.vehicle.value:
+            st.markdown(f"**Vehicle:** {job.vehicle.value}")
+        if job.notes.value:
+            st.markdown(f"**Notes:** {job.notes.value}")
+        if result.decision.missing_information:
+            st.warning(f"Missing: {', '.join(result.decision.missing_information)}")
+        if classify_result.conflicting_fields:
+            st.warning(f"Conflicting: {', '.join(classify_result.conflicting_fields)}")
+
+    # D. Source-company action
+    stream_key = rm.policy_stream_key(item["group_label"], job.source.value)
+    policy = get_policy(stream_key, classify_result.message_type.value)
+    if item["group_label"] == "CLOSINGS":
+        st.caption("Closings & Replies stream -- no new-job acknowledgment applies.")
+    elif policy.acknowledgment_required:
+        mode = outbound.current_mode()
+        if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
+            if not tracking["acknowledged_at"]:
+                if st.button("Send K", key=f"desk_k_{mid}", type="primary", width="stretch"):
+                    storage.mark_acknowledged(conn, mid)
+                    req = outbound.build_request(
+                        source=job.source.value, job_id=classify_result.existing_job_id,
+                        quo_contact_id=item["group_label"], text="K",
+                    )
+                    out_result = outbound.propose_send(conn, req, approved_by="dispatcher-tap")
+                    st.caption(f"Outbound: {out_result.outcome} — {out_result.reason}")
+                    st.rerun()
+            else:
+                st.success("✅ K acknowledged")
+        else:
+            if not tracking["acknowledged_at"]:
+                st.caption("K ready — sending disabled")
+                if st.button("Mark K sent manually", key=f"desk_k_{mid}", width="stretch"):
+                    storage.mark_acknowledged(conn, mid)
+                    st.rerun()
+            else:
+                st.success("✅ K acknowledged")
+    else:
+        st.caption("No acknowledgment required")
+
+    # E. Luxor technician message
+    st.markdown('<div class="desk-section-title" style="margin-top:0.6rem;">Luxor technician message</div>', unsafe_allow_html=True)
+    if result.decision.missing_information:
+        st.warning("HUMAN_REVIEW_NEEDED — required information is missing; do not treat this as ready to send.")
+    with st.expander("Copy Luxor message", expanded=False):
+        st.code(result.luxor_message)
+    if st.button("Mark copied", key=f"desk_copy_{mid}", width="stretch"):
+        storage.mark_copied(conn, mid)
+        st.rerun()
+    if tracking["copied_at"]:
+        st.caption("✅ Copied")
+
+    # F. Routing
+    with st.expander("Routing"):
+        st.markdown(f"**Canonical area:** {area_label}")
+        if market_label:
+            st.markdown(f"**Market label:** {market_label}")
+        if eligible:
+            st.markdown("**Eligible technicians:**")
+            for t in eligible:
+                st.caption(f"{t['name']} — {t['dispatch_group'] or 'WhatsApp destination not configured'}")
+        else:
+            st.caption("No eligible technician configured for this area/service.")
+        if not resolution.canonical_area:
+            st.caption(f"Routing: {resolution.reason}")
+
+    # G. Operating actions
+    destination = eligible[0]["dispatch_group"] if eligible else None
+    if destination:
+        if st.button("Open WhatsApp", key=f"desk_wa_{mid}", width="stretch"):
+            storage.mark_whatsapp_opened(conn, mid)
+            st.rerun()
+    else:
+        st.caption("WhatsApp destination not configured")
+
+    can_mark_dispatched = bool(destination) and tracking["copied_at"] is not None
+    if can_mark_dispatched:
+        if st.button("Mark Dispatched", key=f"desk_dispatch_{mid}", type="primary", width="stretch"):
+            storage.save_audit_entry(
+                conn, job, classify_result, decision=result.decision,
+                suggested_quo_reply=result.decision.quo_reply_suggestion,
+                luxor_message=result.luxor_message, final_action="Approve", channel="manual",
+            )
+            storage.mark_quo_pending_message_actioned(conn, mid)
+            storage.mark_dispatched_manually(conn, mid)
+            st.success("Marked dispatched.")
+            st.rerun()
+    else:
+        st.caption("Mark Dispatched requires a configured WhatsApp destination and a copied message.")
+
+    with st.expander("More"):
+        if st.button("Handle Manually", key=f"desk_hm_{mid}"):
+            storage.save_audit_entry(
+                conn, job, classify_result, decision=result.decision,
+                luxor_message=result.luxor_message, final_action="Handle Manually", channel="manual",
+            )
+            storage.mark_quo_pending_message_actioned(conn, mid)
+            st.rerun()
+        reason = st.text_input("Reason (required to pass/cancel)", key=f"desk_pass_reason_{mid}")
+        if st.button("Pass / Cancel Job", key=f"desk_reject_{mid}", disabled=not reason.strip()):
+            storage.save_audit_entry(
+                conn, job, classify_result, decision=result.decision,
+                luxor_message=result.luxor_message, final_action="Reject", channel="manual",
+                dispatcher_edits=f"Reason: {reason.strip()}",
+            )
+            storage.mark_quo_pending_message_actioned(conn, mid)
+            st.rerun()
+
+
+def shared_mask(raw_text: str) -> str:
+    import luxor_ops_shared as shared
+    return shared.mask_sensitive(raw_text) or ""

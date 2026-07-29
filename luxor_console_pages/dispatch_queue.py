@@ -35,11 +35,13 @@ import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 import luxor_ops_shared as shared
+import luxor_desk_read_model as read_model
 from dispatcher import outbound, quo_client, storage
-from dispatcher.policy import LUCKY_CLOSINGS_STREAM_KEY, get_policy
+from dispatcher.policy import get_policy
 from dispatcher.quo_client import API_KEY_ENV_VAR, QuoAPIError, QuoConfigError
 from dispatcher.quo_ingest import poll_for_new_messages
 from dispatcher.rules.market_aliases import resolve_market_and_area
@@ -64,29 +66,15 @@ conn = get_db()
 live_queue_started_at = storage.ensure_live_queue_activated(conn)
 
 
-def _parse_ts(raw):
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
+# _parse_ts / is_live are shared with luxor_desk via luxor_desk_read_model
+# (see that module's docstring) -- kept as thin local aliases so the rest
+# of this file's calls don't need to change.
+_parse_ts = read_model.parse_ts
 _boundary_dt = _parse_ts(live_queue_started_at)
 
 
 def is_live(item: dict) -> bool:
-    """Fails open to "live" for a message with no parseable timestamp --
-    a genuinely urgent job must never be silently hidden as backlog just
-    because its timestamp didn't parse."""
-    ts = _parse_ts(item["received_at"] or item["fetched_at"])
-    if ts is None or _boundary_dt is None:
-        return True
-    return ts >= _boundary_dt
+    return read_model.is_live(item, _boundary_dt)
 
 
 with st.expander(f"⚙️ Live queue boundary: {shared.humanize_timestamp(live_queue_started_at)}"):
@@ -181,28 +169,14 @@ st.markdown(
 st.button("autorefresh", key="luxor_console_autorefresh_trigger")
 
 # --------------------------------------------------------- Queue build ----
-QUEUE_BUCKETS = ("Urgent", "New Jobs", "Corrections & Cancellations", "Status Requests", "Closings")
-_CORRECTION_CANCEL_TYPES = {MessageType.CORRECTION.value, MessageType.CANCELLATION.value}
-_STATUS_TYPES = {MessageType.STATUS.value, MessageType.UPDATE_REQUEST.value, MessageType.DUPLICATE.value, MessageType.ASSIGNMENT.value}
-_UPDATES_CLOSINGS_TYPES = _CORRECTION_CANCEL_TYPES | _STATUS_TYPES | {MessageType.CLOSING.value}
-
-
-def policy_stream_key(group_label: str, source_value: str) -> str:
-    return LUCKY_CLOSINGS_STREAM_KEY if group_label == "CLOSINGS" else source_value
-
-
-def queue_bucket(message_type: str, urgency: str) -> str:
-    if urgency == "urgent":
-        return "Urgent"
-    if message_type == MessageType.NEW.value:
-        return "New Jobs"
-    if message_type in _CORRECTION_CANCEL_TYPES or message_type == MessageType.UNRECOGNIZED.value or message_type == MessageType.CLOSING_WITHOUT_DISPATCH.value:
-        return "Corrections & Cancellations"
-    if message_type in _STATUS_TYPES:
-        return "Status Requests"
-    if message_type == MessageType.CLOSING.value:
-        return "Closings"
-    return "Corrections & Cancellations"
+# QUEUE_BUCKETS / policy_stream_key / queue_bucket / canonicalize are
+# shared with luxor_desk via luxor_desk_read_model (see that module's
+# docstring) -- one tested implementation, not two independent forks.
+QUEUE_BUCKETS = read_model.QUEUE_BUCKETS
+_UPDATES_CLOSINGS_TYPES = read_model.UPDATES_CLOSINGS_TYPES
+policy_stream_key = read_model.policy_stream_key
+queue_bucket = read_model.queue_bucket
+canonicalize = read_model.canonicalize
 
 
 pending = shared.fetch_pending_messages(conn)
@@ -237,34 +211,6 @@ for item in live_pending:
 
 
 # ------------------------------------------- Canonical action dedup (Phase 3)
-def canonicalize(entries: list) -> list:
-    """One card per canonical (source, ticket) identity, not one per raw
-    row -- repeated raw copies of the same job (reminders/re-sends) must
-    not render as separate urgent cards. A message with no usable ticket
-    is never grouped with anything else (no text-similarity guessing);
-    it always renders on its own. The earliest-received member of a
-    group is the canonical card (so its displayed age reflects the true
-    original event); later members are folded in as a visible count,
-    never deleted, never dropped from the database."""
-    groups: dict = {}
-    order = []
-    for entry in entries:
-        item, job, *_ = entry
-        ticket = job.ticket_number.value
-        key = (job.source.value, ticket) if ticket else (job.source.value, f"__no_ticket_{item['message_id']}")
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(entry)
-
-    canonical = []
-    for key in order:
-        members = groups[key]
-        members.sort(key=lambda e: e[0]["received_at"] or e[0]["fetched_at"] or "")
-        canonical.append((members[0], len(members) - 1))
-    return canonical
-
-
 canonical_live = canonicalize(live_actionable)
 
 # ----------------------------------------------------- Company filters ----
