@@ -405,6 +405,55 @@ class DispatcherService:
             idempotent_replay=was_replay, user_message="Job completed.",
         )
 
+    def update_technician_destinations(
+        self, technician_id: int, dispatch_group: str, closing_group: str,
+    ) -> ActionResult:
+        """Explicit, transactional, audited change to one technician's
+        WhatsApp dispatch/closing destination strings -- the only
+        write-side technician-configuration command in this service.
+        Not job-scoped (ActionResult.job_id is always None here).
+
+        Validates the technician exists and both strings are non-blank.
+        If the requested values already match what's persisted, this is
+        a no-op (idempotent_replay=True, no new audit event) -- the same
+        "no duplicate event for an unchanged fact" contract every other
+        command in this file follows. To roll back, call this again with
+        the previous values (returned by storage.update_technician_destinations());
+        that is itself a new, equally audited transaction, never a
+        destructive undo."""
+        technician = storage.get_technician(self.conn, technician_id)
+        if technician is None:
+            return ActionResult.failure(
+                "update_technician_destinations",
+                message=f"No technician with id {technician_id}.",
+            )
+
+        issues = []
+        if not (dispatch_group or "").strip():
+            issues.append(ValidationIssue(field="dispatch_group", problem="Dispatch destination must not be blank."))
+        if not (closing_group or "").strip():
+            issues.append(ValidationIssue(field="closing_group", problem="Closing destination must not be blank."))
+        if issues:
+            return ActionResult.failure("update_technician_destinations", issues=issues)
+
+        if technician["dispatch_group"] == dispatch_group and technician["closing_group"] == closing_group:
+            return ActionResult(
+                success=True, action="update_technician_destinations",
+                idempotent_replay=True,
+                user_message=f"{technician['name']}'s destinations already match -- no change made.",
+            )
+
+        result = storage.update_technician_destinations(self.conn, technician_id, dispatch_group, closing_group)
+        return ActionResult(
+            success=True, action="update_technician_destinations",
+            audit_event_id=result["audit_event_id"],
+            user_message=(
+                f"Updated {result['name']}'s destinations. "
+                f"dispatch_group: {result['previous_dispatch_group']!r} -> {result['dispatch_group']!r}; "
+                f"closing_group: {result['previous_closing_group']!r} -> {result['closing_group']!r}."
+            ),
+        )
+
     # ------------------------------------------------------------ Queries -
     def get_job_workspace(self, job_id: int) -> Optional[dict]:
         """The current persisted state of one job -- a direct,

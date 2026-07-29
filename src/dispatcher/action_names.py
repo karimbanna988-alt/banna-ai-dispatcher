@@ -44,6 +44,11 @@ class ActionName(str, Enum):
     COMPANY_CLOSING_SENT_MANUALLY = "Company Closing Sent Manually"
     JOB_COMPLETED = "Job Completed"
 
+    # Technician-roster configuration change (not job-scoped -- the
+    # associated events row carries job_id=NULL). See
+    # storage.update_technician_destinations().
+    TECHNICIAN_CONFIGURATION_UPDATED = "Technician Configuration Updated"
+
 
 # Technician update types -- dispatcher-selected, never inferred from
 # free text (see application.py::record_technician_update and

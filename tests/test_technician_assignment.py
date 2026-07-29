@@ -394,3 +394,93 @@ def test_removal_result_has_no_dispatch_or_closing_group(conn, vehicle_rules):
 
     assert result.dispatch_group is None
     assert result.closing_group is None
+
+
+# --------------------------------- update_technician_destinations() ---
+
+
+def test_update_technician_destinations_sets_both_fields(conn):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+
+    result = storage.update_technician_destinations(conn, tech_id, "New Dispatch Group", "New Closing Group")
+
+    assert result["previous_dispatch_group"] is None
+    assert result["previous_closing_group"] is None
+    assert result["dispatch_group"] == "New Dispatch Group"
+    assert result["closing_group"] == "New Closing Group"
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["dispatch_group"] == "New Dispatch Group"
+    assert tech["closing_group"] == "New Closing Group"
+
+
+def test_update_technician_destinations_captures_previous_values(conn):
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"], dispatch_group="Old Dispatch", closing_group="Old Closing",
+    )
+
+    result = storage.update_technician_destinations(conn, tech_id, "New Dispatch", "New Closing")
+
+    assert result["previous_dispatch_group"] == "Old Dispatch"
+    assert result["previous_closing_group"] == "Old Closing"
+
+
+def test_update_technician_destinations_changes_only_the_two_fields(conn):
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"], skills=["lockout"], vehicle_restrictions=["BMW"],
+    )
+    before = storage.get_technician(conn, tech_id)
+
+    storage.update_technician_destinations(conn, tech_id, "New Dispatch", "New Closing")
+
+    after = storage.get_technician(conn, tech_id)
+    assert after["name"] == before["name"]
+    assert after["areas"] == before["areas"]
+    assert after["skills"] == before["skills"]
+    assert after["vehicle_restrictions"] == before["vehicle_restrictions"]
+    assert after["active"] == before["active"]
+
+
+def test_update_technician_destinations_does_not_change_other_technicians(conn):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    other_id = storage.add_technician(conn, "Sam", areas=["OtherArea"], dispatch_group="Sam Dispatch")
+
+    storage.update_technician_destinations(conn, tech_id, "Alex Dispatch", "Alex Closing")
+
+    other = storage.get_technician(conn, other_id)
+    assert other["dispatch_group"] == "Sam Dispatch"
+    assert other["closing_group"] is None
+
+
+def test_update_technician_destinations_raises_for_unknown_technician(conn):
+    with pytest.raises(ValueError):
+        storage.update_technician_destinations(conn, 999999, "Dispatch", "Closing")
+
+
+def test_update_technician_destinations_writes_non_job_audit_event(conn):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+
+    result = storage.update_technician_destinations(conn, tech_id, "New Dispatch", "New Closing")
+
+    row = conn.execute(
+        "SELECT job_id, ticket_number, message_type, final_action, raw_message FROM events WHERE id = ?",
+        (result["audit_event_id"],),
+    ).fetchone()
+    assert row[0] is None
+    assert row[1] is None
+    assert row[2] == storage.MessageType.OPERATIONAL_NOTE.value
+    assert row[3] == "Technician Configuration Updated"
+    payload = json.loads(row[4])
+    assert payload["technician_id"] == tech_id
+    assert payload["new"]["dispatch_group"] == "New Dispatch"
+
+
+def test_update_technician_destinations_does_not_create_or_touch_any_job(conn, vehicle_rules):
+    job_id = make_job(conn, vehicle_rules)
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    before = storage.get_job_by_id(conn, job_id)
+
+    storage.update_technician_destinations(conn, tech_id, "New Dispatch", "New Closing")
+
+    after = storage.get_job_by_id(conn, job_id)
+    assert before == after
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1

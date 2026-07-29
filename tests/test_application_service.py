@@ -422,3 +422,80 @@ def test_luxor_desk_queue_reader_implements_the_protocol(desk_env_conn):
 @pytest.fixture()
 def desk_env_conn(tmp_path):
     return storage.connect(tmp_path / "desk_env.db")
+
+
+# ------------------------------------------- update_technician_destinations
+def test_update_technician_destinations_success(conn, service):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+
+    result = service.update_technician_destinations(tech_id, "New Dispatch", "New Closing")
+
+    assert result.success is True
+    assert result.idempotent_replay is False
+    assert result.audit_event_id is not None
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["dispatch_group"] == "New Dispatch"
+    assert tech["closing_group"] == "New Closing"
+
+
+def test_update_technician_destinations_unknown_technician_fails(service):
+    result = service.update_technician_destinations(999999, "Dispatch", "Closing")
+    assert result.success is False
+    assert "999999" in result.user_message
+
+
+def test_update_technician_destinations_rejects_blank_dispatch_group(conn, service):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    result = service.update_technician_destinations(tech_id, "   ", "Closing")
+    assert result.success is False
+    assert any(issue.field == "dispatch_group" for issue in result.validation_issues)
+    assert storage.get_technician(conn, tech_id)["dispatch_group"] is None
+
+
+def test_update_technician_destinations_rejects_blank_closing_group(conn, service):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    result = service.update_technician_destinations(tech_id, "Dispatch", "")
+    assert result.success is False
+    assert any(issue.field == "closing_group" for issue in result.validation_issues)
+    assert storage.get_technician(conn, tech_id)["closing_group"] is None
+
+
+def test_update_technician_destinations_is_idempotent_when_unchanged(conn, service):
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"], dispatch_group="Same Dispatch", closing_group="Same Closing",
+    )
+
+    result = service.update_technician_destinations(tech_id, "Same Dispatch", "Same Closing")
+
+    assert result.success is True
+    assert result.idempotent_replay is True
+    assert result.audit_event_id is None
+    event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert event_count == 0
+
+
+def test_update_technician_destinations_does_not_affect_other_technicians(conn, service):
+    tech_id = storage.add_technician(conn, "Alex", areas=["Faketown"])
+    other_id = storage.add_technician(conn, "Sam", areas=["OtherArea"], dispatch_group="Sam Dispatch", closing_group="Sam Closing")
+
+    service.update_technician_destinations(tech_id, "Alex Dispatch", "Alex Closing")
+
+    other = storage.get_technician(conn, other_id)
+    assert other["dispatch_group"] == "Sam Dispatch"
+    assert other["closing_group"] == "Sam Closing"
+
+
+def test_update_technician_destinations_rollback_is_calling_it_again_with_previous_values(conn, service):
+    tech_id = storage.add_technician(
+        conn, "Alex", areas=["Faketown"], dispatch_group="Original Dispatch", closing_group="Original Closing",
+    )
+
+    forward = service.update_technician_destinations(tech_id, "New Dispatch", "New Closing")
+    rollback = service.update_technician_destinations(tech_id, "Original Dispatch", "Original Closing")
+
+    assert forward.success and rollback.success
+    assert rollback.idempotent_replay is False
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["dispatch_group"] == "Original Dispatch"
+    assert tech["closing_group"] == "Original Closing"
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2

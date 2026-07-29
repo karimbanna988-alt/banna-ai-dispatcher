@@ -1937,6 +1937,77 @@ def set_technician_active(conn: sqlite3.Connection, technician_id: int, active: 
     conn.commit()
 
 
+def update_technician_destinations(
+    conn: sqlite3.Connection, technician_id: int, dispatch_group: str, closing_group: str,
+) -> dict:
+    """Explicit, transactional, audited update of one existing
+    technician's two opaque WhatsApp destination strings.
+    `add_technician()` only ever sets these at creation time -- this is
+    the one path for changing them afterward.
+
+    Validates the technician exists (raises ValueError if not), captures
+    the previous values, then updates both fields plus
+    technicians.updated_at and inserts one append-only, non-customer
+    `events` audit row (job_id=NULL -- this change belongs to no job,
+    message_type=OPERATIONAL_NOTE, final_action=
+    ActionName.TECHNICIAN_CONFIGURATION_UPDATED) in a single transaction.
+    Nothing here parses or validates the destination strings' contents
+    (same "opaque" contract as add_technician()) -- non-empty is the
+    caller's (application.py's) job.
+
+    Returns previous and new values plus the audit event id. There is no
+    separate "rollback" command: rolling back is calling this function
+    again with the previous values, which is itself a new, equally
+    audited transaction -- never a destructive undo."""
+    existing = get_technician(conn, technician_id)
+    if existing is None:
+        raise ValueError(f"No technician with id {technician_id}")
+
+    previous_dispatch_group = existing["dispatch_group"]
+    previous_closing_group = existing["closing_group"]
+    now = _now()
+    audit_payload = json.dumps({
+        "technician_id": technician_id,
+        "technician_name": existing["name"],
+        "previous": {"dispatch_group": previous_dispatch_group, "closing_group": previous_closing_group},
+        "new": {"dispatch_group": dispatch_group, "closing_group": closing_group},
+    })
+
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            "UPDATE technicians SET dispatch_group = ?, closing_group = ?, updated_at = ? WHERE id = ?",
+            (dispatch_group, closing_group, now, technician_id),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO events (
+                job_id, ticket_number, raw_message, message_type, source,
+                final_action, created_at, channel, schema_version
+            ) VALUES (NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_payload, MessageType.OPERATIONAL_NOTE.value, "internal",
+                ActionName.TECHNICIAN_CONFIGURATION_UPDATED.value, now, "manual", EVENT_SCHEMA_VERSION,
+            ),
+        )
+        audit_event_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "technician_id": technician_id,
+        "name": existing["name"],
+        "previous_dispatch_group": previous_dispatch_group,
+        "previous_closing_group": previous_closing_group,
+        "dispatch_group": dispatch_group,
+        "closing_group": closing_group,
+        "audit_event_id": audit_event_id,
+    }
+
+
 def list_technicians(conn: sqlite3.Connection, active_only: bool = False) -> List[dict]:
     sql = "SELECT * FROM technicians" + (" WHERE active = 1" if active_only else "") + " ORDER BY name ASC"
     cur = conn.execute(sql)
