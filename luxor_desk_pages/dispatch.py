@@ -28,6 +28,9 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+if not shared_desk.require_current_schema(conn):
+    conn.close()
+    st.stop()
 
 # ------------------------------------------------------------ Sync -------
 if "desk_refresh_message" not in st.session_state:

@@ -325,3 +325,25 @@ def resolve_job_routing(conn: sqlite3.Connection, job, raw_text: str):
     if resolution.canonical_area:
         eligible = storage.list_eligible_technicians_for(conn, resolution.canonical_area, job.service_type.value)
     return resolution, eligible, market_label
+
+
+class LuxorDeskQueueReader:
+    """The concrete implementation of dispatcher.application.QueueReader
+    for this app. Lives here, at the repo root, specifically so
+    application.py never has to import this module (or any luxor_desk_*
+    module) to serve DispatcherService.get_queue() -- this class
+    depends on the read model; the read model does not depend on it.
+    The UI layer (luxor_desk_pages/*.py) constructs one instance and
+    passes it into DispatcherService(..., queue_reader=...)."""
+
+    def read_queue(self, conn: sqlite3.Connection, kind: str) -> list:
+        if kind == "new_jobs":
+            live, _backlog, _other = get_live_dispatch_queue(conn)
+            return live
+        if kind == "active":
+            return get_active_jobs_detailed(conn)
+        if kind == "closings":
+            return get_closing_candidates(conn)
+        if kind == "completed":
+            return get_completed_jobs(conn)
+        raise ValueError(f"Unknown queue kind: {kind!r} -- must be one of new_jobs/active/closings/completed")

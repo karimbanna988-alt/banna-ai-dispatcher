@@ -378,3 +378,47 @@ def test_no_real_network_imports_in_application_layer():
         source = pathlib.Path(f).read_text(encoding="utf-8")
         assert "import requests" not in source
         assert "urllib" not in source
+
+
+# --------------------------------------------------------------- get_queue
+def test_get_queue_without_reader_raises_clear_runtime_error(service):
+    with pytest.raises(RuntimeError, match="QueueReader"):
+        service.get_queue("active")
+
+
+def test_get_queue_with_injected_reader_delegates_to_it(conn):
+    from dispatcher.application import DispatcherService
+
+    class _FakeQueueReader:
+        def __init__(self):
+            self.calls = []
+
+        def read_queue(self, conn, kind):
+            self.calls.append(kind)
+            return [f"fake-{kind}"]
+
+    reader = _FakeQueueReader()
+    service_with_reader = DispatcherService(conn, queue_reader=reader)
+    result = service_with_reader.get_queue("active")
+    assert result == ["fake-active"]
+    assert reader.calls == ["active"]
+
+
+def test_luxor_desk_queue_reader_implements_the_protocol(desk_env_conn):
+    """Real, end-to-end wiring check: luxor_desk_read_model.LuxorDeskQueueReader
+    actually satisfies what DispatcherService.get_queue() needs, against
+    a real (temporary) database."""
+    import sys
+    sys.path.insert(0, ".")
+    import luxor_desk_read_model as rm
+    from dispatcher.application import DispatcherService
+
+    service_with_real_reader = DispatcherService(desk_env_conn, queue_reader=rm.LuxorDeskQueueReader())
+    for kind in ("new_jobs", "active", "closings", "completed"):
+        result = service_with_real_reader.get_queue(kind)
+        assert isinstance(result, list)
+
+
+@pytest.fixture()
+def desk_env_conn(tmp_path):
+    return storage.connect(tmp_path / "desk_env.db")

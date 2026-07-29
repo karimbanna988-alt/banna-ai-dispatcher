@@ -212,6 +212,30 @@ def require_login() -> None:
         st.stop()
 
 
+def require_current_schema(conn) -> bool:
+    """Guards a write-capable workspace against a not-yet-migrated
+    database. Rendering must never trigger a migration (see
+    storage.connect()'s own docstring) -- this only *checks*
+    (storage.check_schema_status() is read-only) and, if the schema is
+    behind, shows one concise message plus the exact local command to
+    run and returns False so the caller can skip rendering write
+    actions for this workspace. Read-only pages (Technicians, Activity)
+    never call this -- they work correctly regardless of schema state."""
+    import streamlit as st
+
+    from dispatcher import storage
+
+    status = storage.check_schema_status(conn)
+    if status.up_to_date:
+        return True
+    st.warning(
+        "Database upgrade required — this workspace's write actions are disabled until the "
+        "schema is migrated.\n\n"
+        f"Run: `python scripts/manage_schema.py migrate --db {storage.DB_PATH}`"
+    )
+    return False
+
+
 def urgency_dot_color(urgency: str) -> str:
     return URGENCY_COLORS.get(urgency, MUTED)
 
@@ -304,6 +328,11 @@ def render_job_workspace(conn, entry) -> None:
         f'<span class="desk-chip-outline">{eligible[0]["name"] if len(eligible) == 1 else (str(len(eligible)) + " eligible" if eligible else "No technician configured")}</span></div>',
         unsafe_allow_html=True,
     )
+
+    if not require_current_schema(conn):
+        with st.expander("View details"):
+            _render_details(conn, item, job, area_label, market_label, eligible, resolution)
+        return
 
     needs_review = bool(result.decision.missing_information) or bool(classify_result.conflicting_fields)
 
@@ -526,6 +555,9 @@ def render_active_job_workspace(conn, job_id: int) -> None:
             f' · {shared.humanize_timestamp(latest["created_at"])}</div>',
             unsafe_allow_html=True,
         )
+
+    if not require_current_schema(conn):
+        return
     else:
         st.caption("No technician update recorded yet.")
 
@@ -633,6 +665,9 @@ def render_closing_workspace(conn, job_id: int) -> None:
         f'<div class="desk-meta">Technician: <strong>{job["assigned_technician_name"] or "Unassigned"}</strong></div>',
         unsafe_allow_html=True,
     )
+
+    if not require_current_schema(conn):
+        return
 
     if job["status"] != "Closed":
         st.caption("No closing recorded yet for this job.")

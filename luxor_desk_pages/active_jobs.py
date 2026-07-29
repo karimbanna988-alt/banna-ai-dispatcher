@@ -26,6 +26,9 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+if not shared_desk.require_current_schema(conn):
+    conn.close()
+    st.stop()
 active = rm.get_active_jobs_detailed(conn)
 
 st.caption(f"{len(active)} active job(s)")

@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from typing import List, Optional
+from typing import List, Optional, Protocol
 
 from . import closing as closing_module
 from . import storage, updates
@@ -83,6 +83,22 @@ def compute_idempotency_key(identity, action: str, fingerprint_text: str = "") -
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
+class QueueReader(Protocol):
+    """Seam for the one read this module cannot serve on its own
+    without either duplicating luxor_desk_read_model.py's dedup/
+    canonicalization logic or importing that repo-root, UI-adjacent
+    module directly (a prohibited dependency direction -- application
+    code must never import a luxor_desk_* module; see
+    docs/ARCHITECTURE_FOUNDATION.md and
+    tests/test_dependency_boundaries.py). A concrete implementation
+    lives at the repo root (luxor_desk_read_model.LuxorDeskQueueReader)
+    and is constructed by the UI layer, which already depends on that
+    module -- application.py itself never imports it, at module scope
+    or inside any method."""
+
+    def read_queue(self, conn: sqlite3.Connection, kind: str) -> list: ...
+
+
 class DispatcherService:
     """One instance per request/page-render, wrapping one
     sqlite3.Connection -- mirrors how every luxor_desk_pages/*.py file
@@ -93,10 +109,12 @@ class DispatcherService:
         conn: sqlite3.Connection,
         whatsapp_adapter: Optional[WhatsAppHandoffAdapter] = None,
         quo_adapter: Optional[QuoOutboundAdapter] = None,
+        queue_reader: Optional[QueueReader] = None,
     ) -> None:
         self.conn = conn
         self.whatsapp_adapter = whatsapp_adapter or ManualWhatsAppHandoffAdapter()
         self.quo_adapter = quo_adapter or DisabledQuoOutboundAdapter()
+        self.queue_reader = queue_reader
 
     # --------------------------------------------- New Job / dispatch -----
     def acknowledge_job_manually(self, message_id: str) -> ActionResult:
@@ -401,26 +419,16 @@ class DispatcherService:
         return storage.get_audit_timeline_by_job_id(self.conn, job_id)
 
     def get_queue(self, kind: str) -> list:
-        """Convenience read for the four operational queues. Unlike
-        every command above, this method lazily imports the existing
-        repo-root read model (luxor_desk_read_model.py /
-        luxor_ops_shared.py) rather than reimplementing its display-
-        formatting/dedup logic a second time -- "do not duplicate
-        storage logic" applies here too, and that logic already exists,
-        tested, in one place. This is the one method on this class with
-        a soft dependency on the repo root being importable (true
-        whenever a luxor_desk_pages/*.py caller reaches this point,
-        since it already added the repo root to sys.path to import this
-        module in the first place)."""
-        import luxor_desk_read_model as rm  # local import: lives at repo root, not under src/
-
-        if kind == "new_jobs":
-            live, _backlog, _other = rm.get_live_dispatch_queue(self.conn)
-            return live
-        if kind == "active":
-            return rm.get_active_jobs_detailed(self.conn)
-        if kind == "closings":
-            return rm.get_closing_candidates(self.conn)
-        if kind == "completed":
-            return rm.get_completed_jobs(self.conn)
-        raise ValueError(f"Unknown queue kind: {kind!r} -- must be one of new_jobs/active/closings/completed")
+        """Convenience read for the four operational queues. This
+        module never imports the repo-root read model itself (see
+        QueueReader's own docstring for why) -- a caller must inject a
+        QueueReader implementation via the constructor. Raises
+        RuntimeError, not an import error, when none was provided, so
+        the failure is obviously about missing wiring, not a broken
+        import path."""
+        if self.queue_reader is None:
+            raise RuntimeError(
+                "DispatcherService.get_queue() requires a QueueReader to be injected "
+                "via the constructor -- none was provided. See docs/ARCHITECTURE_FOUNDATION.md."
+            )
+        return self.queue_reader.read_queue(self.conn, kind)

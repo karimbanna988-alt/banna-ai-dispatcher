@@ -24,6 +24,9 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+if not shared_desk.require_current_schema(conn):
+    conn.close()
+    st.stop()
 candidates = rm.get_closing_candidates(conn)
 
 st.caption(f"{len(candidates)} job(s) in the closing workflow")
