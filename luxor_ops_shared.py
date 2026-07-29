@@ -133,8 +133,10 @@ def fetch_jobs(conn: sqlite3.Connection) -> list[dict]:
 
     sql = """
         SELECT jobs.id, jobs.source, jobs.ticket_number, jobs.status,
+               jobs.reconciliation_state,
                jobs.created_at, jobs.updated_at, jobs.last_event_at,
-               jobs.latest_fields_json, technicians.name AS assigned_technician_name
+               jobs.latest_fields_json, technicians.name AS assigned_technician_name,
+               technicians.dispatch_group AS assigned_technician_dispatch_group
         FROM jobs
         LEFT JOIN technicians ON technicians.id = jobs.assigned_technician_id
         ORDER BY COALESCE(jobs.last_event_at, jobs.updated_at) DESC

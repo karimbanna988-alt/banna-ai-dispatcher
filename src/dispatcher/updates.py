@@ -72,6 +72,47 @@ def map_status_to_reply(raw_text: str) -> StandardReply:
     )
 
 
+_UPDATE_TYPE_REPLIES = {
+    "Going": "Going",
+    "No Answer": "No answer",
+    "No Show": "No show",
+    "Not Available": "Technician not available",
+    "Customer Cancelled": "Customer cancelled",
+    "Completed": "Completed",
+}
+
+
+def reply_for_update_type(update_type: str, eta_minutes: Optional[int] = None) -> StandardReply:
+    """Deterministic company-facing reply for one of the dispatcher-
+    selected technician update types (Active Jobs' RECORD TECH UPDATE --
+    the type is always explicitly picked by the dispatcher after reading
+    the technician's real reply, never inferred from free text). "Custom"
+    always comes back unconfirmed: composing a safe company-facing
+    message for an update that doesn't fit a known type is a human's job,
+    not this function's -- matching map_status_to_reply()'s own "never
+    invents a status" rule.
+    """
+    if update_type == "ETA":
+        if not eta_minutes:
+            return StandardReply(
+                reply=None, confirmed=False, raw_input=update_type,
+                reason="ETA update requires a minutes value -- never invented",
+            )
+        return StandardReply(
+            reply=f"Tech ETA {eta_minutes} min", confirmed=True, raw_input=update_type,
+            reason="dispatcher-selected ETA update",
+        )
+    if update_type in _UPDATE_TYPE_REPLIES:
+        return StandardReply(
+            reply=_UPDATE_TYPE_REPLIES[update_type], confirmed=True, raw_input=update_type,
+            reason="dispatcher-selected technician update type",
+        )
+    return StandardReply(
+        reply=None, confirmed=False, raw_input=update_type,
+        reason="custom/unrecognized update type -- requires human review before a company reply can be sent",
+    )
+
+
 def answer_from_latest_status(latest: Optional[StandardReply]) -> StandardReply:
     """Used for company questions like "Any update?" or "Did anyone call?" --
     "Did anyone call?" means whether OUR technician called the customer, and

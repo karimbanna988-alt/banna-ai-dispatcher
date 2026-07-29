@@ -1,10 +1,12 @@
-"""Active Jobs -- real committed jobs currently active. Same
-shared.fetch_jobs()/ACTIVE_STATUSES query luxor_console_pages/active_jobs.py
-already uses, via luxor_desk_read_model.get_active_jobs(). Clicking a job
-opens the same Dispatch workspace pattern is meant for -- since active
-jobs are already committed (no longer pending messages), this page shows
-their latest status/technician/timing directly rather than re-opening
-the message-workspace UI, matching Phase 7's own field list."""
+"""Active Jobs -- the real dispatcher workspace for already-dispatched
+jobs: record a technician's real WhatsApp reply, prepare/copy/mark-sent
+the company-facing update, pass/cancel with a reason, or move on to
+Closing once the technician reports Completed. Reuses
+luxor_desk_read_model/luxor_desk_shared exactly like New Jobs -- every
+write goes through the purpose-built dispatcher.storage.* operational
+methods (job_id + validated input), never a second database, parser, or
+state machine.
+"""
 
 from __future__ import annotations
 
@@ -18,34 +20,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import luxor_desk_read_model as rm
 import luxor_desk_shared as shared_desk
-import luxor_ops_shared as shared
 from dispatcher import storage
 
 if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
-active = rm.get_active_jobs(conn)
+active = rm.get_active_jobs_detailed(conn)
 
 st.caption(f"{len(active)} active job(s)")
+
+selected_id = None
 if not active:
     st.info("No active jobs right now.")
+else:
+    ids = [j["id"] for j in active]
+    selected_id = st.session_state.get("desk_active_selected")
+    if selected_id not in ids:
+        selected_id = ids[0]
+    st.session_state.desk_active_selected = selected_id
 
-for job in active:
-    st.markdown(
-        f'<div class="desk-card-top">'
-        f'{shared_desk.source_chip_html(job["source"])}'
-        f'<span class="desk-ticket">{job["ticket_number"]}</span>'
-        f'<span class="desk-age">{shared.humanize_timestamp(job["last_event_at"] or job["updated_at"])}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f'<div class="desk-meta">{job["service_area"]} · {job["description"]}</div>'
-        f'<div class="desk-meta">Technician: <strong>{job["assigned_technician_name"] or "Unassigned"}</strong> · '
-        f'Status: <strong>{job["status"]}</strong></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="desk-divider"></div>', unsafe_allow_html=True)
+with st.container(key="desk_layout"):
+    with st.container(key="desk_area_workspace"):
+        if selected_id is not None:
+            shared_desk.render_active_job_workspace(conn, selected_id)
+
+    with st.container(key="desk_area_queue"):
+        if active:
+            st.markdown(f'<div class="desk-section-title">Active Jobs ({len(active)})</div>', unsafe_allow_html=True)
+            for job in active:
+                subtitle = f"{job['assigned_technician_name'] or 'Unassigned'} — {shared_desk.active_job_next_action_label(job)}"
+                shared_desk.render_job_row(job, job["id"], selected_id, "active", subtitle)
 
 conn.close()

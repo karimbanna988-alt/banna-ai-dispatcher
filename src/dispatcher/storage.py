@@ -46,6 +46,13 @@ class MessageType(str, Enum):
     # a technician was assigned, reassigned, or removed for this job. See
     # assign_technician() and derive_job_status().
     ASSIGNMENT = "ASSIGNMENT"
+    # Dispatcher-confirmed administrative fact about an already-established
+    # job -- a company update/closing was prepared or sent manually, or the
+    # job was completed. Always preserves the job's existing status (see
+    # derive_job_status()) -- exactly like ASSIGNMENT, these never move the
+    # operational lifecycle on their own. See record_technician_update()
+    # and friends below.
+    OPERATIONAL_NOTE = "OPERATIONAL_NOTE"
 
 
 @dataclass
@@ -125,6 +132,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_whatsapp_handoff_support(conn)
     _add_outbound_log_support(conn)
     _add_closing_and_reconciliation_support(conn)
+    _add_technician_update_support(conn)
     _add_dispatch_tracking_support(conn)
     _add_console_activation_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
@@ -584,6 +592,22 @@ def _add_closing_and_reconciliation_support(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _add_technician_update_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same idempotent PRAGMA table_info pattern as every
+    other migration in this module. Two nullable columns on `events`:
+    `update_type` is one of the fixed, dispatcher-selected technician-
+    update-type labels (see record_technician_update()) -- never inferred
+    from free text; `eta_minutes` is only ever populated for
+    update_type == "ETA", straight from what the dispatcher entered,
+    never estimated."""
+    existing_event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "update_type" not in existing_event_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN update_type TEXT")
+    if "eta_minutes" not in existing_event_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN eta_minutes INTEGER")
+    conn.commit()
+
+
 def _add_dispatch_tracking_support(conn: sqlite3.Connection) -> None:
     """Additive only, same pattern as every other migration in this
     module. Speed Dispatch Console lifecycle timestamps -- keyed by
@@ -942,7 +966,13 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
         return "Needs Review"
 
     if message_type == MessageType.CANCELLATION.value:
-        if final_action in _APPROVE_LIKE_ACTIONS:
+        # "Pass"/"Cancel" are the dispatcher-initiated PASS / CANCEL action
+        # on an already-active job (see pass_or_cancel_job()) -- both are
+        # confirmatory, same as Approve/Edit is for an inbound cancellation
+        # report; there is deliberately no behavioral difference between
+        # "Pass" and "Cancel" here, matching the combined PASS / CANCEL
+        # button in the Active Jobs workspace.
+        if final_action in _APPROVE_LIKE_ACTIONS or final_action in ("Pass", "Cancel"):
             return "Cancelled"
         if final_action == "Reject":
             return prev
@@ -967,6 +997,15 @@ def derive_job_status(previous_status: Optional[str], message_type: str, final_a
         if final_action in ("Assign", "Reassign", "Remove"):
             return prev
         return "Needs Review"
+
+    if message_type == MessageType.OPERATIONAL_NOTE.value:
+        # A prepared/sent-manually/completion confirmation is an
+        # administrative fact about a job that is already in some real
+        # lifecycle stage -- it must never move that stage on its own,
+        # exactly like ASSIGNMENT above. complete_job() separately sets
+        # jobs.reconciliation_state, which is intentionally orthogonal to
+        # status (see _add_closing_and_reconciliation_support's docstring).
+        return prev
 
     return "Needs Review"  # unknown/malformed message_type -- safest fallback
 
@@ -1166,6 +1205,336 @@ def list_jobs(
     rows = cur.fetchall()
     columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+# ------------------------------------------------- Operational job actions -
+# Purpose-built methods for acting on an ALREADY-COMMITTED job (job_id +
+# whatever's actually persisted for it), for the Active Jobs / Closings /
+# Completed workflows. These deliberately do NOT go through
+# save_audit_entry(), which requires a full ExtractedJob -- a committed
+# jobs row only has a flattened latest_fields_json snapshot, and
+# reconstructing a fake ExtractedJob (fabricating raw_text/confidence/
+# status_reasons that were never persisted) just to satisfy that older
+# function's signature was the explicitly rejected approach. Every method
+# below instead: (1) fetches the current persisted job via get_job_by_id(),
+# (2) validates the action is legal for that job's current state (raising
+# InvalidJobActionError otherwise), (3) derives the new status through the
+# one existing deterministic authority, derive_job_status() -- never a
+# second state machine, (4) inserts one append-only events row and updates
+# the jobs snapshot in a single transaction via _insert_operational_event(),
+# and (5) returns the freshly-read updated job state. None of these ever
+# sends anything externally -- they only record that a human confirmed a
+# fact.
+
+class InvalidJobActionError(ValueError):
+    """Raised when an action is not legal for a job's current persisted
+    state (e.g. recording a closing for a job that was never dispatched,
+    completing a job with no closing on record). Distinct from a plain
+    ValueError, which this module still uses for missing/malformed input
+    (bad job_id, empty required text) -- this is specifically an illegal
+    state-transition, so callers can tell the two apart if they want to."""
+
+
+def get_job_by_id(conn: sqlite3.Connection, job_id: int) -> Optional[dict]:
+    """The current persisted state of one job, as a plain dict -- the
+    single read path every operational method below (and the Active
+    Jobs/Closings/Completed pages) uses to look up a committed job.
+    Never returns or requires an ExtractedJob."""
+    row = conn.execute(
+        """
+        SELECT jobs.id, jobs.source, jobs.ticket_number, jobs.status,
+               jobs.reconciliation_state, jobs.assigned_technician_id,
+               jobs.latest_fields_json, jobs.created_at, jobs.updated_at,
+               jobs.last_event_at, technicians.name AS assigned_technician_name,
+               technicians.dispatch_group AS assigned_technician_dispatch_group
+        FROM jobs
+        LEFT JOIN technicians ON technicians.id = jobs.assigned_technician_id
+        WHERE jobs.id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    columns = (
+        "id", "source", "ticket_number", "status", "reconciliation_state",
+        "assigned_technician_id", "latest_fields_json", "created_at", "updated_at",
+        "last_event_at", "assigned_technician_name", "assigned_technician_dispatch_group",
+    )
+    d = dict(zip(columns, row))
+    d["fields"] = json.loads(d.pop("latest_fields_json") or "{}")
+    return d
+
+
+def _insert_operational_event(
+    conn: sqlite3.Connection, *, job_id: int, source: str, ticket_number: Optional[str],
+    message_type: str, final_action: Optional[str], raw_message: str = "",
+    update_type: Optional[str] = None, eta_minutes: Optional[int] = None,
+    luxor_message: Optional[str] = None, dispatcher_edits: Optional[str] = None,
+    closing_amount: Optional[str] = None, closing_payment_method: Optional[str] = None,
+    closing_parts_amount: Optional[str] = None, closing_company_share: Optional[str] = None,
+    closing_technician_share: Optional[str] = None, set_reconciliation_state: Optional[str] = None,
+    channel: str = "manual",
+) -> int:
+    """The one transactional write path every operational method below
+    uses: insert one append-only events row, derive the new job status
+    through derive_job_status() (the same single authority
+    save_audit_entry() already uses), and update the jobs snapshot --
+    event insert + status/reconciliation update all in one SQLite
+    transaction, so a job can never end up with an audit event recorded
+    but its snapshot left stale, or vice versa."""
+    now = _now()
+    previous_status_row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    previous_status = previous_status_row[0] if previous_status_row else "New"
+    new_status = derive_job_status(previous_status, message_type, final_action)
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            """
+            INSERT INTO events (
+                job_id, ticket_number, raw_message, message_type, source,
+                luxor_message, dispatcher_edits, final_action, created_at, channel,
+                update_type, eta_minutes,
+                closing_amount, closing_payment_method, closing_parts_amount,
+                closing_company_share, closing_technician_share
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id, ticket_number, raw_message, message_type, source,
+                luxor_message, dispatcher_edits, final_action, now, channel,
+                update_type, eta_minutes,
+                closing_amount, closing_payment_method, closing_parts_amount,
+                closing_company_share, closing_technician_share,
+            ),
+        )
+        event_id = cur.lastrowid
+        if set_reconciliation_state is not None:
+            conn.execute(
+                "UPDATE jobs SET status = ?, reconciliation_state = ?, last_event_id = ?, last_event_at = ?, updated_at = ? WHERE id = ?",
+                (new_status, set_reconciliation_state, event_id, now, now, job_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET status = ?, last_event_id = ?, last_event_at = ?, updated_at = ? WHERE id = ?",
+                (new_status, event_id, now, now, job_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return event_id
+
+
+_TECHNICIAN_UPDATE_TYPES = frozenset({
+    "Going", "ETA", "No Answer", "No Show", "Not Available",
+    "Customer Cancelled", "Completed", "Custom",
+})
+_TERMINAL_NO_FURTHER_ACTION_STATUSES = frozenset({"Cancelled", "Rejected"})
+
+
+def record_technician_update(
+    conn: sqlite3.Connection, job_id: int, update_type: str, raw_update: str,
+    eta_minutes: Optional[int] = None,
+) -> dict:
+    """Records a technician's real WhatsApp reply against an already-
+    committed job. `update_type` is always dispatcher-selected from the
+    fixed set below -- never inferred from the pasted text, matching
+    updates.py's "never invent a status" rule. Every recognized type
+    (everything except "Custom") derives to "In Progress" -- a confirmed
+    report, not a claim that the job is finished (that only ever happens
+    through the closing workflow). "Custom" -- an update that doesn't fit
+    any of the deterministic types -- derives to "Needs Review" instead,
+    since this module cannot safely interpret it on its own."""
+    if update_type not in _TECHNICIAN_UPDATE_TYPES:
+        raise ValueError(
+            f"Unknown technician update type: {update_type!r} -- must be one of "
+            f"{sorted(_TECHNICIAN_UPDATE_TYPES)}"
+        )
+    if update_type == "ETA" and not eta_minutes:
+        raise ValueError("ETA updates require eta_minutes -- never invented")
+    if not raw_update or not raw_update.strip():
+        raise ValueError("raw_update (the technician's actual reply) is required")
+
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] in _TERMINAL_NO_FURTHER_ACTION_STATUSES:
+        raise InvalidJobActionError(
+            f"Cannot record a technician update for job {job_id} -- status is {job['status']!r}"
+        )
+
+    final_action = "Approve" if update_type != "Custom" else None
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.STATUS.value, final_action=final_action,
+        raw_message=raw_update.strip(), update_type=update_type, eta_minutes=eta_minutes,
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def mark_company_update_prepared(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+    """Records that a company-facing status update was prepared -- never
+    claims it was sent (see mark_company_update_sent_manually for that
+    separate, explicit confirmation)."""
+    if not prepared_text or not prepared_text.strip():
+        raise ValueError("prepared_text is required")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    has_update = conn.execute(
+        "SELECT 1 FROM events WHERE job_id = ? AND message_type = ? AND update_type IS NOT NULL LIMIT 1",
+        (job_id, MessageType.STATUS.value),
+    ).fetchone()
+    if not has_update:
+        raise InvalidJobActionError(
+            f"Cannot prepare a company update for job {job_id} -- no technician update has been recorded yet"
+        )
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Update Prepared",
+        luxor_message=prepared_text.strip(),
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def mark_company_update_sent_manually(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+    """Only explicit confirmation -- this call -- ever records that a
+    company update was actually sent. Preparing or copying it never does."""
+    if not prepared_text or not prepared_text.strip():
+        raise ValueError("prepared_text is required")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Update Sent Manually",
+        luxor_message=prepared_text.strip(),
+    )
+    return get_job_by_id(conn, job_id)
+
+
+_PASS_CANCEL_ACTIONS = frozenset({"Pass", "Cancel"})
+
+
+def pass_or_cancel_job(conn: sqlite3.Connection, job_id: int, final_action: str, reason: str) -> dict:
+    """The single dispatcher-initiated pass/cancel action for an already-
+    active job -- always requires a reason, always creates an audit
+    event. "Pass" and "Cancel" are both accepted (matching the combined
+    PASS / CANCEL button) and behave identically: the job's status
+    becomes "Cancelled"."""
+    if final_action not in _PASS_CANCEL_ACTIONS:
+        raise ValueError(f"final_action must be one of {sorted(_PASS_CANCEL_ACTIONS)}, got {final_action!r}")
+    if not reason or not reason.strip():
+        raise ValueError("reason is required to pass/cancel a job")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] in _TERMINAL_NO_FURTHER_ACTION_STATUSES or job["status"] == "Closed":
+        raise InvalidJobActionError(f"Cannot pass/cancel job {job_id} -- status is already {job['status']!r}")
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.CANCELLATION.value, final_action=final_action,
+        raw_message="", dispatcher_edits=f"Reason: {reason.strip()}",
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def record_job_closing(
+    conn: sqlite3.Connection, job_id: int, raw_closing: str,
+    final_amount: Optional[str] = None, payment_method: Optional[str] = None,
+    parts: Optional[str] = None, company_share: Optional[str] = None,
+    technician_share: Optional[str] = None,
+) -> dict:
+    """Records a real closing -- from an incoming Quo closing/reply, a
+    technician closing pasted from WhatsApp, or a dispatcher-entered
+    record -- against an already-committed job. Only ever stores values
+    actually supplied; a missing amount/payment method stays missing,
+    never invented or calculated. `raw_closing` (the technician's actual
+    closing text) is the one required field -- structured amount/payment/
+    parts/shares are all optional, exactly as much as was really
+    reported."""
+    if not raw_closing or not raw_closing.strip():
+        raise ValueError("raw_closing (the technician's actual closing text) is required")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] in _TERMINAL_NO_FURTHER_ACTION_STATUSES:
+        raise InvalidJobActionError(f"Cannot record a closing for job {job_id} -- status is {job['status']!r}")
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.CLOSING.value, final_action="Approve",
+        raw_message=raw_closing.strip(),
+        closing_amount=final_amount or None, closing_payment_method=payment_method or None,
+        closing_parts_amount=parts or None, closing_company_share=company_share or None,
+        closing_technician_share=technician_share or None,
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def mark_company_closing_prepared(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+    """Requires a closing to already be on record (job.status == "Closed",
+    set by record_job_closing()) -- never claims a closing was prepared
+    for a job that was never actually closed."""
+    if not prepared_text or not prepared_text.strip():
+        raise ValueError("prepared_text is required")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] != "Closed":
+        raise InvalidJobActionError(
+            f"Cannot prepare a company closing for job {job_id} -- no closing has been recorded "
+            f"yet (status is {job['status']!r})"
+        )
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Closing Prepared",
+        luxor_message=prepared_text.strip(),
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def mark_company_closing_sent_manually(conn: sqlite3.Connection, job_id: int, prepared_text: str) -> dict:
+    """Only explicit confirmation -- this call -- ever records that a
+    company closing was actually sent. Preparing or copying it never does."""
+    if not prepared_text or not prepared_text.strip():
+        raise ValueError("prepared_text is required")
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] != "Closed":
+        raise InvalidJobActionError(f"Cannot mark a company closing sent for job {job_id} -- status is {job['status']!r}")
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Company Closing Sent Manually",
+        luxor_message=prepared_text.strip(),
+    )
+    return get_job_by_id(conn, job_id)
+
+
+def complete_job(conn: sqlite3.Connection, job_id: int) -> dict:
+    """The final terminal action -- requires the job to already be
+    "Closed" (i.e. a real closing was recorded via record_job_closing())
+    per the existing deterministic transition authority; raises
+    InvalidJobActionError otherwise. Sets jobs.reconciliation_state to
+    "Settled" (the same financial-settlement concept mark_job_settled()
+    already writes) and records one final OPERATIONAL_NOTE event, both in
+    the same transaction. Idempotent: completing an already-settled job
+    is a safe no-op rather than a duplicate audit event."""
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    if job["status"] != "Closed":
+        raise InvalidJobActionError(
+            f"Cannot complete job {job_id} from status {job['status']!r} -- a closing must be "
+            "recorded first (record_job_closing)."
+        )
+    if job["reconciliation_state"] == "Settled":
+        return job
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action="Job Completed",
+        set_reconciliation_state="Settled",
+    )
+    return get_job_by_id(conn, job_id)
 
 
 # ------------------------------------------------ Technician assignment ----

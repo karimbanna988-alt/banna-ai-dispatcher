@@ -219,6 +219,74 @@ def get_active_jobs(conn: sqlite3.Connection) -> list[dict]:
     return [j for j in jobs if j["status"] in shared.ACTIVE_STATUSES]
 
 
+def get_latest_technician_update(conn: sqlite3.Connection, job_id: int) -> Optional[dict]:
+    """Most recent recorded technician update (a STATUS event carrying a
+    dispatcher-selected update_type) for a job -- None if none has ever
+    been recorded. Never invents a status; a job with nothing recorded
+    yet must show that plainly, not a guessed default."""
+    row = conn.execute(
+        "SELECT update_type, eta_minutes, raw_message, created_at FROM events "
+        "WHERE job_id = ? AND message_type = ? AND update_type IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (job_id, MessageType.STATUS.value),
+    ).fetchone()
+    if row is None:
+        return None
+    columns = ("update_type", "eta_minutes", "raw_message", "created_at")
+    return dict(zip(columns, row))
+
+
+ACTIVE_JOB_WORKSPACE_STATUSES = shared.ACTIVE_STATUSES | {"Needs Review"}
+
+
+def get_active_jobs_detailed(conn: sqlite3.Connection) -> list[dict]:
+    """Everything the Active Jobs workspace needs: each active job plus
+    its latest technician update. Deliberately broader than
+    get_active_jobs()/shared.ACTIVE_STATUSES -- a job that landed on
+    "Needs Review" because a Custom/ambiguous technician update couldn't
+    be safely interpreted must stay visible and actionable here, not
+    silently vanish from the workspace the dispatcher needs to resolve
+    it from."""
+    jobs = shared.fetch_jobs(conn)
+    jobs = [j for j in jobs if j["status"] in ACTIVE_JOB_WORKSPACE_STATUSES]
+    for job in jobs:
+        job["latest_technician_update"] = get_latest_technician_update(conn, job["id"])
+    return jobs
+
+
+def get_closing_candidates(conn: sqlite3.Connection) -> list[dict]:
+    """Jobs ready for the Closings workspace: dispatched jobs still "In
+    Progress" (ready to receive a technician's closing) plus jobs already
+    "Closed" but not yet reconciliation_state == "Settled" (closing
+    recorded, awaiting company-closing dispatch and COMPLETE JOB). A job
+    can legitimately appear here and in Active Jobs at the same time --
+    the two pages offer different, non-exclusive actions on the same
+    underlying job."""
+    jobs = shared.fetch_jobs(conn)
+    result = []
+    for j in jobs:
+        if j["status"] == "In Progress":
+            result.append(j)
+        elif j["status"] == "Closed" and j.get("reconciliation_state") != "Settled":
+            result.append(j)
+    return result
+
+
+def get_completed_jobs(conn: sqlite3.Connection) -> list[dict]:
+    """Jobs with a real final status: Closed + reconciliation_state ==
+    "Settled" (via complete_job()), or Cancelled/Rejected. This is the
+    Completed / History page's query -- normal dispatch history belongs
+    here, not on the generic Activity feed."""
+    jobs = shared.fetch_jobs(conn)
+    result = []
+    for j in jobs:
+        if j["status"] in ("Cancelled", "Rejected"):
+            result.append(j)
+        elif j["status"] == "Closed" and j.get("reconciliation_state") == "Settled":
+            result.append(j)
+    return result
+
+
 def get_pending_closings(conn: sqlite3.Connection) -> list[dict]:
     """Real closed jobs awaiting reconciliation -- same query
     luxor_console_pages/closings.py already uses. Amount/payment method

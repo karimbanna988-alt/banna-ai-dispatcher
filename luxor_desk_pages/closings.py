@@ -1,7 +1,10 @@
-"""Closings -- only real closing work. A closing only ever appears here
-when storage.get_latest_closing_details() returns a real structured
-record for that job; amount/payment method are never invented. Empty
-state is literal, never a fabricated placeholder card."""
+"""Closings -- the real dispatcher workspace: enter a technician's real
+closing (from Quo, a WhatsApp paste, or an already-persisted record),
+prepare/copy/mark-sent the company-specific closing message via the
+existing closing.py formatter, and complete the job. Every write goes
+through the purpose-built dispatcher.storage.* operational methods --
+no second closing template, no second state machine.
+"""
 
 from __future__ import annotations
 
@@ -21,29 +24,30 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
-unsettled = rm.get_pending_closings(conn)
+candidates = rm.get_closing_candidates(conn)
 
-st.caption(f"{len(unsettled)} closed job(s) awaiting reconciliation")
-if not unsettled:
+st.caption(f"{len(candidates)} job(s) in the closing workflow")
+
+selected_id = None
+if not candidates:
     st.success("No closings awaiting action.")
+else:
+    ids = [j["id"] for j in candidates]
+    selected_id = st.session_state.get("desk_closings_selected")
+    if selected_id not in ids:
+        selected_id = ids[0]
+    st.session_state.desk_closings_selected = selected_id
 
-for job in unsettled:
-    details = storage.get_latest_closing_details(conn, job["id"])
-    st.markdown(
-        f'<div class="desk-card-top">'
-        f'{shared_desk.source_chip_html(job["source"])}'
-        f'<span class="desk-ticket">{job["ticket_number"]}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-    if details:
-        st.markdown(
-            f'<div class="desk-meta">Amount: <strong>{details["amount"] or "—"}</strong> · '
-            f'{details["payment_method"] or "Payment method not recorded"}</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.caption("No structured closing amount recorded yet for this job.")
-    st.markdown('<div class="desk-divider"></div>', unsafe_allow_html=True)
+with st.container(key="desk_layout"):
+    with st.container(key="desk_area_workspace"):
+        if selected_id is not None:
+            shared_desk.render_closing_workspace(conn, selected_id)
+
+    with st.container(key="desk_area_queue"):
+        if candidates:
+            st.markdown(f'<div class="desk-section-title">Closings ({len(candidates)})</div>', unsafe_allow_html=True)
+            for job in candidates:
+                subtitle = "Enter closing" if job["status"] != "Closed" else "Ready to send/complete"
+                shared_desk.render_job_row(job, job["id"], selected_id, "closings", subtitle)
 
 conn.close()

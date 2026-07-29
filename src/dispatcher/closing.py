@@ -9,10 +9,11 @@ architecture".
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 from .companies import get_company_profile
-from .models import ExtractedJob
+from .models import ExtractedJob, Source
 
 
 @dataclass
@@ -57,3 +58,28 @@ def render_closing(job: ExtractedJob, closing: ClosingInput) -> ClosingResult:
     )
 
     return ClosingResult(supported=True, text=text, reason=profile.closing_template.source_note)
+
+
+def render_closing_from_persisted_fields(
+    source: str, ticket_number: Optional[str], fields: dict, closing: ClosingInput,
+) -> ClosingResult:
+    """Same company-specific formatter as render_closing(), for a
+    committed job read back from storage -- deliberately never
+    reconstructs a full ExtractedJob. A committed job's persisted
+    latest_fields_json has no raw_text/confidence/status_reasons (those
+    only ever existed for the original in-memory extraction); inventing
+    placeholder values for them just to build a fake ExtractedJob is
+    exactly the fabrication this function avoids. It only reads the
+    handful of plain, already-persisted field values the shared closing
+    template actually needs (ticket_number/phone/address/service_type/
+    vehicle) via a minimal SimpleNamespace view -- never a value that
+    wasn't really stored."""
+    view = SimpleNamespace(
+        source=Source(source),
+        ticket_number=SimpleNamespace(value=ticket_number),
+        phone=SimpleNamespace(value=fields.get("phone")),
+        address=SimpleNamespace(value=fields.get("address")),
+        service_type=SimpleNamespace(value=fields.get("service_type")),
+        vehicle=SimpleNamespace(value=fields.get("vehicle")),
+    )
+    return render_closing(view, closing)
