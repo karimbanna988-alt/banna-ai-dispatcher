@@ -114,6 +114,38 @@ def test_approval_mode_never_sends_even_when_fully_configured(conn, monkeypatch)
     assert "not implemented" in result.reason.lower()
 
 
+def test_approval_mode_rejects_content_other_than_exact_k(conn, monkeypatch):
+    monkeypatch.setenv(outbound.OUTBOUND_MODE_ENV_VAR, "approval")
+    monkeypatch.setenv(outbound.SOURCE_ALLOWLIST_ENV_VAR, "AGN")
+    monkeypatch.setenv(outbound.TEST_RECIPIENT_ALLOWLIST_ENV_VAR, "TEST_CONTACT_1")
+    result = outbound.propose_send(
+        conn, make_request(quo_contact_id="TEST_CONTACT_1", text="Hello there"), approved_by="dispatcher1",
+    )
+    assert result.outcome == "blocked"
+    assert '"k"' in result.reason.lower()
+
+
+def test_approval_mode_blocks_already_acknowledged_job(conn, monkeypatch):
+    monkeypatch.setenv(outbound.OUTBOUND_MODE_ENV_VAR, "approval")
+    monkeypatch.setenv(outbound.SOURCE_ALLOWLIST_ENV_VAR, "AGN")
+    monkeypatch.setenv(outbound.TEST_RECIPIENT_ALLOWLIST_ENV_VAR, "TEST_CONTACT_1")
+    result = outbound.propose_send(
+        conn, make_request(quo_contact_id="TEST_CONTACT_1"), approved_by="dispatcher1", already_acknowledged=True,
+    )
+    assert result.outcome == "blocked"
+    assert "already been acknowledged" in result.reason.lower()
+
+
+def test_already_acknowledged_blocks_even_in_preview_mode(conn, monkeypatch):
+    """The already-acknowledged guard applies regardless of mode -- it's
+    checked before the mode branch at all."""
+    monkeypatch.setenv(outbound.OUTBOUND_MODE_ENV_VAR, "preview")
+    monkeypatch.setenv(outbound.SOURCE_ALLOWLIST_ENV_VAR, "AGN")
+    result = outbound.propose_send(conn, make_request(), already_acknowledged=True)
+    assert result.outcome == "blocked"
+    assert "already been acknowledged" in result.reason.lower()
+
+
 # ------------------------------------------------------------------- Live
 def test_live_mode_is_always_blocked_in_this_build(conn, monkeypatch):
     monkeypatch.setenv(outbound.OUTBOUND_MODE_ENV_VAR, "live")

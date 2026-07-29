@@ -123,17 +123,24 @@ def _send_live(conn: sqlite3.Connection, request: OutboundRequest) -> OutboundRe
 
 def propose_send(
     conn: sqlite3.Connection, request: OutboundRequest, *, approved_by: Optional[str] = None,
+    already_acknowledged: bool = False,
 ) -> OutboundResult:
     """The single entry point for any outbound attempt. Every branch that
     does not end in an actual send is a `return` -- there is no
-    fallthrough path into _send_live()."""
+    fallthrough path into a real send. `already_acknowledged` is the
+    caller's own determination (e.g. from dispatch_tracking.acknowledged_at)
+    that this exact job has already had an acknowledgment sent -- passed
+    in rather than looked up here, so this module stays decoupled from
+    the pending-queue/dispatch-tracking schema."""
     mode = current_mode()
 
     if storage.is_outbound_duplicate(conn, request.idempotency_key):
         result = OutboundResult("duplicate", "An identical request was already recorded.", request)
         return result
 
-    if kill_switch_engaged():
+    if already_acknowledged:
+        outcome, reason = "blocked", "This job has already been acknowledged -- refusing to send a duplicate acknowledgment."
+    elif kill_switch_engaged():
         outcome, reason = "blocked", "Global outbound kill switch is engaged."
     elif mode == OutboundMode.DISABLED:
         outcome, reason = "blocked", "Outbound is disabled (QUO_OUTBOUND_MODE=disabled)."
@@ -146,8 +153,20 @@ def propose_send(
             outcome, reason = "blocked", "Approval mode requires an explicit approved_by value."
         elif request.quo_contact_id not in _test_recipient_allowlist():
             outcome, reason = "blocked", "Recipient is not on the test-recipient allowlist."
+        elif request.text != "K":
+            outcome, reason = "blocked", 'Approval mode in this build only supports the exact acknowledgment text "K".'
         else:
-            outcome, reason = "blocked", "Approval-mode sending is not implemented in this build."
+            # Every approval-mode check has passed -- job identity,
+            # destination, exact content, not-already-acknowledged, kill
+            # switch off, source allowlisted, unique idempotency key. The
+            # actual send is still deliberately unimplemented (see
+            # _send_live's docstring), so this always ends up "blocked"
+            # in this build, never a real network call.
+            try:
+                _send_live(conn, request)
+                outcome, reason = "sent", "Sent successfully."  # unreachable in this build
+            except NotImplementedError as exc:
+                outcome, reason = "blocked", f"All approval-mode checks passed, but sending is not implemented in this build: {exc}"
     else:
         outcome, reason = "blocked", "Live outbound is not implemented in this build."
 

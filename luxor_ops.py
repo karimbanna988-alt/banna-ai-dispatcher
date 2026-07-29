@@ -68,7 +68,7 @@ routing_preview = st.Page("luxor_ops_pages/routing_preview.py", title="Technicia
 
 pg = st.navigation([
     operations, company_inbox, job_workspace, crm_jobs, closings_payments, activity, technicians, routing_preview,
-])
+], position="top")
 
 # Shared frame: rendered on every page, above the selected page's own
 # content. Deliberately compact -- one title line, one caption line, one

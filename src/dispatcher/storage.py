@@ -125,6 +125,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_whatsapp_handoff_support(conn)
     _add_outbound_log_support(conn)
     _add_closing_and_reconciliation_support(conn)
+    _add_dispatch_tracking_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -580,6 +581,90 @@ def _add_closing_and_reconciliation_support(conn: sqlite3.Connection) -> None:
     if "reconciliation_state" not in existing_job_columns:
         conn.execute("ALTER TABLE jobs ADD COLUMN reconciliation_state TEXT")
     conn.commit()
+
+
+def _add_dispatch_tracking_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same pattern as every other migration in this
+    module. Speed Dispatch Console lifecycle timestamps -- keyed by
+    quo_pending_messages.message_id (not job_id), since these milestones
+    (first seen, Luxor prepared, acknowledged, copied, WhatsApp opened)
+    all happen *before* a message is necessarily approved into a job.
+    "dispatched_manually_at" is the one milestone that coincides with the
+    real save_audit_entry()/mark_quo_pending_message_actioned() call --
+    recorded here too, purely for age/SLA display, never as an alternate
+    source of truth for whether a job was actually created (jobs/events
+    remain that source of truth, unchanged). Every column is nullable and
+    only ever set once, moving forward -- never backfilled for messages
+    that predate this table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dispatch_tracking (
+            message_id TEXT PRIMARY KEY,
+            first_seen_at TEXT,
+            luxor_prepared_at TEXT,
+            acknowledged_at TEXT,
+            copied_at TEXT,
+            whatsapp_opened_at TEXT,
+            dispatched_manually_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def get_dispatch_tracking(conn: sqlite3.Connection, message_id: str) -> dict:
+    """Always returns a dict with every known column, defaulting every
+    unset milestone to None -- never raises for a message with no
+    tracking row yet (the common case for a just-arrived message)."""
+    row = conn.execute("SELECT * FROM dispatch_tracking WHERE message_id = ?", (message_id,)).fetchone()
+    columns = ("message_id", "first_seen_at", "luxor_prepared_at", "acknowledged_at", "copied_at", "whatsapp_opened_at", "dispatched_manually_at")
+    if row is None:
+        return {c: (message_id if c == "message_id" else None) for c in columns}
+    return dict(zip(columns, row))
+
+
+def _touch_dispatch_tracking(conn: sqlite3.Connection, message_id: str, column: str) -> None:
+    """Sets `column` to now() the first time only -- calling this again
+    for the same message/column is a no-op (COALESCE keeps the original
+    timestamp), so re-clicking an action never overwrites a genuinely
+    earlier recorded milestone."""
+    assert column in (
+        "first_seen_at", "luxor_prepared_at", "acknowledged_at",
+        "copied_at", "whatsapp_opened_at", "dispatched_manually_at",
+    ), f"unknown dispatch_tracking column: {column}"
+    now = _now()
+    conn.execute(
+        f"""
+        INSERT INTO dispatch_tracking (message_id, {column}) VALUES (?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET {column} = COALESCE(dispatch_tracking.{column}, excluded.{column})
+        """,
+        (message_id, now),
+    )
+    conn.commit()
+
+
+def mark_first_seen(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "first_seen_at")
+
+
+def mark_luxor_prepared(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "luxor_prepared_at")
+
+
+def mark_acknowledged(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "acknowledged_at")
+
+
+def mark_copied(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "copied_at")
+
+
+def mark_whatsapp_opened(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "whatsapp_opened_at")
+
+
+def mark_dispatched_manually(conn: sqlite3.Connection, message_id: str) -> None:
+    _touch_dispatch_tracking(conn, message_id, "dispatched_manually_at")
 
 
 def _now() -> str:
