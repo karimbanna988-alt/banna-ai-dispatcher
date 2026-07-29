@@ -201,7 +201,7 @@ def require_login() -> None:
 
     if not st.session_state[AUTH_SESSION_KEY]:
         st.title("LUXOR LOCKSMITH")
-        st.caption("Operations Desk -- Visual Prototype (fabricated data only)")
+        st.caption("Operations Desk -- live dispatcher workspace (real data, Quo outbound disabled)")
         entered = st.text_input("Password", type="password", key="luxor_desk_password_input")
         if st.button("Enter", type="primary"):
             if hmac.compare_digest(entered, password):
