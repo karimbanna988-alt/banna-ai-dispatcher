@@ -126,6 +126,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_outbound_log_support(conn)
     _add_closing_and_reconciliation_support(conn)
     _add_dispatch_tracking_support(conn)
+    _add_console_activation_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -665,6 +666,90 @@ def mark_whatsapp_opened(conn: sqlite3.Connection, message_id: str) -> None:
 
 def mark_dispatched_manually(conn: sqlite3.Connection, message_id: str) -> None:
     _touch_dispatch_tracking(conn, message_id, "dispatched_manually_at")
+
+
+def _add_console_activation_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same pattern as quo_poll_state. Draws the line
+    between "historical development/shadow-mode backlog" and "genuinely
+    live queue" -- a message received before live_queue_started_at is
+    Previous Backlog (audit-only, never urgent, never counted); at or
+    after it, the message is eligible for the live actionable queue.
+    console_activation_state is a single row (id=1), same convention as
+    quo_poll_state. console_activation_audit keeps a permanent record of
+    every boundary change (initial activation + any manual reset) --
+    never overwritten, never deleted."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS console_activation_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            live_queue_started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS console_activation_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            old_value TEXT,
+            new_value TEXT NOT NULL,
+            changed_at TEXT NOT NULL,
+            note TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def get_live_queue_started_at(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT live_queue_started_at FROM console_activation_state WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+def ensure_live_queue_activated(conn: sqlite3.Connection) -> str:
+    """Idempotent: seeds the live-queue boundary to now() the first time
+    this is ever called for this database, and never again -- a later
+    app/process restart must NOT silently move the boundary forward
+    (that would quietly reclassify genuinely-live jobs as backlog). The
+    boundary only ever moves via the explicit, audited
+    reset_live_queue_boundary() action below."""
+    existing = get_live_queue_started_at(conn)
+    if existing:
+        return existing
+    now = _now()
+    conn.execute(
+        "INSERT INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)",
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO console_activation_audit (old_value, new_value, changed_at, note) VALUES (?, ?, ?, ?)",
+        (None, now, now, "Initial activation on first corrected-console launch"),
+    )
+    conn.commit()
+    return now
+
+
+def reset_live_queue_boundary(conn: sqlite3.Connection, note: str = "Manual reset") -> str:
+    """Explicit administrative action only -- never called automatically.
+    Everything before the new boundary becomes Previous Backlog; nothing
+    is deleted or rewritten. Always recorded in console_activation_audit,
+    including the prior boundary value, so the change itself is
+    auditable."""
+    old = get_live_queue_started_at(conn)
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET live_queue_started_at = excluded.live_queue_started_at, updated_at = excluded.updated_at
+        """,
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO console_activation_audit (old_value, new_value, changed_at, note) VALUES (?, ?, ?, ?)",
+        (old, now, now, note),
+    )
+    conn.commit()
+    return now
 
 
 def _now() -> str:

@@ -3,6 +3,18 @@ deterministically ordered. A raw message never becomes a dispatch card
 until it passes the existing job-transformation gate; acks/fragments
 land in a collapsed Other Messages section instead.
 
+Live-queue boundary (corrective fix, 2026-07-29): quo_pending_messages
+accumulates every message ever fetched, including historical
+development/shadow-mode backlog from long before this console existed.
+Only messages received at or after the durable console_activation_state
+boundary (storage.get_live_queue_started_at / ensure_live_queue_activated)
+are eligible to appear as live, urgent, waiting-for-dispatch work.
+Everything older is preserved unchanged for audit but rendered only in
+the collapsed Previous Backlog section -- never urgent, never counted as
+Waiting, never included in oldest-live-job timing, never a notification
+trigger. See storage.reset_live_queue_boundary() for the one explicit,
+audited, human-confirmed way to move that boundary.
+
 Real write actions (K/Handle Manually/Pass/Mark Dispatched) call the
 exact same storage.save_audit_entry()/mark_quo_pending_message_actioned()
 path app.py's own buttons already use. K/Copy/WhatsApp before that point
@@ -13,6 +25,7 @@ Manually/Pass) is tapped.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -44,13 +57,69 @@ def get_db():
 
 conn = get_db()
 
-# ------------------------------------------------------------ Refresh ----
+# ------------------------------------------------- Live-queue boundary ----
+# Seeded once, ever, the first time this corrected console runs against
+# this database -- never re-seeded on a later restart (see
+# storage.ensure_live_queue_activated's own docstring for why).
+live_queue_started_at = storage.ensure_live_queue_activated(conn)
+
+
+def _parse_ts(raw):
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+_boundary_dt = _parse_ts(live_queue_started_at)
+
+
+def is_live(item: dict) -> bool:
+    """Fails open to "live" for a message with no parseable timestamp --
+    a genuinely urgent job must never be silently hidden as backlog just
+    because its timestamp didn't parse."""
+    ts = _parse_ts(item["received_at"] or item["fetched_at"])
+    if ts is None or _boundary_dt is None:
+        return True
+    return ts >= _boundary_dt
+
+
+with st.expander(f"⚙️ Live queue boundary: {shared.humanize_timestamp(live_queue_started_at)}"):
+    st.caption(
+        "Messages received before this moment are Previous Backlog -- preserved for audit, "
+        "never urgent, never counted as Waiting. Resetting is a deliberate action: it moves "
+        "every currently-live, not-yet-dispatched job into backlog too."
+    )
+    if not st.session_state.get("luxor_console_confirm_reset_boundary"):
+        if st.button("Reset live queue boundary to now", key="luxor_console_reset_boundary_start"):
+            st.session_state.luxor_console_confirm_reset_boundary = True
+            st.rerun()
+    else:
+        st.warning("This moves ALL current live jobs into Previous Backlog. Confirm?")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, reset now", key="luxor_console_reset_boundary_confirm", type="primary"):
+                storage.reset_live_queue_boundary(conn, note="Manual reset from Dispatch Queue")
+                st.session_state.luxor_console_confirm_reset_boundary = False
+                shared.clear_pending_caches()
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", key="luxor_console_reset_boundary_cancel"):
+                st.session_state.luxor_console_confirm_reset_boundary = False
+                st.rerun()
+
+# ------------------------------------------------------------ Sync -------
 if "luxor_console_refresh_message" not in st.session_state:
     st.session_state.luxor_console_refresh_message = None
 
-refresh_col, alert_col = st.columns([2, 2])
-with refresh_col:
-    if st.button("Refresh", key="luxor_console_refresh", width="stretch"):
+sync_col, conn_col = st.columns([1, 2])
+with sync_col:
+    if st.button("Sync", key="luxor_console_refresh", width="stretch"):
         api_key = os.environ.get(API_KEY_ENV_VAR)
         if not api_key:
             st.session_state.luxor_console_refresh_message = ("error", "Quo is not configured in this environment.")
@@ -59,7 +128,7 @@ with refresh_col:
                 client = quo_client.QuoClient(api_key=api_key)
                 outcome = poll_for_new_messages(conn, client)
                 st.session_state.luxor_console_refresh_message = (
-                    "success", f"Refreshed -- {len(outcome.queued)} new message(s).",
+                    "success", f"Synced -- {len(outcome.queued)} new message(s).",
                 )
             except QuoConfigError as exc:
                 storage.record_poll_error(conn, str(exc))
@@ -75,10 +144,47 @@ if st.session_state.luxor_console_refresh_message:
     getattr(st, _kind)(_msg)
     st.session_state.luxor_console_refresh_message = None
 
+# ------------------------------------------------- Connection indicator ---
+_connected = bool(os.environ.get(API_KEY_ENV_VAR))
+_state, _ = shared.connection_state(conn, _connected)
+_live_label = {"connected": "🟢 Live"}.get(_state, "🟡 Delayed" if _state == "delayed" else "🔴 Disconnected")
+_last_poll = shared.fetch_last_refresh(conn)
+_min_interval = int(os.environ.get("QUO_POLL_MIN_INTERVAL_SECONDS", 300))
+_poller_state = "⚪ not detected recently -- start scripts/background_poller.py --loop"
+if _last_poll:
+    _dt = _parse_ts(_last_poll)
+    if _dt is not None and (datetime.now(timezone.utc) - _dt).total_seconds() < (_min_interval * 2):
+        _poller_state = "🟢 likely running"
+with conn_col:
+    st.caption(f"{_live_label} · last poll: {shared.humanize_timestamp(_last_poll)} · background poller: {_poller_state}")
+
+# ------------------------------------------------------- Auto-refresh ----
+# Hidden, single, fixed-key button clicked by client-side JS every 4s.
+# A widget click is Streamlit's own trigger for a full script rerun, so
+# this refreshes the LOCAL view from sqlite only -- it never calls Quo
+# (Quo is only ever called from the Sync button above). Inert in
+# AppTest (no real browser/JS there), so it cannot affect the test suite.
+st.markdown(
+    """
+    <style>.st-key-luxor_console_autorefresh_trigger { display: none !important; }</style>
+    <script>
+    setTimeout(function() {
+        const btn = window.parent.document.querySelector(
+            '.st-key-luxor_console_autorefresh_trigger button'
+        ) || document.querySelector('.st-key-luxor_console_autorefresh_trigger button');
+        if (btn) { btn.click(); }
+    }, 4000);
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+st.button("autorefresh", key="luxor_console_autorefresh_trigger")
+
 # --------------------------------------------------------- Queue build ----
 QUEUE_BUCKETS = ("Urgent", "New Jobs", "Corrections & Cancellations", "Status Requests", "Closings")
 _CORRECTION_CANCEL_TYPES = {MessageType.CORRECTION.value, MessageType.CANCELLATION.value}
 _STATUS_TYPES = {MessageType.STATUS.value, MessageType.UPDATE_REQUEST.value, MessageType.DUPLICATE.value, MessageType.ASSIGNMENT.value}
+_UPDATES_CLOSINGS_TYPES = _CORRECTION_CANCEL_TYPES | _STATUS_TYPES | {MessageType.CLOSING.value}
 
 
 def policy_stream_key(group_label: str, source_value: str) -> str:
@@ -100,11 +206,13 @@ def queue_bucket(message_type: str, urgency: str) -> str:
 
 
 pending = shared.fetch_pending_messages(conn)
-queued: dict = {name: [] for name in QUEUE_BUCKETS}
-other_messages = []
-urgent_count = 0
+live_pending = [item for item in pending if is_live(item)]
+backlog_pending = [item for item in pending if not is_live(item)]
 
-for item in pending:
+other_messages = []
+live_actionable = []  # flat list of (item, job, classify_result, result, tracking, urgency, age_seconds)
+
+for item in live_pending:
     job, classify_result = shared.cached_extract_and_classify(item["raw_text"], conn)
     if not shared.shows_job_transformation(classify_result, job):
         other_messages.append(item)
@@ -121,35 +229,106 @@ for item in pending:
     storage.mark_luxor_prepared(conn, item["message_id"])
 
     received = item["received_at"] or item["fetched_at"] or tracking["first_seen_at"]
-    try:
-        from datetime import datetime, timezone
-        dt = datetime.fromisoformat((received or "").replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
-    except ValueError:
-        age_seconds = 0
+    dt = _parse_ts(received)
+    age_seconds = (datetime.now(timezone.utc) - dt).total_seconds() if dt else 0
 
     urgency = urgency_level(age_seconds, acknowledged, dispatched)
-    if urgency == "urgent":
-        urgent_count += 1
+    live_actionable.append((item, job, classify_result, result, tracking, urgency, age_seconds))
 
+
+# ------------------------------------------- Canonical action dedup (Phase 3)
+def canonicalize(entries: list) -> list:
+    """One card per canonical (source, ticket) identity, not one per raw
+    row -- repeated raw copies of the same job (reminders/re-sends) must
+    not render as separate urgent cards. A message with no usable ticket
+    is never grouped with anything else (no text-similarity guessing);
+    it always renders on its own. The earliest-received member of a
+    group is the canonical card (so its displayed age reflects the true
+    original event); later members are folded in as a visible count,
+    never deleted, never dropped from the database."""
+    groups: dict = {}
+    order = []
+    for entry in entries:
+        item, job, *_ = entry
+        ticket = job.ticket_number.value
+        key = (job.source.value, ticket) if ticket else (job.source.value, f"__no_ticket_{item['message_id']}")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(entry)
+
+    canonical = []
+    for key in order:
+        members = groups[key]
+        members.sort(key=lambda e: e[0]["received_at"] or e[0]["fetched_at"] or "")
+        canonical.append((members[0], len(members) - 1))
+    return canonical
+
+
+canonical_live = canonicalize(live_actionable)
+
+# ----------------------------------------------------- Company filters ----
+FILTER_OPTIONS = ("All", "AGN", "Lucky", "Main Leads", "Updates / Closings", "Needs Review")
+
+
+def entry_source(entry) -> str:
+    _, job, *_ = entry
+    return job.source.value
+
+
+def entry_matches_filter(entry, filter_name: str) -> bool:
+    if filter_name == "All":
+        return True
+    if filter_name in ("AGN", "Lucky", "Main Leads"):
+        return entry_source(entry) == filter_name
+    _item, _job, classify_result, result, *_ = entry
+    if filter_name == "Updates / Closings":
+        return (
+            _item["group_label"] == "CLOSINGS"
+            or classify_result.message_type.value in _UPDATES_CLOSINGS_TYPES
+        )
+    if filter_name == "Needs Review":
+        return (
+            classify_result.message_type.value in shared.ATTENTION_MESSAGE_TYPES
+            or bool(result.decision.missing_information)
+            or bool(classify_result.conflicting_fields)
+        )
+    return True
+
+
+filter_counts = {name: sum(1 for e, _ in canonical_live if entry_matches_filter(e, name)) for name in FILTER_OPTIONS}
+active_filter = st.pills(
+    "Filter by source", FILTER_OPTIONS,
+    selection_mode="single", default="All", key="luxor_console_filter_pills",
+    format_func=lambda name: f"{name} ({filter_counts[name]})",
+    label_visibility="collapsed",
+) or "All"
+
+filtered_canonical = [(e, extra) for e, extra in canonical_live if entry_matches_filter(e, active_filter)]
+
+queued: dict = {name: [] for name in QUEUE_BUCKETS}
+for entry, extra in filtered_canonical:
+    _item, _job, classify_result, _result, _tracking, urgency, _age = entry
     bucket = queue_bucket(classify_result.message_type.value, urgency)
-    queued[bucket].append((item, job, classify_result, result, tracking, urgency, age_seconds))
+    queued[bucket].append((entry, extra))
 
 for bucket in QUEUE_BUCKETS:
-    queued[bucket].sort(key=lambda e: e[0]["received_at"] or e[0]["fetched_at"] or "")  # oldest first
+    queued[bucket].sort(key=lambda pair: pair[0][0]["received_at"] or pair[0][0]["fetched_at"] or "")  # oldest first
 
-all_entries = [entry for bucket in QUEUE_BUCKETS for entry in queued[bucket]]
+all_filtered_entries = [pair for bucket in QUEUE_BUCKETS for pair in queued[bucket]]
 
-# ------------------------------------------------------------ Alerts -----
-alert_placeholder_count = sum(len(queued[b]) for b in QUEUE_BUCKETS)
-with alert_col:
-    st.metric("Waiting", alert_placeholder_count, delta=f"{urgent_count} urgent" if urgent_count else None)
+# ------------------------------------------------------------ Counters ----
+new_jobs_count = len(queued["New Jobs"])
+needs_attention_count = len(queued["Urgent"])
+waiting_for_dispatch_count = new_jobs_count + needs_attention_count + len(queued["Corrections & Cancellations"]) + len(queued["Status Requests"])
+oldest_live_age = all_filtered_entries[0][0][6] if all_filtered_entries else None
 
-if all_entries:
-    oldest_age = all_entries[0][6]
-    st.caption(f"Oldest unhandled: {format_age(oldest_age)}")
+metric_cols = st.columns(4)
+metric_cols[0].metric("New jobs", new_jobs_count)
+metric_cols[1].metric("Needs attention", needs_attention_count)
+metric_cols[2].metric("Waiting for dispatch", waiting_for_dispatch_count)
+metric_cols[3].metric("Oldest live job", format_age(oldest_live_age) if oldest_live_age is not None else "--")
+st.caption(f"Previous backlog: {len(backlog_pending)} (not urgent, not counted above)")
 
 if "luxor_console_sound_enabled" not in st.session_state:
     st.session_state.luxor_console_sound_enabled = False
@@ -162,7 +341,7 @@ with notif_col:
     st.caption("Browser notifications: tap to enable")
 
 _notify_js = ""
-if urgent_count > 0:
+if needs_attention_count > 0:
     if st.session_state.luxor_console_sound_enabled:
         _notify_js += """
         try {
@@ -174,7 +353,7 @@ if urgent_count > 0:
         """
     _notify_js += f"""
     if (window.Notification && Notification.permission === 'granted') {{
-        new Notification('LUXOR Dispatch', {{ body: '{urgent_count} urgent job(s) waiting' }});
+        new Notification('LUXOR Dispatch', {{ body: '{needs_attention_count} job(s) need attention' }});
     }} else if (window.Notification && Notification.permission !== 'denied') {{
         Notification.requestPermission();
     }}
@@ -192,10 +371,9 @@ def urgency_badge(urgency: str) -> str:
     return {"urgent": "🔴 URGENT", "warning": "🟠 Attention", "attention": "🟢 New"}.get(urgency, urgency)
 
 
-def render_job_card(entry) -> None:
+def render_job_card(entry, extra_count: int) -> None:
     item, job, classify_result, result, tracking, urgency, age_seconds = entry
     stream = next((s for s in shared.STREAMS if s.group_label == item["group_label"]), None)
-    stream_name = stream.display_name if stream else item["group_label"]
     market_label = shared.extract_market_label(item["raw_text"]) if job.source.value == "Main Leads" else None
     area_lookup = find_service_area(job.city.value, job.state.value, service_areas)
     address_area = (area_lookup.record.city or area_lookup.record.state) if area_lookup.status == "confirmed" else None
@@ -208,6 +386,8 @@ def render_job_card(entry) -> None:
             header += f" ({market_label})"
         header += f" · {job.ticket_number.value or 'No reference'}"
         st.write(header)
+        if extra_count:
+            st.caption(f"+{extra_count} additional message(s) for this ticket -- folded into this card")
         st.write(f"{resolution.canonical_area or 'Area unresolved'} · {job.service_type.value or 'Not specified'}")
         if job.customer_name.value:
             st.caption(f"Customer: {shared.mask_customer_name(job.customer_name.value)}")
@@ -243,24 +423,56 @@ def render_job_card(entry) -> None:
 
         if policy.acknowledgment_required:
             mode = outbound.current_mode()
-            label = "Send K" if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE) else "K Prepared"
-            if not tracking["acknowledged_at"]:
-                if st.button(label, key=f"luxor_console_k_{mid}", type="primary", width="stretch"):
-                    storage.mark_acknowledged(conn, mid)
-                    if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
+            if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
+                if not tracking["acknowledged_at"]:
+                    if st.button("Send K", key=f"luxor_console_k_{mid}", type="primary", width="stretch"):
+                        storage.mark_acknowledged(conn, mid)
                         req = outbound.build_request(
                             source=job.source.value, job_id=classify_result.existing_job_id,
                             quo_contact_id=stream.group_label if stream else item["group_label"], text="K",
                         )
                         out_result = outbound.propose_send(conn, req, approved_by="dispatcher-tap")
                         st.caption(f"Outbound: {out_result.outcome} — {out_result.reason}")
-                    st.rerun()
+                        st.rerun()
+                else:
+                    st.success("✅ K acknowledged")
             else:
-                st.success("✅ K acknowledged")
+                if not tracking["acknowledged_at"]:
+                    st.caption("K ready — sending disabled")
+                    if st.button("Mark K sent", key=f"luxor_console_k_{mid}", width="stretch"):
+                        storage.mark_acknowledged(conn, mid)
+                        st.rerun()
+                else:
+                    st.success("✅ K acknowledged")
+        else:
+            st.caption("No acknowledgment required")
 
-        if st.button("📋 Mark Luxor Message Copied", key=f"luxor_console_copy_{mid}", width="stretch"):
+        copy_payload = json.dumps(result.luxor_message)
+        st.markdown(
+            f"""
+            <button
+                onclick="
+                    navigator.clipboard.writeText({copy_payload}).then(function() {{
+                        var s = document.getElementById('luxor-copy-status-{mid}');
+                        s.innerText = '✅ Copied to clipboard';
+                        s.style.color = '#1a7f37';
+                    }}).catch(function() {{
+                        var s = document.getElementById('luxor-copy-status-{mid}');
+                        s.innerText = '⚠️ Copy failed — select the text above manually';
+                        s.style.color = '#b42318';
+                    }});
+                "
+                style="width:100%; padding:0.6rem; border-radius:0.5rem; border:1px solid #999;
+                       background:#fff; color:#111; font-size:1rem; min-height:44px; cursor:pointer;"
+            >📋 Copy Luxor Message</button>
+            <div id="luxor-copy-status-{mid}" style="margin-top:0.25rem; font-size:0.85rem;"></div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("✓ Confirm copied", key=f"luxor_console_copy_confirm_{mid}", width="stretch"):
             storage.mark_copied(conn, mid)
             st.rerun()
+        st.caption('Tap "Confirm copied" only after "Copied to clipboard" appears above.')
         if tracking["copied_at"]:
             st.caption("✅ Copied")
 
@@ -322,7 +534,7 @@ def render_job_card(entry) -> None:
                 st.rerun()
 
 
-if not all_entries:
+if not all_filtered_entries:
     st.success("No jobs need your attention right now.")
 else:
     for bucket in QUEUE_BUCKETS:
@@ -330,14 +542,22 @@ else:
         if not entries:
             continue
         st.markdown(f"### {bucket} ({len(entries)})")
-        for entry in entries:
-            render_job_card(entry)
+        for entry, extra_count in entries:
+            render_job_card(entry, extra_count)
 
 with st.expander(f"Other Messages ({len(other_messages)})"):
     for item in other_messages:
         st.caption(
             f"{shared.humanize_timestamp(item['received_at'] or item['fetched_at'])} — "
             f"{shared.mask_sensitive(item['raw_text'])[:80]}"
+        )
+
+with st.expander(f"Previous Backlog ({len(backlog_pending)})"):
+    st.caption("Historical development/shadow-mode messages received before the live queue boundary above. Preserved for audit; never urgent.")
+    for item in backlog_pending:
+        st.caption(
+            f"{shared.humanize_timestamp(item['received_at'] or item['fetched_at'])} — "
+            f"{item['group_label']} · {shared.mask_sensitive(item['raw_text'])[:80]}"
         )
 
 conn.close()
