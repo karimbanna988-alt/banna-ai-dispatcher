@@ -109,16 +109,20 @@ def test_rendering_shadow_review_page_never_writes(desk_env, vehicle_rules):
 def test_shadow_review_empty_state(desk_env):
     at = app_for("luxor_desk_pages/shadow_review.py", desk_env)
     assert len(at.exception) == 0
-    assert any("No shadow episodes recorded" in i.value for i in at.info)
+    assert any("No dispatcher examples have been recorded yet." in i.value for i in at.info)
 
 
 # ------------------------------------------------- Commercial update via UI
 def test_commercial_update_section_present_on_active_job(desk_env, vehicle_rules):
+    """Phase 4 UI rebuild: the Commercial Update section is a plain,
+    always-visible section (a "desk-section-title" heading), no longer
+    wrapped in its own expander -- matches every other primary section
+    in the Active Job workspace."""
     commit_job(desk_env, vehicle_rules, agn_message("SHDW3"))
     at = app_for("luxor_desk_pages/active_jobs.py", desk_env)
     assert len(at.exception) == 0
-    expander_labels = [e.label for e in at.expander]
-    assert any("COMMERCIAL UPDATE" in label for label in expander_labels)
+    rendered = "\n".join(m.value for m in at.markdown)
+    assert "Commercial update" in rendered
 
 
 def test_save_commercial_update_via_ui_creates_episode(desk_env, vehicle_rules):

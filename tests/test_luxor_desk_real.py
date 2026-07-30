@@ -254,9 +254,9 @@ def test_agn_shows_k_ready_wording(desk_env):
     seed_pending(desk_env, "K1", agn_message("K1TICKET"))
     at = login(make_app())
     # COPY K: the literal "K" text, shown via st.code so it has a native
-    # copy affordance -- plus MARK K SENT MANUALLY to record confirmation.
+    # copy affordance -- plus "I sent K in Quo" to record confirmation.
     assert any(c.value == "K" for c in at.code)
-    assert any(b.key == "desk_k_K1" and b.label == "MARK K SENT MANUALLY" for b in at.button)
+    assert any(b.key == "desk_k_K1" and b.label == "I sent K in Quo" for b in at.button)
 
 
 def test_main_leads_shows_no_ack_required(desk_env):
@@ -264,7 +264,7 @@ def test_main_leads_shows_no_ack_required(desk_env):
     seed_pending(desk_env, "ML1", main_leads_message("MLTICKET"), group_label="Main Leads 2")
     at = login(make_app())
     rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "NO ACKNOWLEDGMENT REQUIRED" in rendered_captions
+    assert "No K acknowledgment needed for Main Leads" in rendered_captions
     assert not any(b.key == "desk_k_ML1" for b in at.button)
 
 
@@ -275,7 +275,7 @@ def test_missing_required_fields_shows_human_review_needed(desk_env):
     at = login(make_app())
     assert len(at.exception) == 0
     rendered = "\n".join(w.value for w in at.warning)
-    assert "HUMAN REVIEW NEEDED" in rendered
+    assert "Please review this job before dispatching" in rendered
     # Dispatch actions must be replaced, not merely warned alongside.
     assert not any(b.key == "desk_wa_INC1" for b in at.button)
     assert not any(b.key == "desk_k_INC1" for b in at.button)
@@ -297,7 +297,7 @@ def test_multiple_eligible_technicians_all_shown(desk_env):
 
 def test_no_whatsapp_or_dispatch_claim_without_destination(desk_env):
     """The formatted message may still be copied (it's always shown via
-    st.code), and the DISPATCH IN WHATSAPP button is visible but
+    st.code), and the "I sent it in WhatsApp" button is visible but
     disabled -- never claims a destination that doesn't exist, and never
     silently hides the action either."""
     seed_live_boundary(desk_env)
@@ -336,7 +336,7 @@ def test_closings_page_shows_empty_state_not_fabricated_data(desk_env):
     at.session_state[shared_desk.AUTH_SESSION_KEY] = True
     at.run()
     assert len(at.exception) == 0
-    assert any("No closings awaiting action" in s.value for s in at.success)
+    assert any("No closings are waiting." in s.value for s in at.success)
 
 
 def test_technicians_page_shows_real_roster_only(desk_env):

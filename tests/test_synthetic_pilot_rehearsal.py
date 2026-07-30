@@ -104,7 +104,7 @@ def test_primary_rehearsal_full_agn_columbia_kabaka_lifecycle(desk_env, capsys):
 
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     assert len(at.exception) == 0
-    assert any(b.key == "desk_k_RHRSL1" and b.label == "MARK K SENT MANUALLY" for b in at.button)
+    assert any(b.key == "desk_k_RHRSL1" and b.label == "I sent K in Quo" for b in at.button)
 
     # ---- Step 3-4: prepare + confirm K sent manually ----
     at.button(key="desk_k_RHRSL1").click().run()
@@ -293,7 +293,7 @@ def test_edge_a_main_leads_no_k_ack_and_unsupported_closing(desk_env):
     assert len(at.exception) == 0
     assert not any(b.key == "desk_k_ML1" for b in at.button)
     rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "NO ACKNOWLEDGMENT REQUIRED" in rendered_captions
+    assert "No K acknowledgment needed for Main Leads" in rendered_captions
 
     wa_button = next(b for b in at.button if b.key == "desk_wa_ML1")
     assert wa_button.disabled is False
@@ -481,7 +481,7 @@ def test_ui_commercial_fields_compact_parser_internals_hidden(desk_env):
     at_active = app_for("luxor_desk_pages/active_jobs.py", db_path)
     at_active.text_area(key=f"commercial_raw_{{}}".format(_only_job_id(db_path))).set_value("quoted 125").run()
 
-    details_expander = next(e for e in at_active.expander if "View details (raw extraction)" in (e.label or ""))
+    details_expander = next(e for e in at_active.expander if "Technical details" in (e.label or ""))
     nested_captions = "\n".join(c.value for c in details_expander.caption)
     assert "Confidence:" in nested_captions  # present, but only inside the nested, collapsed-by-default expander
 
@@ -514,8 +514,8 @@ def test_ui_shadow_review_distinguishes_suggestion_from_actual(desk_env):
     at_review = app_for("luxor_desk_pages/shadow_review.py", db_path)
     assert len(at_review.exception) == 0
     rendered = "\n".join(m.value for m in at_review.markdown)
-    assert "Shadow suggested reply" in rendered
-    assert "Dispatcher actual reply" in rendered
+    assert "What the system suggested" in rendered
+    assert "What the dispatcher confirmed or corrected" in rendered
 
 
 def test_ui_quo_vs_whatsapp_channel_labels_correct(desk_env):
@@ -526,7 +526,7 @@ def test_ui_quo_vs_whatsapp_channel_labels_correct(desk_env):
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     # Technician dispatch is explicitly WhatsApp
     rendered_before = "\n".join(b.label or "" for b in at.button)
-    assert "DISPATCH IN WHATSAPP" in rendered_before
+    assert "I sent it in WhatsApp" in rendered_before
 
     at.button(key="desk_k_UI4").click().run()
     at.button(key="desk_wa_UI4").click().run()
@@ -539,4 +539,4 @@ def test_ui_quo_vs_whatsapp_channel_labels_correct(desk_env):
 
     at_active = app_for("luxor_desk_pages/active_jobs.py", db_path)
     rendered_captions = "\n".join(c.value for c in at_active.caption)
-    assert "Send channel: Quo" in rendered_captions  # commercial reply -> Quo, never WhatsApp
+    assert "Send manually in Quo" in rendered_captions  # commercial reply -> Quo, never WhatsApp

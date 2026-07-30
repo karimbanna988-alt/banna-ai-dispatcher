@@ -77,7 +77,7 @@ def app_for(page: str, db_path) -> AppTest:
 def test_completed_history_page_registered_in_navigation():
     source = pathlib.Path("luxor_desk.py").read_text(encoding="utf-8")
     assert 'luxor_desk_pages/history.py' in source
-    assert 'title="Completed / History"' in source
+    assert 'title="History"' in source
 
 
 def test_navigation_order_matches_canonical_workflow():
@@ -131,7 +131,7 @@ def test_custom_update_shows_human_review_needed(desk_env, vehicle_rules):
     at = app_for("luxor_desk_pages/active_jobs.py", desk_env)
     assert len(at.exception) == 0
     rendered = "\n".join(w.value for w in at.warning)
-    assert "HUMAN REVIEW NEEDED" in rendered
+    assert "Please review this update before saving." in rendered
 
 
 def test_pass_cancel_button_disabled_without_reason(desk_env, vehicle_rules):
@@ -160,7 +160,7 @@ def test_move_to_closing_hint_shown_only_after_completed_update(desk_env, vehicl
     conn.close()
     at = app_for("luxor_desk_pages/active_jobs.py", desk_env)
     assert len(at.exception) == 0
-    assert any("MOVE TO CLOSING" in i.value for i in at.info)
+    assert any("Ready to close" in i.value for i in at.info)
 
 
 # --------------------------------------------------------------- Closings flow
@@ -234,7 +234,7 @@ def test_closing_missing_amount_shows_human_review_needed(desk_env, vehicle_rule
     at = app_for("luxor_desk_pages/closings.py", desk_env)
     assert len(at.exception) == 0
     rendered = "\n".join(w.value for w in at.warning)
-    assert "HUMAN REVIEW NEEDED" in rendered
+    assert "Please review this closing before sending." in rendered
     assert not any(b.key == f"closing_prepare_{job_id}" for b in at.button)
 
 
@@ -246,7 +246,7 @@ def test_complete_job_button_hidden_until_sent_manually(desk_env, vehicle_rules)
     at = app_for("luxor_desk_pages/closings.py", desk_env)
     assert len(at.exception) == 0
     assert not any(b.key == f"closing_complete_{job_id}" for b in at.button)
-    assert any("COMPLETE JOB is available once" in c.value for c in at.caption)
+    assert any("Complete job is available once" in c.value for c in at.caption)
 
 
 # --------------------------------------------------------------- History page
@@ -268,7 +268,7 @@ def test_completed_job_appears_in_history_with_audit_trail(desk_env, vehicle_rul
     rendered = "\n".join(m.value for m in at.markdown)
     assert "HIST1" in rendered
     expander_labels = [e.label for e in at.expander]
-    assert any("View details" in label for label in expander_labels)
+    assert any("Job details" in label for label in expander_labels)
     at.expander[0].expanded = True
     at.run()
     assert len(at.exception) == 0
