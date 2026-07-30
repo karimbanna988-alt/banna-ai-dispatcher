@@ -211,6 +211,36 @@ def test_migrate_no_fk_violations_and_integrity_ok(tmp_path):
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+def test_migrate_adds_shadow_tables_without_disturbing_existing_data(tmp_path):
+    """The real database is currently at revision 2 (no shadow tables) --
+    this fixture is shaped exactly like that (jobs/events present,
+    idempotency/schema_version absent). Confirms migrate_schema() adds
+    shadow_episodes/shadow_events cleanly on top, with every existing
+    row and the database's overall integrity untouched."""
+    db_path = tmp_path / "pre_idempotency.db"
+    _raw_current_minus_idempotency(db_path)
+    conn = storage.connect(db_path)
+    before_jobs = conn.execute("SELECT id, ticket_number, status FROM jobs ORDER BY id").fetchall()
+    before_events = conn.execute("SELECT id, job_id, raw_message FROM events ORDER BY id").fetchall()
+
+    status = storage.migrate_schema(conn)
+
+    assert status.up_to_date
+    assert status.current_revision == 3
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "shadow_episodes" in tables
+    assert "shadow_events" in tables
+    assert conn.execute("SELECT COUNT(*) FROM shadow_episodes").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM shadow_events").fetchone()[0] == 0
+
+    after_jobs = conn.execute("SELECT id, ticket_number, status FROM jobs ORDER BY id").fetchall()
+    after_events = conn.execute("SELECT id, job_id, raw_message FROM events ORDER BY id").fetchall()
+    assert before_jobs == after_jobs
+    assert before_events == after_events
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_migrate_twice_is_a_no_op(tmp_path):
     db_path = tmp_path / "pre_idempotency.db"
     _raw_current_minus_idempotency(db_path)

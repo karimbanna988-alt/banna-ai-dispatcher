@@ -29,6 +29,7 @@ def test_quo_api_key_never_hardcoded_in_new_architecture_files():
         "src/dispatcher/application.py", "src/dispatcher/adapters.py", "src/dispatcher/health.py",
         "src/dispatcher/source_adapters.py", "src/dispatcher/review_interpreter.py",
         "src/dispatcher/action_names.py", "src/dispatcher/app_models.py", "src/dispatcher/clock.py",
+        "src/dispatcher/commercial.py", "src/dispatcher/shadow.py", "src/dispatcher/shadow_export.py",
         "scripts/manage_schema.py", "scripts/backup_database.py", "scripts/verify_backup.py",
         "scripts/restore_database.py", "scripts/validate_configuration.py",
     )
@@ -49,6 +50,8 @@ def test_no_env_file_loaded_by_new_test_files():
         "tests/test_application_service.py", "tests/test_schema_migration.py",
         "tests/test_backup_restore.py", "tests/test_health.py", "tests/test_e2e_lifecycle.py",
         "tests/test_concurrency.py", "tests/test_transaction_fault_injection.py",
+        "tests/test_commercial.py", "tests/test_shadow.py", "tests/test_shadow_persistence.py",
+        "tests/test_shadow_export.py", "tests/test_shadow_application_service.py", "tests/test_shadow_ui.py",
     )
     for f in test_files:
         source = (REPO_ROOT / f).read_text(encoding="utf-8")
@@ -61,6 +64,7 @@ def test_no_real_network_libraries_in_new_files():
     files = (
         "src/dispatcher/application.py", "src/dispatcher/adapters.py", "src/dispatcher/health.py",
         "src/dispatcher/source_adapters.py", "src/dispatcher/review_interpreter.py",
+        "src/dispatcher/commercial.py", "src/dispatcher/shadow.py", "src/dispatcher/shadow_export.py",
         "scripts/manage_schema.py", "scripts/backup_database.py",
     )
     for f in files:
@@ -170,6 +174,8 @@ def test_all_new_test_fixtures_never_open_the_real_database_path():
         "tests/test_schema_migration.py", "tests/test_backup_restore.py", "tests/test_health.py",
         "tests/test_e2e_lifecycle.py", "tests/test_concurrency.py", "tests/test_transaction_fault_injection.py",
         "tests/test_application_service.py", "tests/test_dependency_boundaries.py", "tests/test_schema_guard_ui.py",
+        "tests/test_commercial.py", "tests/test_shadow.py", "tests/test_shadow_persistence.py",
+        "tests/test_shadow_export.py", "tests/test_shadow_application_service.py", "tests/test_shadow_ui.py",
     )
     for f in new_test_files:
         path = REPO_ROOT / f
@@ -186,3 +192,24 @@ def test_all_new_test_fixtures_never_open_the_real_database_path():
                 and node.func.value.id == "storage"
             ):
                 assert node.args or node.keywords, f"{f} calls storage.connect() with no path argument -- would open the real database"
+
+
+# ------------------------------------------------------------- Shadow Mode
+def test_shadow_episode_model_has_no_field_for_secrets_or_local_paths():
+    """Structural guard: the Shadow Mode episode contract has no field
+    for an API key, password, tunnel URL, or local database path --
+    there is nothing to leak in an export because nothing like that is
+    ever collected in the first place."""
+    from dispatcher.shadow import EPISODE_FIELDS
+
+    forbidden_substrings = ("api_key", "password", "tunnel", "db_path", "secret", "token")
+    for field in EPISODE_FIELDS:
+        lowered = field.lower()
+        assert not any(bad in lowered for bad in forbidden_substrings), field
+
+
+def test_shadow_export_excludes_dispatcher_actor_and_technician_identity():
+    from dispatcher.shadow_export import _EXCLUDED_EPISODE_FIELDS
+
+    assert "dispatcher_actor" in _EXCLUDED_EPISODE_FIELDS
+    assert "technician_id" in _EXCLUDED_EPISODE_FIELDS

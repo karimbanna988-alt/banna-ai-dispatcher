@@ -43,13 +43,14 @@ logic a second time.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import sqlite3
 from typing import List, Optional, Protocol
 
 from . import closing as closing_module
-from . import storage, updates
-from .action_names import ActionName
+from . import commercial, storage, updates
+from .action_names import ActionName, STATUS_CANCELLED, STATUS_CLOSED
 from .adapters import DisabledQuoOutboundAdapter, ManualWhatsAppHandoffAdapter, QuoOutboundAdapter, WhatsAppHandoffAdapter
 from .app_models import (
     ActionResult,
@@ -59,6 +60,7 @@ from .app_models import (
     ValidationIssue,
 )
 from .closing import ClosingInput
+from .shadow import ComparisonLabel, ShadowChannel, ShadowEventType, compare_shadow_to_actual
 from .storage import InvalidJobActionError
 
 
@@ -70,6 +72,28 @@ def _fingerprint(text: str) -> str:
     logic already applies to inbound messages."""
     normalized = " ".join((text or "").split()).strip().lower()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _commercial_update_to_dict(cu: commercial.CommercialUpdate) -> dict:
+    """JSON-safe snapshot of a CommercialUpdate for shadow_events/
+    shadow_episodes payloads -- enum members become their .value."""
+    return {
+        "raw_technician_text": cu.raw_technician_text,
+        "quote_type": cu.quote_type.value,
+        "quote_amount": cu.quote_amount,
+        "quote_amount_text": cu.quote_amount_text,
+        "quote_range_low": cu.quote_range_low,
+        "quote_range_high": cu.quote_range_high,
+        "currency": cu.currency,
+        "customer_response": cu.customer_response.value,
+        "customer_response_text": cu.customer_response_text,
+        "follow_up_required": cu.follow_up_required,
+        "follow_up_time_text": cu.follow_up_time_text,
+        "negotiation_state": cu.negotiation_state.value,
+        "confidence": cu.confidence,
+        "validation_issues": cu.validation_issues,
+        "human_review_required": cu.human_review_required,
+    }
 
 
 def compute_idempotency_key(identity, action: str, fingerprint_text: str = "") -> str:
@@ -453,6 +477,288 @@ class DispatcherService:
                 f"closing_group: {result['previous_closing_group']!r} -> {result['closing_group']!r}."
             ),
         )
+
+    # ------------------------------------------------------- Shadow Mode ---
+    # Passive observation only -- see docs/SHADOW_MODE.md. None of these
+    # commands ever change jobs.status/reconciliation_state, select a
+    # technician, or send anything; every write here lands only in
+    # shadow_episodes/shadow_events (see storage.py's own docstring for
+    # that table pair). A ValidationIssue/failure here never blocks the
+    # job's real operational commands above.
+
+    def record_commercial_update(
+        self, job_id: int, raw_technician_text: str,
+        corrected_fields: Optional[dict] = None, dispatcher_actor: Optional[str] = None,
+    ) -> ActionResult:
+        """The core Shadow Mode observation point: the dispatcher pastes
+        the technician's real WhatsApp text (step 1 of the Active Job
+        commercial-update workflow). commercial.extract_commercial_update()
+        computes a passive shadow suggestion; whatever the dispatcher
+        actually confirms -- verbatim, or corrected via
+        `corrected_fields` (any of quote_type/quote_amount/
+        quote_range_low/quote_range_high/currency/customer_response) --
+        becomes the verified commercial update the prepared company
+        reply is built from. Never sends anything; never touches
+        jobs.status."""
+        if not raw_technician_text or not raw_technician_text.strip():
+            return ActionResult.failure(
+                "record_commercial_update", job_id=job_id,
+                issues=[ValidationIssue(field="raw_technician_text", problem="the technician's actual message is required")],
+            )
+        job = storage.get_job_by_id(self.conn, job_id)
+        if job is None:
+            return ActionResult.failure("record_commercial_update", job_id=job_id, message=f"No job with id {job_id}.")
+
+        suggestion = commercial.extract_commercial_update(raw_technician_text)
+        corrected = bool(corrected_fields)
+        if corrected:
+            actual = dataclasses.replace(suggestion, **corrected_fields)
+            neg_state, follow_up = commercial.derive_negotiation_state(actual.quote_type, actual.customer_response)
+            actual = dataclasses.replace(
+                actual, negotiation_state=neg_state, follow_up_required=follow_up,
+                human_review_required=(actual.quote_type == commercial.QuoteType.UNKNOWN),
+            )
+        else:
+            actual = suggestion
+
+        base_key = compute_idempotency_key(
+            job_id, "record_commercial_update", f"{raw_technician_text}|{sorted((corrected_fields or {}).items())}",
+        )
+        cu_key = f"{base_key}:CU"
+        was_replay = storage.get_shadow_event_by_idempotency_key(self.conn, cu_key) is not None
+
+        episode = storage.find_or_create_shadow_episode(
+            self.conn, source=job["source"], channel=ShadowChannel.WHATSAPP_TECHNICIAN.value,
+            ticket_or_pdl=job["ticket_number"], job_id=job_id, dispatcher_actor=dispatcher_actor,
+            technician_id=job.get("assigned_technician_id"), previous_job_status=job["status"],
+            incoming_message_type="COMMERCIAL_UPDATE",
+        )
+        text_fingerprint = _fingerprint(raw_technician_text)
+
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.SHADOW_OBSERVATION.value,
+            channel=ShadowChannel.WHATSAPP_TECHNICIAN.value, actor=dispatcher_actor,
+            payload={"text_fingerprint": text_fingerprint, "job_id": job_id}, idempotency_key=f"{base_key}:OBS",
+        )
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.SHADOW_SUGGESTION.value,
+            channel=ShadowChannel.SYSTEM_SHADOW_SUGGESTION.value,
+            payload={**_commercial_update_to_dict(suggestion), "raw_technician_text": None, "text_fingerprint": text_fingerprint},
+            idempotency_key=f"{base_key}:SUG",
+        )
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.COMMERCIAL_UPDATE.value,
+            channel=ShadowChannel.WHATSAPP_TECHNICIAN.value, actor=dispatcher_actor,
+            payload=_commercial_update_to_dict(actual), idempotency_key=cu_key,
+        )
+        comparison = compare_shadow_to_actual(
+            shadow_suggested_action="record_commercial_update", dispatcher_actual_action="record_commercial_update",
+            shadow_quote_type=suggestion.quote_type.value, dispatcher_quote_type=actual.quote_type.value,
+            shadow_quote_amount=suggestion.quote_amount, dispatcher_quote_amount=actual.quote_amount,
+            shadow_customer_response=suggestion.customer_response.value, dispatcher_customer_response=actual.customer_response.value,
+            human_review_required=actual.human_review_required,
+        )
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.DISPATCHER_DECISION.value,
+            channel=ShadowChannel.CRM_DISPATCHER_ACTION.value, actor=dispatcher_actor,
+            payload={"comparison_label": comparison.value, "corrected": corrected}, idempotency_key=f"{base_key}:DEC",
+        )
+
+        suggested_reply = commercial.prepare_commercial_company_reply(job["source"], suggestion)
+        actual_reply = commercial.prepare_commercial_company_reply(job["source"], actual)
+        storage.update_shadow_episode(
+            self.conn, episode["episode_id"],
+            normalized_intent="COMMERCIAL_UPDATE",
+            shadow_suggested_action="record_commercial_update",
+            shadow_suggested_reply=suggested_reply.reply,
+            shadow_confidence=suggestion.confidence,
+            shadow_reasons=suggestion.validation_issues,
+            validation_issues=actual.validation_issues,
+            human_review_required=actual.human_review_required,
+            dispatcher_actual_action="record_commercial_update",
+            dispatcher_actual_reply=actual_reply.reply,
+            commercial_update=_commercial_update_to_dict(actual),
+            customer_response=actual.customer_response.value,
+        )
+
+        return ActionResult(
+            success=True, action="record_commercial_update", job_id=job_id, idempotent_replay=was_replay,
+            prepared_text=actual_reply.reply if actual_reply.confirmed else None,
+            human_review_required=actual.human_review_required,
+            human_review_reason=(
+                HumanReviewReason(code="ambiguous_commercial_update", detail=actual_reply.reason)
+                if not actual_reply.confirmed else None
+            ),
+            user_message=actual_reply.reply or actual_reply.reason,
+        )
+
+    def record_customer_response(
+        self, job_id: int, customer_response: str, raw_text: Optional[str] = None, dispatcher_actor: Optional[str] = None,
+    ) -> ActionResult:
+        """A customer response fact arriving separately from a technician
+        quote paste (e.g. a later note). Never implies cancellation on
+        its own -- see commercial.derive_negotiation_state()."""
+        valid = {s.value for s in commercial.CustomerResponseType}
+        if customer_response not in valid:
+            return ActionResult.failure(
+                "record_customer_response", job_id=job_id,
+                issues=[ValidationIssue(field="customer_response", problem=f"must be one of {sorted(valid)}")],
+            )
+        job = storage.get_job_by_id(self.conn, job_id)
+        if job is None:
+            return ActionResult.failure("record_customer_response", job_id=job_id, message=f"No job with id {job_id}.")
+
+        episode = storage.find_or_create_shadow_episode(
+            self.conn, source=job["source"], channel=ShadowChannel.CRM_DISPATCHER_ACTION.value,
+            ticket_or_pdl=job["ticket_number"], job_id=job_id, dispatcher_actor=dispatcher_actor,
+            previous_job_status=job["status"],
+        )
+        idempotency_key = compute_idempotency_key(job_id, "record_customer_response", f"{customer_response}|{raw_text or ''}")
+        was_replay = storage.get_shadow_event_by_idempotency_key(self.conn, idempotency_key) is not None
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.CUSTOMER_RESPONSE.value,
+            channel=ShadowChannel.CRM_DISPATCHER_ACTION.value, actor=dispatcher_actor,
+            payload={"customer_response": customer_response, "raw_text": raw_text}, idempotency_key=idempotency_key,
+        )
+
+        existing_cu = episode.get("commercial_update") or {}
+        prior_quote_type = commercial.QuoteType(existing_cu.get("quote_type") or "UNKNOWN")
+        response_enum = commercial.CustomerResponseType(customer_response)
+        neg_state, follow_up = commercial.derive_negotiation_state(prior_quote_type, response_enum)
+        merged_cu = dict(existing_cu)
+        merged_cu["customer_response"] = customer_response
+        merged_cu["negotiation_state"] = neg_state.value
+        merged_cu["follow_up_required"] = follow_up
+        storage.update_shadow_episode(
+            self.conn, episode["episode_id"], customer_response=customer_response, commercial_update=merged_cu,
+        )
+        return ActionResult(
+            success=True, action="record_customer_response", job_id=job_id, idempotent_replay=was_replay,
+            user_message="Customer response recorded.",
+        )
+
+    def record_negotiation_outcome(
+        self, job_id: int, negotiation_outcome: str, raw_text: Optional[str] = None, dispatcher_actor: Optional[str] = None,
+    ) -> ActionResult:
+        """The dispatcher-confirmed terminal negotiation fact (e.g.
+        ACCEPTED, LOST_ON_PRICE) once it is actually known -- never
+        inferred automatically from a single hesitant customer reply.
+        `final_job_outcome` is populated from the job's own real status
+        only when that status is already terminal (Closed/Cancelled);
+        this never sets or changes jobs.status itself."""
+        valid = {s.value for s in commercial.NegotiationState}
+        if negotiation_outcome not in valid:
+            return ActionResult.failure(
+                "record_negotiation_outcome", job_id=job_id,
+                issues=[ValidationIssue(field="negotiation_outcome", problem=f"must be one of {sorted(valid)}")],
+            )
+        job = storage.get_job_by_id(self.conn, job_id)
+        if job is None:
+            return ActionResult.failure("record_negotiation_outcome", job_id=job_id, message=f"No job with id {job_id}.")
+
+        episode = storage.find_or_create_shadow_episode(
+            self.conn, source=job["source"], channel=ShadowChannel.CRM_DISPATCHER_ACTION.value,
+            ticket_or_pdl=job["ticket_number"], job_id=job_id, dispatcher_actor=dispatcher_actor,
+            previous_job_status=job["status"],
+        )
+        idempotency_key = compute_idempotency_key(job_id, "record_negotiation_outcome", f"{negotiation_outcome}|{raw_text or ''}")
+        was_replay = storage.get_shadow_event_by_idempotency_key(self.conn, idempotency_key) is not None
+        final_outcome = job["status"] if job["status"] in (STATUS_CLOSED, STATUS_CANCELLED) else None
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.NEGOTIATION_OUTCOME.value,
+            channel=ShadowChannel.CRM_DISPATCHER_ACTION.value, actor=dispatcher_actor,
+            payload={"negotiation_outcome": negotiation_outcome, "raw_text": raw_text}, idempotency_key=idempotency_key,
+        )
+        storage.update_shadow_episode(
+            self.conn, episode["episode_id"], negotiation_outcome=negotiation_outcome, final_job_outcome=final_outcome,
+        )
+        return ActionResult(
+            success=True, action="record_negotiation_outcome", job_id=job_id, idempotent_replay=was_replay,
+            user_message="Negotiation outcome recorded.",
+        )
+
+    def answer_company_commercial_question(self, job_id: int, raw_question_text: str) -> ActionResult:
+        """Correlates a source company's commercial question to this one
+        job's latest verified quote/customer response only -- never
+        another job, never a superseded quote. Returns
+        human_review_required=True (no prepared_text) when no verified
+        price is on record, rather than inventing one."""
+        job = storage.get_job_by_id(self.conn, job_id)
+        if job is None:
+            return ActionResult.failure("answer_company_commercial_question", job_id=job_id, message=f"No job with id {job_id}.")
+
+        question_type = commercial.detect_company_question(raw_question_text)
+        latest = storage.get_latest_verified_commercial_update_for_job(self.conn, job_id)
+        latest_cu = None
+        if latest:
+            latest_cu = commercial.CommercialUpdate(
+                raw_technician_text=latest.get("raw_technician_text") or "",
+                quote_type=commercial.QuoteType(latest.get("quote_type") or "UNKNOWN"),
+                quote_amount=latest.get("quote_amount"),
+                quote_range_low=latest.get("quote_range_low"),
+                quote_range_high=latest.get("quote_range_high"),
+                currency=latest.get("currency"),
+                customer_response=commercial.CustomerResponseType(latest.get("customer_response") or "UNKNOWN"),
+                human_review_required=bool(latest.get("human_review_required")),
+            )
+        answer = commercial.answer_company_commercial_question(question_type, latest_cu, source=job["source"])
+
+        episode = storage.find_or_create_shadow_episode(
+            self.conn, source=job["source"], channel=ShadowChannel.QUO_COMPANY.value,
+            ticket_or_pdl=job["ticket_number"], job_id=job_id, previous_job_status=job["status"],
+        )
+        storage.record_shadow_event(
+            self.conn, episode_id=episode["episode_id"], event_type=ShadowEventType.SHADOW_SUGGESTION.value,
+            channel=ShadowChannel.SYSTEM_SHADOW_SUGGESTION.value,
+            payload={
+                "question_type": question_type.value, "question_fingerprint": _fingerprint(raw_question_text),
+                "suggested_reply": answer.reply, "confirmed": answer.confirmed, "reason": answer.reason,
+            },
+        )
+
+        human_review = not answer.confirmed
+        return ActionResult(
+            success=True, action="answer_company_commercial_question", job_id=job_id,
+            prepared_text=answer.reply, human_review_required=human_review,
+            human_review_reason=HumanReviewReason(code="commercial_question", detail=answer.reason) if human_review else None,
+            user_message=answer.reply or answer.reason,
+        )
+
+    def confirm_commercial_reply_sent(
+        self, job_id: int, sent_channel: str, dispatcher_actor: Optional[str] = None,
+    ) -> ActionResult:
+        """Records that the dispatcher actually sent the prepared
+        commercial reply -- in the real Quo or company-WhatsApp thread,
+        outside this application. This method cannot send anything
+        itself; it only documents that a real send already happened.
+        Distinct from `confirm_company_update_sent()` (the existing
+        technician-status-update reply trail on the job's own `events`
+        audit log) -- the commercial reply's own send-confirmation lives
+        in the shadow episode, since a commercial update is not
+        required to also be a recognized technician status type."""
+        job = storage.get_job_by_id(self.conn, job_id)
+        if job is None:
+            return ActionResult.failure("confirm_commercial_reply_sent", job_id=job_id, message=f"No job with id {job_id}.")
+        episode = storage.get_shadow_episode_for_job(self.conn, job_id)
+        if episode is None:
+            return ActionResult.failure(
+                "confirm_commercial_reply_sent", job_id=job_id,
+                message="No commercial update has been recorded for this job yet.",
+            )
+        storage.confirm_shadow_reply_sent(self.conn, episode["episode_id"], sent_channel, actor=dispatcher_actor)
+        return ActionResult(
+            success=True, action="confirm_commercial_reply_sent", job_id=job_id,
+            user_message=f"Recorded as sent via {sent_channel}.",
+        )
+
+    def set_shadow_review(self, episode_id: str, review_status: str, reviewed_by: Optional[str] = None) -> ActionResult:
+        """The only way an episode becomes export-eligible -- see
+        shadow.EXPORTABLE_REVIEW_STATES / storage.set_shadow_review_status()."""
+        try:
+            storage.set_shadow_review_status(self.conn, episode_id, review_status, reviewed_by=reviewed_by)
+        except ValueError as exc:
+            return ActionResult.failure("set_shadow_review", message=str(exc))
+        return ActionResult(success=True, action="set_shadow_review", user_message=f"Episode marked {review_status}.")
 
     # ------------------------------------------------------------ Queries -
     def get_job_workspace(self, job_id: int) -> Optional[dict]:

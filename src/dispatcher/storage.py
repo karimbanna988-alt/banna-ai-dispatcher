@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
 from .rules.service_areas import ServiceAreaRecord, find_service_area
+from .shadow import EXPORTABLE_REVIEW_STATES, SHADOW_EPISODE_SCHEMA_VERSION, ReviewStatus, ShadowChannel, ShadowEventType
 from .rules.service_categories import KNOWN_SERVICE_CATEGORIES, classify_service_categories, normalize_skill_label
 from .updates import map_status_to_reply
 
@@ -55,7 +57,10 @@ LEGACY_EVENT_SCHEMA_VERSION = 0
 # PRAGMA user_version (never a second migration-tracking table -- see
 # docs/SCHEMA_MIGRATION_RUNBOOK.md for why one isn't needed here).
 # Bumped whenever a new migration function is added to _ensure_schema().
-SCHEMA_REVISION = 2
+# Revision 3 added shadow_episodes/shadow_events (see
+# _add_shadow_mode_support() and docs/SHADOW_MODE.md) -- purely additive,
+# no existing table's shape changed.
+SCHEMA_REVISION = 3
 
 # SQLite's own busy-wait, in milliseconds, before a writer blocked by
 # another writer's transaction gives up and raises "database is
@@ -167,6 +172,8 @@ _SCHEMA_MARKERS: tuple = (
     ("dispatch_tracking", None),
     ("console_activation_state", None),
     ("quo_pending_messages", None),
+    ("shadow_episodes", None),
+    ("shadow_events", None),
 )
 
 
@@ -393,6 +400,99 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_job_id_id ON events (job_id, id)"
+    )
+    conn.commit()
+    _add_shadow_mode_support(conn)
+
+
+def _add_shadow_mode_support(conn: sqlite3.Connection) -> None:
+    """Shadow Mode's persistence: two additive tables, no existing table
+    touched. Mirrors this file's own established jobs/events split --
+    `shadow_episodes` is the one-row-per-episode enrichable snapshot
+    (mirrors `jobs`), `shadow_events` is the append-only chronological
+    log of every SHADOW_OBSERVATION/SHADOW_SUGGESTION/DISPATCHER_DECISION/
+    COMMERCIAL_UPDATE/CUSTOMER_RESPONSE/NEGOTIATION_OUTCOME/SHADOW_REVIEWED/
+    SHADOW_EXCLUDED action ever recorded against an episode (mirrors
+    `events`) -- so a corrected quote is never lost, only ever
+    superseded in the snapshot while the original stays visible in the
+    log. See docs/SHADOW_MODE.md.
+
+    `episode_id` is an opaque random identifier (never derived from
+    customer data), stable across every enrichment call for the same
+    episode -- see find_or_create_shadow_episode(). `job_id` starts NULL
+    for episodes observed before CONFIRM DISPATCHED (correlated instead
+    via pending_message_id or (source, ticket_or_pdl)) and is backfilled,
+    never re-created, once the job is committed."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shadow_episodes (
+            episode_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            source_message_id TEXT,
+            pending_message_id TEXT,
+            job_id INTEGER,
+            ticket_or_pdl TEXT,
+            dispatcher_actor TEXT,
+            technician_id INTEGER,
+            previous_job_status TEXT,
+            incoming_message_type TEXT,
+            normalized_intent TEXT,
+            shadow_suggested_action TEXT,
+            shadow_suggested_reply TEXT,
+            shadow_confidence REAL,
+            shadow_reasons_json TEXT,
+            validation_issues_json TEXT,
+            human_review_required INTEGER NOT NULL DEFAULT 0,
+            dispatcher_actual_action TEXT,
+            dispatcher_actual_reply TEXT,
+            actual_send_channel TEXT,
+            actual_send_confirmed_at TEXT,
+            commercial_update_json TEXT,
+            customer_response TEXT,
+            negotiation_outcome TEXT,
+            final_job_outcome TEXT,
+            review_status TEXT NOT NULL DEFAULT 'UNREVIEWED',
+            eligible_for_export INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            reviewed_at TEXT,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (job_id) REFERENCES jobs (id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_episodes_job_id ON shadow_episodes (job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_episodes_source_ticket ON shadow_episodes (source, ticket_or_pdl)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_episodes_pending_message_id ON shadow_episodes (pending_message_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shadow_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            actor TEXT,
+            payload_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (episode_id) REFERENCES shadow_episodes (episode_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_events_episode_id ON shadow_events (episode_id, id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_events_idempotency_key "
+        "ON shadow_events (idempotency_key) WHERE idempotency_key IS NOT NULL"
     )
     conn.commit()
 
@@ -2457,3 +2557,310 @@ def mark_quo_pending_message_actioned(conn: sqlite3.Connection, message_id: str)
         (_now(), message_id),
     )
     conn.commit()
+
+
+# ================================================================
+# Shadow Mode -- see docs/SHADOW_MODE.md. shadow_episodes is the
+# enrichable snapshot (mirrors `jobs`); shadow_events is the append-only
+# log (mirrors `events`). Neither table is ever read or written by any
+# operational command above this point -- Shadow Mode is purely
+# additive and has zero effect on job status, routing, or any existing
+# behavior.
+# ================================================================
+
+_SHADOW_EPISODE_JSON_FIELDS = {
+    "shadow_reasons": "shadow_reasons_json",
+    "validation_issues": "validation_issues_json",
+    "commercial_update": "commercial_update_json",
+}
+_SHADOW_EPISODE_BOOL_FIELDS = frozenset({"human_review_required"})
+_SHADOW_EPISODE_UPDATABLE_FIELDS = frozenset({
+    "job_id", "ticket_or_pdl", "dispatcher_actor", "technician_id", "previous_job_status",
+    "incoming_message_type", "normalized_intent",
+    "shadow_suggested_action", "shadow_suggested_reply", "shadow_confidence", "shadow_reasons",
+    "validation_issues", "human_review_required",
+    "dispatcher_actual_action", "dispatcher_actual_reply", "actual_send_channel", "actual_send_confirmed_at",
+    "commercial_update", "customer_response", "negotiation_outcome", "final_job_outcome",
+})
+
+
+def _shadow_episode_row_to_dict(columns: List[str], row: tuple) -> dict:
+    d = dict(zip(columns, row))
+    d["shadow_reasons"] = json.loads(d.pop("shadow_reasons_json") or "[]")
+    d["validation_issues"] = json.loads(d.pop("validation_issues_json") or "[]")
+    commercial_raw = d.pop("commercial_update_json")
+    d["commercial_update"] = json.loads(commercial_raw) if commercial_raw else None
+    d["human_review_required"] = bool(d["human_review_required"])
+    d["eligible_for_export"] = bool(d["eligible_for_export"])
+    return d
+
+
+def _get_shadow_episode_row(conn: sqlite3.Connection, where_clause: str, params: tuple) -> Optional[dict]:
+    cur = conn.execute(
+        f"SELECT * FROM shadow_episodes WHERE {where_clause} ORDER BY created_at DESC LIMIT 1", params,
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in cur.description]
+    return _shadow_episode_row_to_dict(columns, row)
+
+
+def get_shadow_episode(conn: sqlite3.Connection, episode_id: str) -> Optional[dict]:
+    return _get_shadow_episode_row(conn, "episode_id = ?", (episode_id,))
+
+
+def get_shadow_episode_for_job(conn: sqlite3.Connection, job_id: int) -> Optional[dict]:
+    return _get_shadow_episode_row(conn, "job_id = ?", (job_id,))
+
+
+def find_or_create_shadow_episode(
+    conn: sqlite3.Connection, *, source: str, channel: str,
+    ticket_or_pdl: Optional[str] = None, source_message_id: Optional[str] = None,
+    pending_message_id: Optional[str] = None, job_id: Optional[int] = None,
+    dispatcher_actor: Optional[str] = None, technician_id: Optional[int] = None,
+    previous_job_status: Optional[str] = None, incoming_message_type: Optional[str] = None,
+) -> dict:
+    """Finds the one episode representing this job's entire operational
+    story, or creates it. Correlation priority: job_id (once a job
+    exists it is the one stable identity) -> pending_message_id ->
+    (source, ticket_or_pdl) -> source_message_id -- the first of these
+    that is both supplied and already on record wins. A job's whole
+    chain (original message through negotiation through closing) shares
+    one episode_id; later facts enrich it via update_shadow_episode()
+    rather than creating a second episode. Never creates a jobs row,
+    never requires job_id."""
+    existing = None
+    if job_id is not None:
+        existing = _get_shadow_episode_row(conn, "job_id = ?", (job_id,))
+    if existing is None and pending_message_id:
+        existing = _get_shadow_episode_row(conn, "pending_message_id = ?", (pending_message_id,))
+    if existing is None and ticket_or_pdl:
+        existing = _get_shadow_episode_row(conn, "source = ? AND ticket_or_pdl = ?", (source, ticket_or_pdl))
+    if existing is None and source_message_id:
+        existing = _get_shadow_episode_row(conn, "source_message_id = ?", (source_message_id,))
+
+    now = _now()
+    if existing is not None:
+        if job_id is not None and existing.get("job_id") is None:
+            conn.execute(
+                "UPDATE shadow_episodes SET job_id = ?, updated_at = ? WHERE episode_id = ?",
+                (job_id, now, existing["episode_id"]),
+            )
+            conn.commit()
+            existing["job_id"] = job_id
+            existing["updated_at"] = now
+        return existing
+
+    episode_id = secrets.token_hex(16)
+    conn.execute(
+        """
+        INSERT INTO shadow_episodes (
+            episode_id, source, channel, source_message_id, pending_message_id, job_id,
+            ticket_or_pdl, dispatcher_actor, technician_id, previous_job_status,
+            incoming_message_type, shadow_reasons_json, validation_issues_json,
+            human_review_required, eligible_for_export, review_status,
+            created_at, updated_at, schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        """,
+        (
+            episode_id, source, channel, source_message_id, pending_message_id, job_id,
+            ticket_or_pdl, dispatcher_actor, technician_id, previous_job_status,
+            incoming_message_type, json.dumps([]), json.dumps([]),
+            ReviewStatus.UNREVIEWED.value, now, now, SHADOW_EPISODE_SCHEMA_VERSION,
+        ),
+    )
+    conn.commit()
+    return get_shadow_episode(conn, episode_id)
+
+
+def update_shadow_episode(conn: sqlite3.Connection, episode_id: str, **fields) -> dict:
+    """Incrementally enriches an existing episode -- never widens beyond
+    _SHADOW_EPISODE_UPDATABLE_FIELDS (episode_id/source/channel/
+    created_at/schema_version are immutable after creation). A missing
+    later fact is simply never passed here; it stays NULL/UNKNOWN rather
+    than being invented."""
+    if not fields:
+        current = get_shadow_episode(conn, episode_id)
+        if current is None:
+            raise ValueError(f"No shadow episode with id {episode_id}")
+        return current
+    unknown = set(fields) - _SHADOW_EPISODE_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(f"Unknown shadow episode field(s): {sorted(unknown)}")
+
+    set_clauses = []
+    params: list = []
+    for key, value in fields.items():
+        if key in _SHADOW_EPISODE_JSON_FIELDS:
+            column = _SHADOW_EPISODE_JSON_FIELDS[key]
+            value = json.dumps(value)
+        elif key in _SHADOW_EPISODE_BOOL_FIELDS:
+            column = key
+            value = 1 if value else 0
+        else:
+            column = key
+        set_clauses.append(f"{column} = ?")
+        params.append(value)
+    set_clauses.append("updated_at = ?")
+    params.append(_now())
+    params.append(episode_id)
+
+    conn.execute(f"UPDATE shadow_episodes SET {', '.join(set_clauses)} WHERE episode_id = ?", params)
+    conn.commit()
+    updated = get_shadow_episode(conn, episode_id)
+    if updated is None:
+        raise ValueError(f"No shadow episode with id {episode_id}")
+    return updated
+
+
+def get_shadow_event_by_idempotency_key(conn: sqlite3.Connection, idempotency_key: str) -> Optional[dict]:
+    """Read-side counterpart to record_shadow_event()'s dedup check --
+    lets a caller determine beforehand whether a call would be a replay,
+    for ActionResult.idempotent_replay reporting. Mirrors
+    get_event_by_idempotency_key()."""
+    row = conn.execute("SELECT * FROM shadow_events WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in conn.execute("SELECT * FROM shadow_events LIMIT 0").description]
+    d = dict(zip(columns, row))
+    d["payload"] = json.loads(d.pop("payload_json"))
+    return d
+
+
+def record_shadow_event(
+    conn: sqlite3.Connection, *, episode_id: str, event_type: str, channel: str,
+    payload: dict, actor: Optional[str] = None, idempotency_key: Optional[str] = None,
+) -> int:
+    """Append-only -- one row per shadow action, never updated or
+    deleted; a corrected commercial update is a new row, the original
+    stays exactly as recorded. Idempotent when idempotency_key is
+    supplied (same partial-unique-index pattern as events.idempotency_key
+    -- see docs/EVENT_CONTRACT.md): a second call with the same key
+    returns the existing row's id instead of inserting a duplicate."""
+    if idempotency_key:
+        existing = conn.execute(
+            "SELECT id FROM shadow_events WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        if existing is not None:
+            return existing[0]
+    now = _now()
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            """
+            INSERT INTO shadow_events (episode_id, event_type, channel, actor, payload_json, idempotency_key, created_at, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (episode_id, event_type, channel, actor, json.dumps(payload), idempotency_key, now, SHADOW_EPISODE_SCHEMA_VERSION),
+        )
+        event_id = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        if idempotency_key:
+            existing = conn.execute(
+                "SELECT id FROM shadow_events WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if existing is not None:
+                return existing[0]
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    return event_id
+
+
+def get_shadow_episode_events(conn: sqlite3.Connection, episode_id: str) -> List[dict]:
+    """Full chronological log for one episode -- every SHADOW_OBSERVATION/
+    SHADOW_SUGGESTION/DISPATCHER_DECISION/COMMERCIAL_UPDATE/
+    CUSTOMER_RESPONSE/NEGOTIATION_OUTCOME/SHADOW_REVIEWED/SHADOW_EXCLUDED
+    ever recorded for this episode, oldest first -- including every
+    superseded commercial update, never collapsed to just the latest."""
+    rows = conn.execute(
+        "SELECT * FROM shadow_events WHERE episode_id = ? ORDER BY id ASC", (episode_id,)
+    ).fetchall()
+    columns = [d[0] for d in conn.execute("SELECT * FROM shadow_events LIMIT 0").description]
+    events = []
+    for row in rows:
+        d = dict(zip(columns, row))
+        d["payload"] = json.loads(d.pop("payload_json"))
+        events.append(d)
+    return events
+
+
+def get_latest_verified_commercial_update_for_job(conn: sqlite3.Connection, job_id: int) -> Optional[dict]:
+    """The latest technician commercial update the dispatcher actually
+    reviewed and saved for this job (never a stale/superseded one --
+    commercial_update_json always holds the latest; the complete history
+    including every superseded quote remains in shadow_events, never
+    lost). Never reads across jobs. Returns None if no commercial update
+    has ever been recorded for this job."""
+    episode = get_shadow_episode_for_job(conn, job_id)
+    if episode is None:
+        return None
+    return episode.get("commercial_update")
+
+
+def set_shadow_review_status(conn: sqlite3.Connection, episode_id: str, review_status: str, reviewed_by: Optional[str] = None) -> dict:
+    """The only way an episode becomes export-eligible -- see
+    shadow.EXPORTABLE_REVIEW_STATES. Also records a SHADOW_REVIEWED (or
+    SHADOW_EXCLUDED, for EXCLUDE) shadow_event so the review decision
+    itself is auditable."""
+    valid_statuses = {s.value for s in ReviewStatus}
+    if review_status not in valid_statuses:
+        raise ValueError(f"Unknown review status: {review_status!r} -- must be one of {sorted(valid_statuses)}")
+    now = _now()
+    eligible = review_status in {s.value for s in EXPORTABLE_REVIEW_STATES}
+    conn.execute(
+        "UPDATE shadow_episodes SET review_status = ?, eligible_for_export = ?, reviewed_at = ?, updated_at = ? WHERE episode_id = ?",
+        (review_status, 1 if eligible else 0, now, now, episode_id),
+    )
+    conn.commit()
+    updated = get_shadow_episode(conn, episode_id)
+    if updated is None:
+        raise ValueError(f"No shadow episode with id {episode_id}")
+    event_type = ShadowEventType.SHADOW_EXCLUDED.value if review_status == ReviewStatus.EXCLUDE.value else ShadowEventType.SHADOW_REVIEWED.value
+    record_shadow_event(
+        conn, episode_id=episode_id, event_type=event_type, channel=ShadowChannel.CRM_DISPATCHER_ACTION.value,
+        payload={"review_status": review_status, "reviewed_by": reviewed_by}, actor=reviewed_by,
+    )
+    return updated
+
+
+def confirm_shadow_reply_sent(conn: sqlite3.Connection, episode_id: str, sent_channel: str, actor: Optional[str] = None) -> dict:
+    """Records that the dispatcher actually sent a prepared commercial
+    reply -- this module has no outbound capability of any kind, so
+    this call only ever documents a send that already happened outside
+    this application (in the real Quo or company-WhatsApp thread).
+    `sent_channel` is descriptive only (e.g. "Quo", "WhatsApp company
+    thread")."""
+    now = _now()
+    update_shadow_episode(conn, episode_id, actual_send_channel=sent_channel, actual_send_confirmed_at=now)
+    record_shadow_event(
+        conn, episode_id=episode_id, event_type=ShadowEventType.DISPATCHER_REPLY_CONFIRMED.value,
+        channel=ShadowChannel.CRM_DISPATCHER_ACTION.value, actor=actor, payload={"sent_channel": sent_channel},
+    )
+    updated = get_shadow_episode(conn, episode_id)
+    if updated is None:
+        raise ValueError(f"No shadow episode with id {episode_id}")
+    return updated
+
+
+def list_shadow_episodes(conn: sqlite3.Connection, *, limit: int = 50) -> List[dict]:
+    """Most-recently-updated first -- backs the read-only Shadow Review
+    screen. No customer data is masked here; callers displaying this to
+    a human review it exactly like any other operational screen (see
+    luxor_desk_shared.mask_sensitive() usage in the Shadow Review page)."""
+    cur = conn.execute("SELECT * FROM shadow_episodes ORDER BY updated_at DESC LIMIT ?", (limit,))
+    columns = [d[0] for d in cur.description]
+    return [_shadow_episode_row_to_dict(columns, row) for row in cur.fetchall()]
+
+
+def list_shadow_episodes_for_export(conn: sqlite3.Connection) -> List[dict]:
+    """Only VERIFIED/CORRECTED episodes -- see set_shadow_review_status().
+    An UNREVIEWED, EXCLUDE, SENSITIVE, or INCOMPLETE episode is never
+    returned here, regardless of what other fields it has filled in."""
+    cur = conn.execute("SELECT * FROM shadow_episodes WHERE eligible_for_export = 1 ORDER BY created_at ASC")
+    columns = [d[0] for d in cur.description]
+    return [_shadow_episode_row_to_dict(columns, row) for row in cur.fetchall()]
