@@ -524,7 +524,7 @@ def render_active_job_workspace(conn, job_id: int) -> None:
 
     import luxor_desk_read_model as rm
     import luxor_ops_shared as shared
-    from dispatcher import updates
+    from dispatcher import commercial, storage, updates
     from dispatcher.app_models import TechnicianUpdateCommand
     from dispatcher.application import DispatcherService
 
@@ -614,6 +614,95 @@ def render_active_job_workspace(conn, job_id: int) -> None:
         # A plain caption avoids that fragility entirely; the persistent
         # top navigation already puts Closings one tap away.
         st.info("MOVE TO CLOSING — open the Closings tab to continue this job.")
+
+    with st.expander("COMMERCIAL UPDATE (Shadow Mode)"):
+        st.caption(
+            "Observes and prepares only -- nothing here sends automatically. "
+            "Paste the technician's exact message; correct any field before saving."
+        )
+        dispatcher_actor = st.text_input(
+            "Dispatcher (name/initials — used for Shadow Mode records only)",
+            value=st.session_state.get("desk_dispatcher_actor", ""), key=f"commercial_actor_{job_id}",
+        ) or None
+        if dispatcher_actor:
+            st.session_state["desk_dispatcher_actor"] = dispatcher_actor
+
+        raw_commercial_text = st.text_area(
+            "Technician's exact WhatsApp message (paste exactly)", key=f"commercial_raw_{job_id}",
+        )
+        preview = commercial.extract_commercial_update(raw_commercial_text) if raw_commercial_text.strip() else None
+
+        if preview:
+            quote_type_options = [t.value for t in commercial.QuoteType]
+            chosen_quote_type = st.selectbox(
+                "Quote type", quote_type_options, index=quote_type_options.index(preview.quote_type.value),
+                key=f"commercial_quote_type_{job_id}",
+            )
+            amount, range_low, range_high = None, None, None
+            if chosen_quote_type == commercial.QuoteType.RANGE.value:
+                rcol1, rcol2 = st.columns(2)
+                with rcol1:
+                    range_low = st.text_input("Range low", value=preview.quote_range_low or "", key=f"commercial_low_{job_id}")
+                with rcol2:
+                    range_high = st.text_input("Range high", value=preview.quote_range_high or "", key=f"commercial_high_{job_id}")
+            elif chosen_quote_type in (commercial.QuoteType.FIXED.value, commercial.QuoteType.STARTING.value, commercial.QuoteType.ESTIMATE.value):
+                amount = st.text_input("Amount", value=preview.quote_amount or "", key=f"commercial_amount_{job_id}")
+
+            response_options = [r.value for r in commercial.CustomerResponseType]
+            chosen_response = st.selectbox(
+                "Customer response", response_options, index=response_options.index(preview.customer_response.value),
+                key=f"commercial_response_{job_id}",
+            )
+
+            if preview.human_review_required:
+                st.warning("HUMAN REVIEW NEEDED — wording did not clearly match a known quote phrasing. Correct the fields above before saving.")
+
+            with st.expander("View details (raw extraction)"):
+                st.caption(f"Confidence: {preview.confidence:.2f}")
+                if preview.validation_issues:
+                    st.caption("Issues: " + "; ".join(preview.validation_issues))
+
+            if st.button("Save verified commercial update", key=f"commercial_save_{job_id}", width="stretch"):
+                corrected_fields = {
+                    "quote_type": commercial.QuoteType(chosen_quote_type),
+                    "quote_amount": amount or None,
+                    "quote_range_low": range_low or None,
+                    "quote_range_high": range_high or None,
+                    "customer_response": commercial.CustomerResponseType(chosen_response),
+                }
+                result = service.record_commercial_update(
+                    job_id, raw_commercial_text, corrected_fields=corrected_fields, dispatcher_actor=dispatcher_actor,
+                )
+                if result.success:
+                    st.rerun()
+                else:
+                    st.error(result.user_message or "Could not save.")
+
+        episode = storage.get_shadow_episode_for_job(conn, job_id)
+        if episode and episode.get("commercial_update"):
+            cu = episode["commercial_update"]
+            status_label = {
+                "QUOTE_GIVEN": "Quote given", "WAITING_FOR_CUSTOMER": "Waiting for customer",
+                "NEGOTIATING": "Negotiating", "ACCEPTED": "Accepted", "LOST_ON_PRICE": "Lost on price",
+                "FOLLOW_UP_REQUIRED": "Follow-up required",
+            }.get(cu.get("negotiation_state"), "Human review needed")
+            st.markdown(f"**Negotiation status:** {status_label}")
+
+            reply_text = episode.get("dispatcher_actual_reply")
+            if reply_text:
+                st.code(reply_text)
+                st.caption("Send channel: Quo (company thread) — this business never uses WhatsApp for company replies.")
+                if episode.get("actual_send_confirmed_at"):
+                    st.success(f"✅ Sent manually · {shared.humanize_timestamp(episode['actual_send_confirmed_at'])}")
+                elif st.button("Mark commercial reply sent manually", key=f"commercial_sent_{job_id}", width="stretch"):
+                    result = service.confirm_commercial_reply_sent(job_id, "Quo", dispatcher_actor=dispatcher_actor)
+                    if result.success:
+                        st.success(result.user_message)
+                        st.rerun()
+                    else:
+                        st.error(result.user_message)
+            elif cu.get("human_review_required"):
+                st.warning("HUMAN REVIEW NEEDED — no company reply prepared for this commercial update.")
 
     with st.expander("PASS / CANCEL"):
         reason = st.text_input("Reason (required)", key=f"active_pass_reason_{job_id}")
