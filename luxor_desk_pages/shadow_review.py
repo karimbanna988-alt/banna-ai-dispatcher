@@ -30,6 +30,13 @@ conn = storage.connect()
 if not shared_desk.require_current_schema(conn):
     conn.close()
     st.stop()
+if not storage.shadow_schema_present(conn):
+    st.info(
+        "Shadow Mode requires a database upgrade that has not been applied yet. "
+        "This page will show episodes once migrated."
+    )
+    conn.close()
+    st.stop()
 
 service = DispatcherService(conn)
 episodes = storage.list_shadow_episodes(conn, limit=50)

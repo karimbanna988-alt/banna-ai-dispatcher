@@ -226,7 +226,8 @@ def test_migrate_adds_shadow_tables_without_disturbing_existing_data(tmp_path):
     status = storage.migrate_schema(conn)
 
     assert status.up_to_date
-    assert status.current_revision == 3
+    assert status.current_revision == 2  # core revision unchanged -- shadow tables don't bump it
+    assert storage.shadow_schema_present(conn) is True
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "shadow_episodes" in tables
     assert "shadow_events" in tables

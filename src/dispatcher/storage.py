@@ -53,14 +53,25 @@ DB_PATH = Path(__file__).resolve().parents[2] / "data" / "dispatcher.db"
 EVENT_SCHEMA_VERSION = 1
 LEGACY_EVENT_SCHEMA_VERSION = 0
 
-# The current target database schema revision, tracked via SQLite's own
-# PRAGMA user_version (never a second migration-tracking table -- see
-# docs/SCHEMA_MIGRATION_RUNBOOK.md for why one isn't needed here).
-# Bumped whenever a new migration function is added to _ensure_schema().
-# Revision 3 added shadow_episodes/shadow_events (see
-# _add_shadow_mode_support() and docs/SHADOW_MODE.md) -- purely additive,
-# no existing table's shape changed.
-SCHEMA_REVISION = 3
+# The current CORE target database schema revision, tracked via
+# SQLite's own PRAGMA user_version (never a second migration-tracking
+# table -- see docs/SCHEMA_MIGRATION_RUNBOOK.md for why one isn't needed
+# here). Bumped whenever a new migration function is added to
+# _ensure_schema() that the EXISTING dispatcher workflow depends on.
+#
+# Shadow Mode's tables (shadow_episodes/shadow_events, see
+# _add_shadow_mode_support() and docs/SHADOW_MODE.md) are deliberately
+# NOT counted here and do NOT bump this number -- they are an optional
+# capability layered on top of core revision 2, checked independently
+# via shadow_schema_present(). A database missing only the shadow
+# tables must still report core-ready (current_revision >= 2, nothing
+# in _SCHEMA_MARKERS missing) -- see
+# tests/test_shadow_persistence.py::test_missing_shadow_tables_never_fails_the_blanket_schema_check.
+# _ensure_schema() still creates the shadow tables as a harmless,
+# purely-additive side effect of any core migration (or a brand-new
+# database), so no second migration script is needed -- running the
+# existing `python scripts/manage_schema.py migrate` picks up both.
+SCHEMA_REVISION = 2
 
 # SQLite's own busy-wait, in milliseconds, before a writer blocked by
 # another writer's transaction gives up and raises "database is
@@ -172,9 +183,18 @@ _SCHEMA_MARKERS: tuple = (
     ("dispatch_tracking", None),
     ("console_activation_state", None),
     ("quo_pending_messages", None),
-    ("shadow_episodes", None),
-    ("shadow_events", None),
 )
+
+# Deliberately NOT part of _SCHEMA_MARKERS/check_schema_status(): those
+# gate every existing write-capable page (dispatch/active_jobs/closings)
+# via require_current_schema(), and none of that existing functionality
+# depends on shadow_episodes/shadow_events. Folding the shadow tables
+# into that same blanket check would make the entire, already-working
+# dispatch workflow report "Database upgrade required" the moment this
+# code ships, even before anyone touches Shadow Mode -- a regression to
+# functionality that has nothing to do with this feature. Shadow Mode's
+# own UI sections check shadow_schema_present() independently instead,
+# so only Shadow Mode itself degrades gracefully until migrated.
 
 
 @dataclass(frozen=True)
@@ -2567,6 +2587,22 @@ def mark_quo_pending_message_actioned(conn: sqlite3.Connection, message_id: str)
 # additive and has zero effect on job status, routing, or any existing
 # behavior.
 # ================================================================
+
+
+def shadow_schema_present(conn: sqlite3.Connection) -> bool:
+    """Read-only, independent of check_schema_status()/require_current_schema()
+    on purpose -- see _SCHEMA_MARKERS' own docstring for why shadow
+    tables are deliberately excluded from that blanket check. Callers
+    (Shadow Mode's own UI sections) use this to degrade gracefully
+    (skip only Shadow Mode's own content) on a database that has not
+    yet run the shadow-mode migration, without blocking any existing,
+    unrelated functionality."""
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('shadow_episodes', 'shadow_events')"
+        )
+    }
+    return {"shadow_episodes", "shadow_events"} <= tables
 
 _SHADOW_EPISODE_JSON_FIELDS = {
     "shadow_reasons": "shadow_reasons_json",

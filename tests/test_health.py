@@ -25,6 +25,23 @@ def test_health_on_fresh_database(tmp_path):
     assert result.migration_required is False
     assert result.integrity_status == "ok"
     assert result.foreign_key_violation_count == 0
+    assert result.shadow_schema_present is True
+
+
+def test_health_reports_shadow_schema_absent_without_blocking_core_readiness(tmp_path):
+    """A database shaped exactly like the real one (core up to date,
+    shadow tables not yet migrated) must report migration_required=False
+    (core is fine) while shadow_schema_present=False (Shadow Mode is
+    not yet available) -- the two are independent facts."""
+    conn = storage.connect(tmp_path / "core_only.db")
+    conn.execute("DROP TABLE shadow_episodes")
+    conn.execute("DROP TABLE shadow_events")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+
+    result = health.get_operational_health(conn)
+    assert result.migration_required is False
+    assert result.shadow_schema_present is False
 
 
 def test_health_never_writes(tmp_path):

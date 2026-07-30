@@ -35,6 +35,17 @@ def make_job(conn, vehicle_rules, raw="agn_clean.txt"):
     return storage.save_audit_entry(conn, job, classify_result, final_action="Approve")
 
 
+def _drop_shadow_tables(conn) -> None:
+    """Simulates the real database's exact current shape: every other
+    migration applied, shadow tables absent -- built by dropping them
+    from an otherwise-fully-migrated connection rather than hand-crafting
+    SQL, so it can never silently drift from the real schema shape."""
+    conn.execute("DROP TABLE shadow_episodes")
+    conn.execute("DROP TABLE shadow_events")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+
+
 # ---------------------------------------------------------------- Schema ---
 def test_shadow_tables_created_on_fresh_database(conn):
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -42,10 +53,37 @@ def test_shadow_tables_created_on_fresh_database(conn):
     assert "shadow_events" in tables
 
 
-def test_schema_revision_is_3(conn):
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+def test_core_schema_revision_unchanged_at_2(conn):
+    """Shadow Mode's tables are an optional capability layered on top of
+    core revision 2 -- they deliberately do not bump SCHEMA_REVISION.
+    See shadow_schema_present() for the independent shadow-readiness check."""
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     status = storage.check_schema_status(conn)
     assert status.up_to_date
+
+
+def test_shadow_schema_present_true_on_fresh_database(conn):
+    assert storage.shadow_schema_present(conn) is True
+
+
+def test_shadow_schema_present_false_when_tables_missing(conn):
+    _drop_shadow_tables(conn)
+    assert storage.shadow_schema_present(conn) is False
+
+
+def test_missing_shadow_tables_never_fails_the_blanket_schema_check(conn):
+    """Regression guard: a database exactly like the real one (every
+    other migration applied, shadow tables not yet migrated) must still
+    report up_to_date=True for check_schema_status()/require_current_schema()
+    -- that blanket check gates ALL existing write-capable pages
+    (dispatch/active_jobs/closings), none of which depend on shadow
+    tables. Shadow Mode's own shadow_schema_present() is the only thing
+    that should ever report this database as not-yet-ready, and only
+    for Shadow Mode's own UI sections."""
+    _drop_shadow_tables(conn)
+    status = storage.check_schema_status(conn)
+    assert status.up_to_date is True
+    assert status.missing == []
 
 
 # --------------------------------------------- find_or_create_shadow_episode

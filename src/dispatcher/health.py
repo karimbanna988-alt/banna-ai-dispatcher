@@ -24,6 +24,7 @@ class OperationalHealth:
     current_schema_revision: int
     required_schema_revision: int
     migration_required: bool
+    shadow_schema_present: bool
     integrity_status: Optional[str]
     foreign_key_violation_count: Optional[int]
     last_successful_quo_poll: Optional[str]
@@ -74,7 +75,7 @@ def get_operational_health(conn: sqlite3.Connection, backup_timestamp: Optional[
     except sqlite3.Error:
         return OperationalHealth(
             database_reachable=False, current_schema_revision=0, required_schema_revision=storage.SCHEMA_REVISION,
-            migration_required=True, integrity_status=None, foreign_key_violation_count=None,
+            migration_required=True, shadow_schema_present=False, integrity_status=None, foreign_key_violation_count=None,
             last_successful_quo_poll=None, last_poll_error=None, live_queue_count=0,
             oldest_live_message_age_seconds=None, config_error_count=0, config_warning_count=0,
             technicians_with_dispatch_destination=0, active_technician_count=0,
@@ -82,6 +83,12 @@ def get_operational_health(conn: sqlite3.Connection, backup_timestamp: Optional[
             ai_interpreter_enabled=DisabledReviewInterpreter().is_enabled(),
             notes=["database unreachable"],
         )
+
+    try:
+        shadow_present = storage.shadow_schema_present(conn)
+    except sqlite3.Error:
+        shadow_present = False
+        notes.append("shadow schema check failed to run")
 
     integrity_status = None
     fk_violation_count = None
@@ -139,6 +146,7 @@ def get_operational_health(conn: sqlite3.Connection, backup_timestamp: Optional[
         current_schema_revision=schema_status.current_revision,
         required_schema_revision=schema_status.required_revision,
         migration_required=not schema_status.up_to_date,
+        shadow_schema_present=shadow_present,
         integrity_status=integrity_status,
         foreign_key_violation_count=fk_violation_count,
         last_successful_quo_poll=last_poll,
