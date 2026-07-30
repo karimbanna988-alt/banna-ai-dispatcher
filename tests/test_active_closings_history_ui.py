@@ -84,7 +84,7 @@ def test_navigation_order_matches_canonical_workflow():
     source = pathlib.Path("luxor_desk.py").read_text(encoding="utf-8")
     nav_line = next(line for line in source.splitlines() if "st.navigation([" in line)
     order = [name.strip() for name in nav_line.split("[", 1)[1].split("]")[0].split(",")]
-    assert order == ["dispatch", "active_jobs", "closings", "history", "technicians", "activity"]
+    assert order == ["dispatch", "active_jobs", "closings", "history", "technicians", "activity", "shadow_review"]
 
 
 # --------------------------------------------------------------- Empty states

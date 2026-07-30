@@ -39,13 +39,16 @@ closings = st.Page("luxor_desk_pages/closings.py", title="Closings", url_path="c
 history = st.Page("luxor_desk_pages/history.py", title="Completed / History", url_path="history")
 technicians = st.Page("luxor_desk_pages/technicians.py", title="Technicians", url_path="technicians")
 activity = st.Page("luxor_desk_pages/activity.py", title="Activity", url_path="activity")
+shadow_review = st.Page("luxor_desk_pages/shadow_review.py", title="Shadow Review", url_path="shadow-review")
 
 # Canonical order: New Jobs -> Active Jobs -> Closings -> Completed /
 # History are the primary dispatcher workflow. Technicians stays
 # available as secondary reference; Activity stays available as a
 # secondary generic audit/developer feed -- normal dispatch history now
-# belongs on Completed / History instead.
-pg = st.navigation([dispatch, active_jobs, closings, history, technicians, activity], position="top")
+# belongs on Completed / History instead. Shadow Review is appended last
+# -- a secondary, passive-observation-only audit view, never part of the
+# primary dispatch workflow.
+pg = st.navigation([dispatch, active_jobs, closings, history, technicians, activity, shadow_review], position="top")
 
 st.markdown('<div class="desk-title" style="margin-bottom:0.5rem;">LUXOR LOCKSMITH OPERATIONS</div>', unsafe_allow_html=True)
 
