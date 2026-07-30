@@ -26,6 +26,7 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+shared_desk.render_header(conn, "Active Jobs")
 if not shared_desk.require_current_schema(conn):
     conn.close()
     st.stop()
@@ -35,7 +36,7 @@ st.caption(f"{len(active)} active job(s)")
 
 selected_id = None
 if not active:
-    st.info("No active jobs right now.")
+    st.info("No active jobs.")
 else:
     ids = [j["id"] for j in active]
     selected_id = st.session_state.get("desk_active_selected")

@@ -24,6 +24,7 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+shared_desk.render_header(conn, "Closings")
 if not shared_desk.require_current_schema(conn):
     conn.close()
     st.stop()
@@ -33,7 +34,7 @@ st.caption(f"{len(candidates)} job(s) in the closing workflow")
 
 selected_id = None
 if not candidates:
-    st.success("No closings awaiting action.")
+    st.success("No closings are waiting.")
 else:
     ids = [j["id"] for j in candidates]
     selected_id = st.session_state.get("desk_closings_selected")

@@ -1,7 +1,10 @@
 """Activity -- real append-only audit events. shared.fetch_all_events()
-via luxor_desk_read_model, unchanged. Business-facing labels via the
-existing humanize_event_label(), not raw message_type/final_action
-strings."""
+via luxor_desk_read_model, unchanged. Reuses
+luxor_desk_shared.history_event_label() -- the same business-facing
+labels the History page uses -- for consistent wording across both
+audit surfaces. A secondary, cross-job feed: normal dispatch history
+belongs on History; this page stays available as the generic audit/
+developer view."""
 
 from __future__ import annotations
 
@@ -22,13 +25,16 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
+shared_desk.render_header(conn, "Activity")
 events = rm.get_recent_activity(conn, limit=50)
+
+st.caption("A secondary audit feed across every job -- for normal dispatch history, use the History page instead.")
 
 if not events:
     st.info("No activity recorded yet.")
 for event in events:
     st.markdown(
-        f'<div class="desk-meta">{shared.humanize_event_label(event)} — '
+        f'<div class="desk-meta">{shared_desk.history_event_label(event)} — '
         f'{event.get("source") or "Unknown"} · {event.get("ticket_number") or "No reference"} — '
         f'{shared.humanize_timestamp(event["created_at"])}</div>',
         unsafe_allow_html=True,

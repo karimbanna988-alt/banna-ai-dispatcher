@@ -28,44 +28,38 @@ if not shared_desk.is_authenticated():
     st.stop()
 
 conn = storage.connect()
-if not shared_desk.require_current_schema(conn):
-    conn.close()
-    st.stop()
 
 # ------------------------------------------------------------ Sync -------
 if "desk_refresh_message" not in st.session_state:
     st.session_state.desk_refresh_message = None
 
-top_l, top_r = st.columns([3, 1])
-with top_r:
-    if st.button("Sync", key="desk_dispatch_sync", width="stretch"):
-        api_key = os.environ.get(API_KEY_ENV_VAR)
-        if not api_key:
-            st.session_state.desk_refresh_message = ("error", "Quo is not configured in this environment.")
-        else:
-            try:
-                client = quo_client.QuoClient(api_key=api_key)
-                outcome = poll_for_new_messages(conn, client)
-                st.session_state.desk_refresh_message = ("success", f"Synced -- {len(outcome.queued)} new message(s).")
-            except QuoConfigError as exc:
-                storage.record_poll_error(conn, str(exc))
-                st.session_state.desk_refresh_message = ("error", "Quo is not configured.")
-            except QuoAPIError as exc:
-                storage.record_poll_error(conn, str(exc))
-                st.session_state.desk_refresh_message = ("error", "Quo temporarily unavailable.")
-            shared.clear_pending_caches()
-        st.rerun()
-with top_l:
-    _connected = bool(os.environ.get(API_KEY_ENV_VAR))
-    _state, _ = shared.connection_state(conn, _connected)
-    _live_label = {"connected": "🟢 Live"}.get(_state, "🟡 Delayed" if _state == "delayed" else "🔴 Disconnected")
-    _last_poll = shared.fetch_last_refresh(conn)
-    st.caption(f"{_live_label} · last synced {shared.humanize_timestamp(_last_poll)}")
+sync_clicked = shared_desk.render_header(conn, "New Jobs", show_sync=True)
+if sync_clicked:
+    api_key = os.environ.get(API_KEY_ENV_VAR)
+    if not api_key:
+        st.session_state.desk_refresh_message = ("error", "Quo is not configured in this environment.")
+    else:
+        try:
+            client = quo_client.QuoClient(api_key=api_key)
+            outcome = poll_for_new_messages(conn, client)
+            st.session_state.desk_refresh_message = ("success", f"Synced -- {len(outcome.queued)} new message(s).")
+        except QuoConfigError as exc:
+            storage.record_poll_error(conn, str(exc))
+            st.session_state.desk_refresh_message = ("error", "Quo is not configured.")
+        except QuoAPIError as exc:
+            storage.record_poll_error(conn, str(exc))
+            st.session_state.desk_refresh_message = ("error", "Quo temporarily unavailable.")
+        shared.clear_pending_caches()
+    st.rerun()
 
 if st.session_state.desk_refresh_message:
     _kind, _msg = st.session_state.desk_refresh_message
     getattr(st, _kind)(_msg)
     st.session_state.desk_refresh_message = None
+
+if not shared_desk.require_current_schema(conn):
+    conn.close()
+    st.stop()
 
 # --------------------------------------------------------- Queue build ---
 live_entries, backlog_pending, other_messages = rm.get_live_dispatch_queue(conn)

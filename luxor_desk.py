@@ -9,12 +9,13 @@ database, no second parser, no second decision engine, no second
 persistence layer. Quo outbound stays disabled; WhatsApp stays manual
 copy/open only -- see luxor_desk_shared.render_job_workspace().
 
-Six real sections, one persistent top-of-page navigation (visible on
+Seven real sections, one persistent top-of-page navigation (visible on
 both desktop and portrait iPhone, never hidden in the collapsed
-sidebar): New Jobs, Active Jobs, Closings, Completed / History,
-Technicians, Activity. The first four are the primary dispatcher
-workflow; Technicians/Activity stay available as secondary reference/
-audit views.
+sidebar): New Jobs, Active Jobs, Closings, History, Technicians,
+Activity, Shadow Review. The first four are the primary dispatcher
+workflow; Technicians/Activity/Shadow Review stay available as secondary
+reference/audit views. Every page renders its own shared header via
+luxor_desk_shared.render_header() -- no separate top-level app title here.
 """
 
 from __future__ import annotations
@@ -36,20 +37,18 @@ shared.require_login()
 dispatch = st.Page("luxor_desk_pages/dispatch.py", title="New Jobs", url_path="new-jobs", default=True)
 active_jobs = st.Page("luxor_desk_pages/active_jobs.py", title="Active Jobs", url_path="active-jobs")
 closings = st.Page("luxor_desk_pages/closings.py", title="Closings", url_path="closings")
-history = st.Page("luxor_desk_pages/history.py", title="Completed / History", url_path="history")
+history = st.Page("luxor_desk_pages/history.py", title="History", url_path="history")
 technicians = st.Page("luxor_desk_pages/technicians.py", title="Technicians", url_path="technicians")
 activity = st.Page("luxor_desk_pages/activity.py", title="Activity", url_path="activity")
 shadow_review = st.Page("luxor_desk_pages/shadow_review.py", title="Shadow Review", url_path="shadow-review")
 
-# Canonical order: New Jobs -> Active Jobs -> Closings -> Completed /
-# History are the primary dispatcher workflow. Technicians stays
-# available as secondary reference; Activity stays available as a
-# secondary generic audit/developer feed -- normal dispatch history now
-# belongs on Completed / History instead. Shadow Review is appended last
-# -- a secondary, passive-observation-only audit view, never part of the
-# primary dispatch workflow.
+# Canonical order: New Jobs -> Active Jobs -> Closings -> History are the
+# primary dispatcher workflow. Technicians stays available as secondary
+# reference; Activity stays available as a secondary generic audit/
+# developer feed -- normal dispatch history now belongs on History
+# instead. Shadow Review is appended last -- a secondary, passive-
+# observation-only audit view, never part of the primary dispatch
+# workflow.
 pg = st.navigation([dispatch, active_jobs, closings, history, technicians, activity, shadow_review], position="top")
-
-st.markdown('<div class="desk-title" style="margin-bottom:0.5rem;">LUXOR LOCKSMITH OPERATIONS</div>', unsafe_allow_html=True)
 
 pg.run()
