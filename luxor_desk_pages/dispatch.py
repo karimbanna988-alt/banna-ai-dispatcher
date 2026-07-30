@@ -61,6 +61,8 @@ if not shared_desk.require_current_schema(conn):
     conn.close()
     st.stop()
 
+shared_desk.render_workflow_strip(conn, "New")
+
 # --------------------------------------------------------- Queue build ---
 live_entries, backlog_pending, other_messages = rm.get_live_dispatch_queue(conn)
 
@@ -93,6 +95,43 @@ active_filter = st.pills(
 filtered = [e for e in live_entries if entry_filter_match(e, active_filter)]
 st.caption(f"Previous backlog: {len(backlog_pending)} (not urgent, not counted here)")
 
+# ------------------------------------------------- Needs action / Waiting -
+# "Waiting" = the dispatcher already tapped something for this job (K sent
+# and/or WhatsApp opened) but hasn't confirmed dispatch yet -- come back
+# and finish it. "Needs action" = everything untouched, or blocked by
+# missing/conflicting data. See docs/operator_ui_blueprint.md's mobile
+# addendum for why New Jobs has no third, "nothing to do" bucket.
+VIEW_OPTIONS = ("Needs action", "Waiting", "All")
+
+
+def entry_bucket(e: rm.QueueEntry) -> str:
+    needs_review = bool(e.result.decision.missing_information) or bool(e.classify_result.conflicting_fields)
+    started = bool(e.tracking["acknowledged_at"]) or bool(e.tracking["whatsapp_opened_at"])
+    if needs_review or not started:
+        return "needs_action"
+    return "waiting"
+
+
+def view_match(e: rm.QueueEntry, name: str) -> bool:
+    if name == "All":
+        return True
+    return entry_bucket(e) == ("needs_action" if name == "Needs action" else "waiting")
+
+
+view_counts = {name: sum(1 for e in filtered if view_match(e, name)) for name in VIEW_OPTIONS}
+active_view = st.pills(
+    "View", VIEW_OPTIONS, selection_mode="single", default="Needs action",
+    key="desk_dispatch_view", label_visibility="collapsed",
+    format_func=lambda n: f"{n} ({view_counts[n]})",
+) or "Needs action"
+# The company-filtered set stays the *selectable* universe -- a job the
+# dispatcher is mid-flow on (e.g. just sent K) can move from "Needs
+# action" to "Waiting" the moment they act on it; it must not vanish out
+# from under them just because the view narrowed. view_filtered only
+# drives what the compact queue list and "Next job" show.
+company_filtered = filtered
+view_filtered = [e for e in company_filtered if view_match(e, active_view)]
+
 
 def entry_identity(e: rm.QueueEntry) -> str:
     """The canonical representative's own message_id -- always unique
@@ -115,16 +154,21 @@ def group_for(e: rm.QueueEntry) -> str:
     return GROUP_LABELS.get(e.job.source.value, e.job.source.value)
 
 
-if not filtered:
+company_identities = [entry_identity(e) for e in company_filtered]
+view_identities = [entry_identity(e) for e in view_filtered]
+
+if not company_filtered:
     st.success("No jobs need your attention right now.")
     selected = None
+    selected_id = None
 else:
-    working_identities = [entry_identity(e) for e in filtered]
     selected_id = st.session_state.get("desk_dispatch_selected")
-    if selected_id not in working_identities:
-        selected_id = working_identities[0]
+    if selected_id not in company_identities:
+        fallback_pool = view_identities or company_identities
+        selected_id = fallback_pool[0]
     st.session_state.desk_dispatch_selected = selected_id
-    selected = next(e for e in filtered if entry_identity(e) == selected_id)
+    selected = next(e for e in company_filtered if entry_identity(e) == selected_id)
+    shared_desk.render_next_job_button(view_identities or company_identities, selected_id, "desk_dispatch_selected", "desk_dispatch_next")
 
 with st.container(key="desk_layout"):
     with st.container(key="desk_area_workspace"):
@@ -132,12 +176,12 @@ with st.container(key="desk_layout"):
             shared_desk.render_job_workspace(conn, selected)
 
     with st.container(key="desk_area_queue"):
-        if filtered:
-            st.markdown(f'<div class="desk-section-title">Queue ({len(filtered)})</div>', unsafe_allow_html=True)
+        if view_filtered:
+            st.markdown(f'<div class="desk-section-title">Queue ({len(view_filtered)})</div>', unsafe_allow_html=True)
             if active_filter == "All":
                 groups: dict = {}
                 order = []
-                for e in filtered:
+                for e in view_filtered:
                     g = group_for(e)
                     if g not in groups:
                         groups[g] = []
@@ -148,8 +192,10 @@ with st.container(key="desk_layout"):
                     for e in groups[g]:
                         shared_desk.render_queue_row(e, entry_identity(e), selected_id)
             else:
-                for e in filtered:
+                for e in view_filtered:
                     shared_desk.render_queue_row(e, entry_identity(e), selected_id)
+        elif company_filtered:
+            st.caption("No jobs in this view.")
 
 with st.expander(f"Other Messages ({len(other_messages)})"):
     for item in other_messages:

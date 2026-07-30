@@ -29,6 +29,7 @@ if not shared_desk.is_authenticated():
 
 conn = storage.connect()
 shared_desk.render_header(conn, "History")
+shared_desk.render_workflow_strip(conn, "History")
 completed = rm.get_completed_jobs(conn)
 
 if not completed:
