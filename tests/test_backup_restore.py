@@ -205,3 +205,71 @@ def test_manage_schema_verify_passes_for_current_db(tmp_path, vehicle_rules, cap
     captured = capsys.readouterr()
     assert "PASS" in captured.out
     assert "BKPTEST" not in captured.out
+
+
+# ---------------------------------------- manage_schema + optional Shadow schema
+def _core_ready_shadow_missing_db(db_path) -> None:
+    """Shaped exactly like the real database before its Shadow Mode
+    migration: core revision 2, shadow_episodes/shadow_events absent."""
+    conn = storage.connect(db_path)
+    conn.execute("DROP TABLE shadow_episodes")
+    conn.execute("DROP TABLE shadow_events")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+
+def test_manage_schema_migrate_applies_shadow_schema_even_when_core_is_up_to_date(tmp_path, monkeypatch):
+    """Regression test for the exact bug found in the real migration
+    attempt: cmd_migrate used to check only core status.up_to_date and
+    exit early with "Nothing to do" whenever core was already current --
+    silently never adding the optional Shadow Mode tables to a database
+    exactly like the real one. Confirms the fix actually applies them."""
+    db_path = tmp_path / "core_ready.db"
+    _core_ready_shadow_missing_db(db_path)
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(backup_database, "DEFAULT_BACKUP_DIR", backup_dir)
+
+    conn = storage.connect(db_path)
+    assert storage.shadow_schema_present(conn) is False
+    conn.close()
+
+    exit_code = manage_schema.cmd_migrate(db_path, assume_yes=True)
+    assert exit_code == 0
+    assert backup_dir.exists()
+    assert any(backup_dir.iterdir())
+
+    conn = storage.connect(db_path)
+    assert storage.shadow_schema_present(conn) is True
+    status = storage.check_schema_status(conn)
+    assert status.up_to_date
+    assert conn.execute("SELECT COUNT(*) FROM shadow_episodes").fetchone()[0] == 0
+    conn.close()
+
+
+def test_manage_schema_migrate_is_a_true_no_op_when_both_core_and_shadow_ready(tmp_path, vehicle_rules, monkeypatch):
+    source = _seeded_db(tmp_path, vehicle_rules)  # fresh DB -- core + shadow both current
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(backup_database, "DEFAULT_BACKUP_DIR", backup_dir)
+
+    exit_code = manage_schema.cmd_migrate(source, assume_yes=True)
+    assert exit_code == 0
+    assert not backup_dir.exists()  # no backup taken -- nothing to migrate
+
+
+def test_manage_schema_check_reports_shadow_status_without_failing_on_core(tmp_path, capsys):
+    db_path = tmp_path / "core_ready.db"
+    _core_ready_shadow_missing_db(db_path)
+    exit_code = manage_schema.cmd_check(db_path)
+    assert exit_code == 0  # core is fine -- must not be reported as broken
+    captured = capsys.readouterr()
+    assert "Shadow Mode schema present (optional): False" in captured.out
+
+
+def test_manage_schema_verify_reports_shadow_status(tmp_path, vehicle_rules, capsys):
+    source = _seeded_db(tmp_path, vehicle_rules)
+    exit_code = manage_schema.cmd_verify(source)
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Shadow Mode schema present (optional): True" in captured.out
+    assert "shadow_episodes rows: 0" in captured.out

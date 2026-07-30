@@ -48,20 +48,30 @@ def cmd_check(db_path: Path) -> int:
         return 2
     conn = storage.connect(db_path)
     status = storage.check_schema_status(conn)
+    shadow_ready = storage.shadow_schema_present(conn)
     conn.close()
 
     print(f"Current schema revision:  {status.current_revision}")
     print(f"Required schema revision: {status.required_revision}")
+    print(f"Shadow Mode schema present (optional): {shadow_ready}")
     if status.up_to_date:
-        print("Schema is up to date. No migration required.")
-        return 0
-    print(f"Pending migrations ({len(status.missing)}):")
-    for item in status.missing:
-        print(f"  - {item}")
-    print()
-    print("Run to apply:")
-    print(f"  python scripts/manage_schema.py migrate --db {db_path}")
-    return 1
+        print("Core schema is up to date. No core migration required.")
+    else:
+        print(f"Pending core migrations ({len(status.missing)}):")
+        for item in status.missing:
+            print(f"  - {item}")
+    if not shadow_ready:
+        print("Shadow Mode's schema is not yet installed -- optional, run migrate to add it.")
+    if not status.up_to_date or not shadow_ready:
+        print()
+        print("Run to apply:")
+        print(f"  python scripts/manage_schema.py migrate --db {db_path}")
+    # Exit code reflects CORE readiness only -- Shadow Mode is an
+    # optional capability layered on top of core revision 2 (see
+    # storage.py's own _SCHEMA_MARKERS docstring); its absence must
+    # never be reported as "the database needs an urgent migration" the
+    # way a genuine core gap is.
+    return 0 if status.up_to_date else 1
 
 
 def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
@@ -71,14 +81,18 @@ def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
 
     conn = storage.connect(db_path)
     status = storage.check_schema_status(conn)
-    if status.up_to_date:
+    shadow_ready = storage.shadow_schema_present(conn)
+    if status.up_to_date and shadow_ready:
         conn.close()
-        print("Schema is already up to date. Nothing to do.")
+        print("Schema is already up to date (core and Shadow Mode). Nothing to do.")
         return 0
 
-    print(f"Pending migrations ({len(status.missing)}):")
-    for item in status.missing:
-        print(f"  - {item}")
+    if not status.up_to_date:
+        print(f"Pending core migrations ({len(status.missing)}):")
+        for item in status.missing:
+            print(f"  - {item}")
+    if not shadow_ready:
+        print("Pending optional migration: Shadow Mode schema (shadow_episodes, shadow_events)")
     print()
 
     if not assume_yes:
@@ -92,14 +106,17 @@ def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
     print(f"Backup created: {backup_path}")
 
     result = storage.migrate_schema(conn)
+    shadow_ready_after = storage.shadow_schema_present(conn)
     conn.close()
 
-    if result.up_to_date:
-        print(f"Migration complete. Schema revision is now {result.current_revision}.")
+    if result.up_to_date and shadow_ready_after:
+        print(f"Migration complete. Core schema revision is now {result.current_revision}; Shadow Mode schema present: {shadow_ready_after}.")
         return 0
     print("Migration finished but the schema is still not fully up to date:")
     for item in result.missing:
         print(f"  - {item}")
+    if not shadow_ready_after:
+        print("  - Shadow Mode schema still missing")
     print("Re-run this command to resume -- migrate_schema() is idempotent and resumable.")
     return 1
 
@@ -131,6 +148,16 @@ def cmd_verify(db_path: Path) -> int:
     ).fetchone()
     print(f"idx_events_idempotency_key present: {index_row is not None}")
     ok = ok and index_row is not None
+
+    # Informational only -- Shadow Mode is optional and never affects
+    # the core VERIFY: PASS/FAIL verdict above.
+    shadow_ready = storage.shadow_schema_present(conn)
+    print(f"Shadow Mode schema present (optional): {shadow_ready}")
+    if shadow_ready:
+        shadow_episode_count = conn.execute("SELECT COUNT(*) FROM shadow_episodes").fetchone()[0]
+        shadow_event_count = conn.execute("SELECT COUNT(*) FROM shadow_events").fetchone()[0]
+        print(f"  shadow_episodes rows: {shadow_episode_count}")
+        print(f"  shadow_events rows: {shadow_event_count}")
 
     print("Row counts:")
     for table in ("jobs", "events", "quo_pending_messages", "technicians"):
