@@ -59,12 +59,19 @@ html, body {{ overflow-x: hidden !important; }}
 h1, h2, h3, h4, p, div, span, label {{ color: {TEXT}; }}
 
 .desk-header {{
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 0.35rem 0 0.6rem 0; border-bottom: 1px solid {BORDER}; margin-bottom: 0.5rem; gap: 0.5rem;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 0.35rem 0 0.3rem 0; margin-bottom: 0.2rem; gap: 0.5rem; flex-wrap: wrap;
 }}
-.desk-title {{ font-size: 1rem; font-weight: 700; color: {TEXT}; white-space: nowrap; }}
-.desk-status-line {{ font-size: 0.72rem; color: {MUTED}; text-align: right; line-height: 1.3; }}
+.desk-title {{ font-size: 0.78rem; font-weight: 700; color: {MUTED}; letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }}
+.desk-page-title {{ font-size: 1.25rem; font-weight: 700; color: {TEXT}; white-space: nowrap; line-height: 1.25; }}
+.desk-status-line {{ font-size: 0.72rem; color: {MUTED}; text-align: right; line-height: 1.3; white-space: nowrap; }}
 .desk-live-dot {{ display:inline-block; width:7px; height:7px; border-radius:50%; background:#34D399; margin-right: 0.3rem; }}
+.desk-header-actions [data-testid="stHorizontalBlock"] {{ gap: 0.4rem !important; }}
+.desk-header-actions button {{ font-size: 0.72rem !important; padding: 0.35rem 0.6rem !important; min-height: 34px !important; }}
+.desk-warning-chip {{
+    display: inline-block; padding: 0.06rem 0.5rem; border-radius: 999px;
+    font-size: 0.68rem; font-weight: 700; color: #FFFFFF; background: {URGENCY_COLORS['warning']};
+}}
 
 .desk-section-title {{
     font-size: 0.7rem; font-weight: 700; color: {MUTED}; text-transform: uppercase;
@@ -236,6 +243,53 @@ def require_current_schema(conn) -> bool:
     return False
 
 
+def render_header(conn, title: str, show_sync: bool = False) -> bool:
+    """One shared header for every page: fixed app name, current page
+    title, Quo connection state, last successful sync time, and a
+    logout control -- never process IDs, schema revision, database
+    paths, git hashes, or env var names (those belong only inside a
+    page's own "Technical details" expander, if it has one). Returns
+    True exactly once, on the render where the caller's own "Sync"
+    button was clicked -- the actual poll/error-handling logic stays in
+    the calling page (dispatch.py), this component only renders the
+    trigger so New Jobs is the only page that shows it."""
+    import os
+
+    import streamlit as st
+
+    import luxor_ops_shared as shared
+    from dispatcher.quo_client import API_KEY_ENV_VAR
+
+    left, right = st.columns([2, 1])
+    with left:
+        st.markdown(
+            f'<div class="desk-title">LUXOR LOCKSMITH</div><div class="desk-page-title">{title}</div>',
+            unsafe_allow_html=True,
+        )
+    sync_clicked = False
+    with right:
+        api_key_configured = bool(os.environ.get(API_KEY_ENV_VAR))
+        _state, label = shared.connection_state(conn, api_key_configured)
+        last_sync = shared.fetch_last_refresh(conn)
+        st.markdown(
+            f'<div class="desk-status-line">{label} · synced {shared.humanize_timestamp(last_sync)}</div>',
+            unsafe_allow_html=True,
+        )
+        with st.container(key="desk_header_actions_wrapper"):
+            st.markdown('<div class="desk-header-actions">', unsafe_allow_html=True)
+            action_cols = st.columns(2) if show_sync else st.columns(1)
+            if show_sync:
+                with action_cols[0]:
+                    sync_clicked = st.button("Sync", key="desk_header_sync", width="stretch")
+            with action_cols[-1]:
+                if st.button("Log out", key="desk_header_logout", width="stretch"):
+                    st.session_state[AUTH_SESSION_KEY] = False
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="desk-divider"></div>', unsafe_allow_html=True)
+    return sync_clicked
+
+
 def urgency_dot_color(urgency: str) -> str:
     return URGENCY_COLORS.get(urgency, MUTED)
 
@@ -311,26 +365,26 @@ def render_job_workspace(conn, entry) -> None:
 
     resolution, eligible, market_label = rm.resolve_job_routing(conn, job, item["raw_text"])
     area_label = resolution.canonical_area or "Area unresolved"
-    stage = _lifecycle_stage(tracking)
 
-    # Header
+    # ---- Header: source, ticket, time received ----------------------
     st.markdown(
         f'<div class="desk-card-top">'
         f'{source_chip_html(job.source.value)}'
         f'<span class="desk-ticket">{job.ticket_number.value or "No reference"}</span>'
-        f'<span class="desk-age">{format_age(entry.age_seconds)} ago</span>'
+        f'<span class="desk-age">Received {format_age(entry.age_seconds)} ago</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
-    st.markdown(f'<div class="desk-meta">{area_label} · {job.service_type.value or "Not specified"}{" (" + market_label + ")" if market_label else ""}</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<div><span class="desk-chip-outline">{stage}</span> '
-        f'<span class="desk-chip-outline">{eligible[0]["name"] if len(eligible) == 1 else (str(len(eligible)) + " eligible" if eligible else "No technician configured")}</span></div>',
-        unsafe_allow_html=True,
-    )
+    # ---- City/state, service, and only the fields that are present --
+    meta_line = f"{area_label} · {job.service_type.value or 'Not specified'}"
+    if market_label:
+        meta_line += f" ({market_label})"
+    st.markdown(f'<div class="desk-meta">{meta_line}</div>', unsafe_allow_html=True)
+    if job.vehicle.value:
+        st.markdown(f'<div class="desk-meta">Vehicle: {job.vehicle.value}</div>', unsafe_allow_html=True)
 
     if not require_current_schema(conn):
-        with st.expander("View details"):
+        with st.expander("Technical details"):
             _render_details(conn, item, job, area_label, market_label, eligible, resolution)
         return
 
@@ -338,12 +392,23 @@ def render_job_workspace(conn, entry) -> None:
 
     if needs_review:
         problems = list(result.decision.missing_information) + [f"conflicting {f}" for f in classify_result.conflicting_fields]
-        st.warning(f"HUMAN REVIEW NEEDED — {', '.join(problems)}")
-        with st.expander("View details"):
+        st.warning(f"Please review this job before dispatching — {', '.join(problems)}.")
+        with st.expander("Technical details"):
             _render_details(conn, item, job, area_label, market_label, eligible, resolution)
-        with st.expander("Handle manually / pass"):
+        with st.expander("Handle manually or pass"):
             _render_secondary_actions(conn, mid, job, classify_result, result)
         return
+
+    # ---- Recommended technician + WhatsApp destination ---------------
+    destination = eligible[0]["dispatch_group"] if eligible else None
+    if len(eligible) == 1:
+        tech_line = f"Technician: <strong>{eligible[0]['name']}</strong>"
+    elif eligible:
+        tech_line = f"{len(eligible)} technicians eligible — pick one in WhatsApp"
+    else:
+        tech_line = "No technician configured for this area"
+    dest_line = f"WhatsApp: <strong>{destination}</strong>" if destination else "WhatsApp destination not configured"
+    st.markdown(f'<div class="desk-meta">{tech_line} · {dest_line}</div>', unsafe_allow_html=True)
 
     stream_key = rm.policy_stream_key(item["group_label"], job.source.value)
     policy = get_policy(stream_key, classify_result.message_type.value)
@@ -357,7 +422,7 @@ def render_job_workspace(conn, entry) -> None:
         mode = outbound.current_mode()
         if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
             if not tracking["acknowledged_at"]:
-                if st.button("SEND K", key=f"desk_k_{mid}", type="primary", width="stretch"):
+                if st.button("Send K", key=f"desk_k_{mid}", type="primary", width="stretch"):
                     ack_result = service.attempt_quo_acknowledgment(
                         mid, source=job.source.value, job_id=classify_result.existing_job_id,
                         quo_contact_id=item["group_label"], text="K",
@@ -365,46 +430,47 @@ def render_job_workspace(conn, entry) -> None:
                     st.caption(ack_result.user_message)
                     st.rerun()
             else:
-                st.success("✅ K acknowledged")
+                st.success("✅ K sent")
         elif not tracking["acknowledged_at"]:
+            st.caption("Copy K")
             k_cols = st.columns(2)
             with k_cols[0]:
                 st.code("K")
             with k_cols[1]:
-                if st.button("MARK K SENT MANUALLY", key=f"desk_k_{mid}", width="stretch"):
+                if st.button("I sent K in Quo", key=f"desk_k_{mid}", width="stretch"):
                     service.acknowledge_job_manually(mid)
                     st.rerun()
         else:
-            st.success("✅ K acknowledged")
+            st.success("✅ K sent")
     else:
-        st.caption("NO ACKNOWLEDGMENT REQUIRED")
+        st.caption("No K acknowledgment needed for Main Leads")
 
     # The already-prepared Luxor technician message -- visible
     # immediately, never behind an "Extracted fields"/"Copy Luxor
     # message" step first.
+    st.caption("Copy technician message")
     st.code(result.luxor_message)
 
-    destination = eligible[0]["dispatch_group"] if eligible else None
     dispatched = tracking["dispatched_manually_at"] is not None
 
     if dispatched:
-        st.success("✅ Dispatched")
+        st.success("✅ Job dispatched")
     else:
         if not destination:
             st.caption("WhatsApp destination not configured")
-        if st.button("DISPATCH IN WHATSAPP", key=f"desk_wa_{mid}", type="primary", width="stretch", disabled=not destination):
+        if st.button("I sent it in WhatsApp", key=f"desk_wa_{mid}", type="primary", width="stretch", disabled=not destination):
             service.prepare_technician_dispatch(mid)
             st.rerun()
         if tracking["whatsapp_opened_at"] and not tracking["dispatched_manually_at"]:
-            if st.button("CONFIRM DISPATCHED", key=f"desk_confirm_dispatch_{mid}", type="primary", width="stretch"):
+            if st.button("Confirm dispatched", key=f"desk_confirm_dispatch_{mid}", type="primary", width="stretch"):
                 dispatch_result = service.confirm_whatsapp_dispatch(mid, job, classify_result, result.luxor_message)
                 st.success(dispatch_result.user_message)
                 st.rerun()
 
-    with st.expander("View details"):
+    with st.expander("Technical details"):
         _render_details(conn, item, job, area_label, market_label, eligible, resolution)
 
-    with st.expander("Handle manually / pass"):
+    with st.expander("Handle manually or pass"):
         _render_secondary_actions(conn, mid, job, classify_result, result)
 
 
@@ -415,7 +481,7 @@ def _render_details(conn, item, job, area_label, market_label, eligible, resolut
     normal job can be acted on" requirement."""
     import streamlit as st
 
-    st.markdown("**Original company message**")
+    st.markdown("**Original message**")
     st.code(shared_mask(item["raw_text"]))
 
     st.markdown("**Extracted fields**")
@@ -475,6 +541,40 @@ UPDATE_TYPES = (
     "Going", "ETA", "No Answer", "No Show", "Not Available",
     "Customer Cancelled", "Completed", "Custom",
 )
+
+# Plain-English display labels for Commercial Update's internal enum
+# values (dispatcher.commercial.QuoteType/CustomerResponseType) --
+# translation only, via st.selectbox(format_func=...); the underlying
+# option values passed to record_commercial_update() are always the
+# real enum .value strings, unchanged.
+COMMERCIAL_QUOTE_TYPE_LABELS = {
+    "FIXED": "Fixed price",
+    "STARTING": "Starting price",
+    "RANGE": "Price range",
+    "ESTIMATE": "Estimate",
+    "NO_AMOUNT": "No price given",
+    "UNKNOWN": "Unclear",
+}
+COMMERCIAL_CUSTOMER_RESPONSE_LABELS = {
+    "ACCEPTED": "Accepted",
+    "DECLINED": "Declined",
+    "WILL_CALL_BACK": "Will call back",
+    "THINKING": "Thinking",
+    "TOO_EXPENSIVE": "Price too high",
+    "SHOPPING_AROUND": "Shopping around",
+    "REQUESTED_DISCOUNT": "Requested discount",
+    "NO_RESPONSE": "No response",
+    "UNKNOWN": "Unclear",
+}
+COMMERCIAL_NEGOTIATION_LABELS = {
+    "QUOTE_GIVEN": "Quote given",
+    "WAITING_FOR_CUSTOMER": "Waiting for customer",
+    "NEGOTIATING": "Negotiating",
+    "ACCEPTED": "Accepted",
+    "LOST_ON_PRICE": "Lost on price",
+    "FOLLOW_UP_REQUIRED": "Follow-up required",
+    "UNKNOWN": "Human review needed",
+}
 
 
 def render_job_row(job: dict, identity: str, selected_id: str, key_prefix: str, subtitle: str) -> None:
@@ -558,39 +658,141 @@ def render_active_job_workspace(conn, job_id: int) -> None:
 
     if not require_current_schema(conn):
         return
-    else:
+
+    # ---- 2. Technician update -----------------------------------------
+    st.markdown('<div class="desk-section-title">Technician update</div>', unsafe_allow_html=True)
+    if not latest:
         st.caption("No technician update recorded yet.")
+    update_type = st.selectbox("Update type", UPDATE_TYPES, key=f"active_update_type_{job_id}")
+    eta_minutes = None
+    if update_type == "ETA":
+        eta_minutes = st.number_input("ETA minutes", min_value=1, max_value=999, step=1, value=15, key=f"active_eta_{job_id}")
+    raw_update = st.text_area("Technician's actual reply (paste exactly)", key=f"active_raw_update_{job_id}")
+    if st.button("Save technician update", key=f"active_save_update_{job_id}", width="stretch"):
+        if not raw_update.strip():
+            st.error("Paste the technician's actual reply first.")
+        else:
+            command = TechnicianUpdateCommand(
+                job_id=job_id, update_type=update_type, raw_update=raw_update,
+                eta_minutes=int(eta_minutes) if eta_minutes else None,
+            )
+            service.record_technician_update(command)
+            st.rerun()
 
-    with st.expander("RECORD TECH UPDATE", expanded=not latest):
-        update_type = st.selectbox("Update type", UPDATE_TYPES, key=f"active_update_type_{job_id}")
-        eta_minutes = None
-        if update_type == "ETA":
-            eta_minutes = st.number_input("ETA minutes", min_value=1, max_value=999, step=1, value=15, key=f"active_eta_{job_id}")
-        raw_update = st.text_area("Technician's actual reply (paste exactly)", key=f"active_raw_update_{job_id}")
-        if st.button("Save technician update", key=f"active_save_update_{job_id}", width="stretch"):
-            if not raw_update.strip():
-                st.error("Paste the technician's actual reply first.")
-            else:
-                command = TechnicianUpdateCommand(
-                    job_id=job_id, update_type=update_type, raw_update=raw_update,
-                    eta_minutes=int(eta_minutes) if eta_minutes else None,
+    # ---- 3. Commercial update -------------------------------------------
+    st.markdown('<div class="desk-section-title">Commercial update</div>', unsafe_allow_html=True)
+    if not storage.shadow_schema_present(conn):
+        st.caption(
+            "This section requires a database upgrade that has not been applied yet -- "
+            "it will appear once migrated. The rest of this workspace is unaffected."
+        )
+        commercial_episode = None
+    else:
+        st.caption(
+            "Observes and prepares only -- nothing here sends automatically. "
+            "Paste the technician's exact price message; correct any field before saving."
+        )
+        dispatcher_actor = st.text_input(
+            "Dispatcher (name/initials — used for internal records only)",
+            value=st.session_state.get("desk_dispatcher_actor", ""), key=f"commercial_actor_{job_id}",
+        ) or None
+        if dispatcher_actor:
+            st.session_state["desk_dispatcher_actor"] = dispatcher_actor
+
+        raw_commercial_text = st.text_area(
+            "Technician's exact WhatsApp price message (paste exactly)", key=f"commercial_raw_{job_id}",
+        )
+        preview = commercial.extract_commercial_update(raw_commercial_text) if raw_commercial_text.strip() else None
+
+        if preview:
+            quote_type_options = [t.value for t in commercial.QuoteType]
+            chosen_quote_type = st.selectbox(
+                "Price type", quote_type_options, index=quote_type_options.index(preview.quote_type.value),
+                format_func=lambda v: COMMERCIAL_QUOTE_TYPE_LABELS.get(v, v),
+                key=f"commercial_quote_type_{job_id}",
+            )
+            amount, range_low, range_high = None, None, None
+            if chosen_quote_type == commercial.QuoteType.RANGE.value:
+                rcol1, rcol2 = st.columns(2)
+                with rcol1:
+                    range_low = st.text_input("Range low", value=preview.quote_range_low or "", key=f"commercial_low_{job_id}")
+                with rcol2:
+                    range_high = st.text_input("Range high", value=preview.quote_range_high or "", key=f"commercial_high_{job_id}")
+            elif chosen_quote_type in (commercial.QuoteType.FIXED.value, commercial.QuoteType.STARTING.value, commercial.QuoteType.ESTIMATE.value):
+                amount = st.text_input("Price or range", value=preview.quote_amount or "", key=f"commercial_amount_{job_id}")
+
+            response_options = [r.value for r in commercial.CustomerResponseType]
+            chosen_response = st.selectbox(
+                "Customer response", response_options, index=response_options.index(preview.customer_response.value),
+                format_func=lambda v: COMMERCIAL_CUSTOMER_RESPONSE_LABELS.get(v, v),
+                key=f"commercial_response_{job_id}",
+            )
+
+            if preview.human_review_required:
+                st.warning("Please review this update before saving.")
+                st.caption("The wording didn't clearly match a known price phrasing — check the fields above.")
+
+            with st.expander("Technical details"):
+                st.caption(f"Confidence: {preview.confidence:.2f}")
+                if preview.validation_issues:
+                    st.caption("Issues: " + "; ".join(preview.validation_issues))
+
+            if st.button("Save verified commercial update", key=f"commercial_save_{job_id}", width="stretch"):
+                corrected_fields = {
+                    "quote_type": commercial.QuoteType(chosen_quote_type),
+                    "quote_amount": amount or None,
+                    "quote_range_low": range_low or None,
+                    "quote_range_high": range_high or None,
+                    "customer_response": commercial.CustomerResponseType(chosen_response),
+                }
+                result = service.record_commercial_update(
+                    job_id, raw_commercial_text, corrected_fields=corrected_fields, dispatcher_actor=dispatcher_actor,
                 )
-                service.record_technician_update(command)
-                st.rerun()
+                if result.success:
+                    st.rerun()
+                else:
+                    st.error(result.user_message or "Could not save.")
 
+        commercial_episode = storage.get_shadow_episode_for_job(conn, job_id)
+        if commercial_episode and commercial_episode.get("commercial_update"):
+            cu = commercial_episode["commercial_update"]
+            status_label = COMMERCIAL_NEGOTIATION_LABELS.get(cu.get("negotiation_state"), "Human review needed")
+            st.markdown(f"**Negotiation status:** {status_label}")
+
+            reply_text = commercial_episode.get("dispatcher_actual_reply")
+            if reply_text:
+                st.caption("Copy company response")
+                st.code(reply_text)
+                st.caption("Send manually in Quo — this business never uses WhatsApp for company replies.")
+                if commercial_episode.get("actual_send_confirmed_at"):
+                    st.success(f"✅ Sent manually · {shared.humanize_timestamp(commercial_episode['actual_send_confirmed_at'])}")
+                elif st.button("I sent this response manually", key=f"commercial_sent_{job_id}", width="stretch"):
+                    result = service.confirm_commercial_reply_sent(job_id, "Quo", dispatcher_actor=dispatcher_actor)
+                    if result.success:
+                        st.success(result.user_message)
+                        st.rerun()
+                    else:
+                        st.error(result.user_message)
+            elif cu.get("human_review_required"):
+                st.warning("Please review this update before saving — no company response prepared yet.")
+
+    # ---- 4. Company response (technician-status-driven reply) ----------
     if latest:
+        st.markdown('<div class="desk-section-title">Company response</div>', unsafe_allow_html=True)
         reply = updates.reply_for_update_type(latest["update_type"], latest.get("eta_minutes"))
         if reply.confirmed:
             prepared_text = reply.reply
         else:
-            st.warning(f"HUMAN REVIEW NEEDED — {reply.reason}")
+            st.warning("Please review this update before saving.")
+            st.caption(reply.reason)
             prepared_text = st.text_input("Company-facing update (typed manually)", key=f"active_manual_update_{job_id}")
 
         if prepared_text:
+            st.caption("Copy company response")
             st.code(prepared_text)
             action_cols = st.columns(2)
             with action_cols[0]:
-                if st.button("PREPARE COMPANY UPDATE", key=f"active_prepare_update_{job_id}", width="stretch"):
+                if st.button("Mark as prepared", key=f"active_prepare_update_{job_id}", width="stretch"):
                     manual_text = prepared_text if not reply.confirmed else None
                     result = service.prepare_company_update(job_id, latest["update_type"], latest.get("eta_minutes"), manual_text=manual_text)
                     if result.success:
@@ -598,7 +800,7 @@ def render_active_job_workspace(conn, job_id: int) -> None:
                     else:
                         st.error(result.user_message)
             with action_cols[1]:
-                if st.button("MARK UPDATE SENT MANUALLY", key=f"active_sent_update_{job_id}", width="stretch"):
+                if st.button("I sent this response manually", key=f"active_sent_update_{job_id}", width="stretch"):
                     result = service.confirm_company_update_sent(job_id, prepared_text)
                     if result.success:
                         st.success(result.user_message)
@@ -606,113 +808,10 @@ def render_active_job_workspace(conn, job_id: int) -> None:
                     else:
                         st.error(result.user_message)
 
-    if latest and latest["update_type"] == "Completed":
-        # st.page_link() requires a real st.navigation() page-registry
-        # context to resolve its target -- it raises KeyError when this
-        # workspace is exercised standalone (as every other Active Jobs/
-        # Closings/Technicians/Activity test in this suite already does).
-        # A plain caption avoids that fragility entirely; the persistent
-        # top navigation already puts Closings one tap away.
-        st.info("MOVE TO CLOSING — open the Closings tab to continue this job.")
-
-    with st.expander("COMMERCIAL UPDATE (Shadow Mode)"):
-        if not storage.shadow_schema_present(conn):
-            st.caption(
-                "Shadow Mode requires a database upgrade that has not been applied yet -- "
-                "this section will appear once migrated. The rest of this workspace is unaffected."
-            )
-        else:
-            st.caption(
-                "Observes and prepares only -- nothing here sends automatically. "
-                "Paste the technician's exact message; correct any field before saving."
-            )
-            dispatcher_actor = st.text_input(
-                "Dispatcher (name/initials — used for Shadow Mode records only)",
-                value=st.session_state.get("desk_dispatcher_actor", ""), key=f"commercial_actor_{job_id}",
-            ) or None
-            if dispatcher_actor:
-                st.session_state["desk_dispatcher_actor"] = dispatcher_actor
-
-            raw_commercial_text = st.text_area(
-                "Technician's exact WhatsApp message (paste exactly)", key=f"commercial_raw_{job_id}",
-            )
-            preview = commercial.extract_commercial_update(raw_commercial_text) if raw_commercial_text.strip() else None
-
-            if preview:
-                quote_type_options = [t.value for t in commercial.QuoteType]
-                chosen_quote_type = st.selectbox(
-                    "Quote type", quote_type_options, index=quote_type_options.index(preview.quote_type.value),
-                    key=f"commercial_quote_type_{job_id}",
-                )
-                amount, range_low, range_high = None, None, None
-                if chosen_quote_type == commercial.QuoteType.RANGE.value:
-                    rcol1, rcol2 = st.columns(2)
-                    with rcol1:
-                        range_low = st.text_input("Range low", value=preview.quote_range_low or "", key=f"commercial_low_{job_id}")
-                    with rcol2:
-                        range_high = st.text_input("Range high", value=preview.quote_range_high or "", key=f"commercial_high_{job_id}")
-                elif chosen_quote_type in (commercial.QuoteType.FIXED.value, commercial.QuoteType.STARTING.value, commercial.QuoteType.ESTIMATE.value):
-                    amount = st.text_input("Amount", value=preview.quote_amount or "", key=f"commercial_amount_{job_id}")
-
-                response_options = [r.value for r in commercial.CustomerResponseType]
-                chosen_response = st.selectbox(
-                    "Customer response", response_options, index=response_options.index(preview.customer_response.value),
-                    key=f"commercial_response_{job_id}",
-                )
-
-                if preview.human_review_required:
-                    st.warning("HUMAN REVIEW NEEDED — wording did not clearly match a known quote phrasing. Correct the fields above before saving.")
-
-                with st.expander("View details (raw extraction)"):
-                    st.caption(f"Confidence: {preview.confidence:.2f}")
-                    if preview.validation_issues:
-                        st.caption("Issues: " + "; ".join(preview.validation_issues))
-
-                if st.button("Save verified commercial update", key=f"commercial_save_{job_id}", width="stretch"):
-                    corrected_fields = {
-                        "quote_type": commercial.QuoteType(chosen_quote_type),
-                        "quote_amount": amount or None,
-                        "quote_range_low": range_low or None,
-                        "quote_range_high": range_high or None,
-                        "customer_response": commercial.CustomerResponseType(chosen_response),
-                    }
-                    result = service.record_commercial_update(
-                        job_id, raw_commercial_text, corrected_fields=corrected_fields, dispatcher_actor=dispatcher_actor,
-                    )
-                    if result.success:
-                        st.rerun()
-                    else:
-                        st.error(result.user_message or "Could not save.")
-
-            episode = storage.get_shadow_episode_for_job(conn, job_id)
-            if episode and episode.get("commercial_update"):
-                cu = episode["commercial_update"]
-                status_label = {
-                    "QUOTE_GIVEN": "Quote given", "WAITING_FOR_CUSTOMER": "Waiting for customer",
-                    "NEGOTIATING": "Negotiating", "ACCEPTED": "Accepted", "LOST_ON_PRICE": "Lost on price",
-                    "FOLLOW_UP_REQUIRED": "Follow-up required",
-                }.get(cu.get("negotiation_state"), "Human review needed")
-                st.markdown(f"**Negotiation status:** {status_label}")
-
-                reply_text = episode.get("dispatcher_actual_reply")
-                if reply_text:
-                    st.code(reply_text)
-                    st.caption("Send channel: Quo (company thread) — this business never uses WhatsApp for company replies.")
-                    if episode.get("actual_send_confirmed_at"):
-                        st.success(f"✅ Sent manually · {shared.humanize_timestamp(episode['actual_send_confirmed_at'])}")
-                    elif st.button("Mark commercial reply sent manually", key=f"commercial_sent_{job_id}", width="stretch"):
-                        result = service.confirm_commercial_reply_sent(job_id, "Quo", dispatcher_actor=dispatcher_actor)
-                        if result.success:
-                            st.success(result.user_message)
-                            st.rerun()
-                        else:
-                            st.error(result.user_message)
-                elif cu.get("human_review_required"):
-                    st.warning("HUMAN REVIEW NEEDED — no company reply prepared for this commercial update.")
-
-    with st.expander("PASS / CANCEL"):
+    # ---- 5. Pass / Cancel -------------------------------------------------
+    with st.expander("Pass / Cancel"):
         reason = st.text_input("Reason (required)", key=f"active_pass_reason_{job_id}")
-        if st.button("PASS / CANCEL JOB", key=f"active_pass_{job_id}", disabled=not reason.strip()):
+        if st.button("Pass or cancel job", key=f"active_pass_{job_id}", disabled=not reason.strip()):
             result = service.pass_or_cancel_job(job_id, "Cancel", reason)
             if result.success:
                 st.success(result.user_message)
@@ -720,11 +819,35 @@ def render_active_job_workspace(conn, job_id: int) -> None:
             else:
                 st.error(result.user_message)
 
-    with st.expander("View details"):
+    # ---- 6. Closing readiness --------------------------------------------
+    st.markdown('<div class="desk-section-title">Closing readiness</div>', unsafe_allow_html=True)
+    if latest and latest["update_type"] == "Completed":
+        # st.page_link() requires a real st.navigation() page-registry
+        # context to resolve its target -- it raises KeyError when this
+        # workspace is exercised standalone (as every other Active Jobs/
+        # Closings/Technicians/Activity test in this suite already does).
+        # A plain info box avoids that fragility entirely; the persistent
+        # top navigation already puts Closings one tap away.
+        st.info("Ready to close — open the Closings tab to continue this job.")
+    else:
+        st.caption("This job becomes ready to close once the technician reports the work is completed.")
+
+    # ---- 7. Job timeline --------------------------------------------------
+    st.markdown('<div class="desk-section-title">Job timeline</div>', unsafe_allow_html=True)
+    timeline = shared.fetch_timeline(conn, job_id)
+    if not timeline:
+        st.caption("No activity recorded yet.")
+    for event in timeline:
+        when = shared.humanize_timestamp(event.get("created_at"))
+        st.markdown(f"**{when}** — {history_event_label(event)}")
+
+    with st.expander("Technical details"):
         st.markdown(f"Phone: {job['fields'].get('phone') or '—'}")
         st.markdown(f"Address: {job['fields'].get('address') or '—'}")
         if job["fields"].get("notes"):
             st.markdown(f"Notes: {job['fields']['notes']}")
+        if commercial_episode:
+            st.caption(f"Shadow episode ID: {commercial_episode['episode_id']}")
 
 
 def render_closing_workspace(conn, job_id: int) -> None:
@@ -764,7 +887,13 @@ def render_closing_workspace(conn, job_id: int) -> None:
     if not require_current_schema(conn):
         return
 
+    quote = storage.get_latest_verified_commercial_update_for_job(conn, job_id) if storage.shadow_schema_present(conn) else None
+    quote_amount = quote.get("quote_amount_text") or quote.get("quote_amount") if quote else None
+    if quote_amount:
+        st.caption(f"Quote given earlier: {quote_amount}")
+
     if job["status"] != "Closed":
+        st.markdown('<div class="desk-section-title">Review closing details</div>', unsafe_allow_html=True)
         st.caption("No closing recorded yet for this job.")
         with st.expander("Enter technician closing", expanded=True):
             raw_closing = st.text_area("Technician's actual closing (paste exactly)", key=f"closing_raw_{job_id}")
@@ -773,7 +902,7 @@ def render_closing_workspace(conn, job_id: int) -> None:
             parts = st.text_input("Parts amount (optional)", key=f"closing_parts_{job_id}")
             company_share = st.text_input("Company share (optional)", key=f"closing_company_share_{job_id}")
             technician_share = st.text_input("Technician share (optional)", key=f"closing_tech_share_{job_id}")
-            if st.button("RECORD CLOSING", key=f"closing_record_{job_id}", width="stretch"):
+            if st.button("Save closing details", key=f"closing_record_{job_id}", width="stretch"):
                 command = ClosingCommand(
                     job_id=job_id, raw_closing=raw_closing,
                     final_amount=amount or None, payment_method=payment_method or None,
@@ -787,6 +916,7 @@ def render_closing_workspace(conn, job_id: int) -> None:
                     st.error(result.user_message or "Paste the technician's actual closing first.")
         return
 
+    st.markdown('<div class="desk-section-title">Review closing details</div>', unsafe_allow_html=True)
     details = storage.get_latest_closing_details(conn, job_id)
     if details:
         parts_bit = f" · Parts: {details['parts_amount']}" if details.get("parts_amount") else ""
@@ -802,7 +932,7 @@ def render_closing_workspace(conn, job_id: int) -> None:
     else:
         st.caption("No structured closing amount recorded yet for this job.")
 
-    with st.expander("View details"):
+    with st.expander("Technical details"):
         row = conn.execute(
             "SELECT raw_message FROM events WHERE job_id = ? AND message_type = ? "
             "ORDER BY id DESC LIMIT 1",
@@ -818,7 +948,8 @@ def render_closing_workspace(conn, job_id: int) -> None:
     if not details or not details.get("payment_method"):
         missing.append("payment method")
     if missing:
-        st.warning(f"HUMAN REVIEW NEEDED — missing: {', '.join(missing)}")
+        st.warning("Please review this closing before sending.")
+        st.caption(f"Missing: {', '.join(missing)}.")
         return
 
     closing_input = ClosingInput(
@@ -827,20 +958,24 @@ def render_closing_workspace(conn, job_id: int) -> None:
     )
     result = render_closing_from_persisted_fields(job["source"], job["ticket_number"], job["fields"], closing_input)
     if not result.supported:
-        st.warning(f"HUMAN REVIEW NEEDED — {result.reason}")
+        st.warning("Please review this closing before sending.")
+        st.caption(result.reason)
         return
 
+    st.markdown('<div class="desk-section-title">Send company closing</div>', unsafe_allow_html=True)
+    st.caption("Copy company closing")
     st.code(result.text)
+    st.caption("Send manually in Quo — this business never uses WhatsApp for company closings.")
     action_cols = st.columns(2)
     with action_cols[0]:
-        if st.button("PREPARE COMPANY CLOSING", key=f"closing_prepare_{job_id}", width="stretch"):
+        if st.button("Mark as prepared", key=f"closing_prepare_{job_id}", width="stretch"):
             prep_result = service.prepare_company_closing(job_id)
             if prep_result.success:
                 st.rerun()
             else:
                 st.error(prep_result.user_message)
     with action_cols[1]:
-        if st.button("MARK CLOSING SENT MANUALLY", key=f"closing_sent_{job_id}", width="stretch"):
+        if st.button("I sent this closing manually", key=f"closing_sent_{job_id}", width="stretch"):
             sent_result = service.confirm_company_closing_sent(job_id, result.text)
             if sent_result.success:
                 st.success(sent_result.user_message)
@@ -852,8 +987,9 @@ def render_closing_workspace(conn, job_id: int) -> None:
         "SELECT 1 FROM events WHERE job_id = ? AND message_type = ? AND final_action = ? LIMIT 1",
         (job_id, storage.MessageType.OPERATIONAL_NOTE.value, ActionName.COMPANY_CLOSING_SENT_MANUALLY.value),
     ).fetchone()
+    st.markdown('<div class="desk-section-title">Complete job</div>', unsafe_allow_html=True)
     if sent_confirmed:
-        if st.button("COMPLETE JOB", key=f"closing_complete_{job_id}", type="primary", width="stretch"):
+        if st.button("Complete job", key=f"closing_complete_{job_id}", type="primary", width="stretch"):
             complete_result = service.complete_job(job_id)
             if complete_result.success:
                 st.success(complete_result.user_message)
@@ -861,10 +997,10 @@ def render_closing_workspace(conn, job_id: int) -> None:
             else:
                 st.error(complete_result.user_message)
     else:
-        st.caption("COMPLETE JOB is available once the company closing has been marked sent.")
+        st.caption("Complete job is available once the company closing has been marked sent.")
 
 
-def _history_event_label(event: dict) -> str:
+def history_event_label(event: dict) -> str:
     """History-page-only event labels, layered in front of
     luxor_ops_shared.humanize_event_label() for the new event
     shapes (OPERATIONAL_NOTE, dispatcher-recorded STATUS updates,
@@ -916,13 +1052,13 @@ def render_completed_job_card(conn, job: dict) -> None:
         )
     st.caption(f"Completed {shared.humanize_timestamp(job.get('last_event_at') or job.get('updated_at'))}")
 
-    with st.expander("View details"):
+    with st.expander("Job details"):
         timeline = shared.fetch_timeline(conn, job["id"])
         if not timeline:
             st.caption("No audit history recorded for this job.")
         for event in timeline:
             when = shared.humanize_timestamp(event.get("created_at"))
-            st.markdown(f"**{when}** — {_history_event_label(event)}")
+            st.markdown(f"**{when}** — {history_event_label(event)}")
             if event.get("dispatcher_edits"):
                 st.caption(event["dispatcher_edits"])
 

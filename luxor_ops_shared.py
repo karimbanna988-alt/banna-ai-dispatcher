@@ -287,7 +287,12 @@ def fetch_pending_messages(_conn: sqlite3.Connection, group_label: Optional[str]
 
 @st.cache_data(show_spinner=False, ttl=5)
 def fetch_last_refresh(_conn: sqlite3.Connection) -> Optional[str]:
-    row = _conn.execute("SELECT updated_at FROM quo_poll_state WHERE id = 1").fetchone()
+    try:
+        row = _conn.execute("SELECT updated_at FROM quo_poll_state WHERE id = 1").fetchone()
+    except sqlite3.OperationalError:
+        # Pre-migration database missing quo_poll_state -- read-only pages
+        # must keep rendering regardless of schema staleness elsewhere.
+        return None
     return row[0] if row else None
 
 
