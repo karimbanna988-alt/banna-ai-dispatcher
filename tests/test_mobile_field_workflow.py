@@ -99,24 +99,35 @@ def test_whatsapp_button_replaced_by_confirm_after_opened(desk_env, vehicle_rule
     seed_pending(desk_env, "MOB1", agn_message("MOB1TICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", desk_env)
     at.button(key="desk_k_MOB1").click().run()
+    at.button(key="desk_k_confirm_MOB1").click().run()
     assert any(b.key == "desk_wa_MOB1" for b in at.button)
 
     at.button(key="desk_wa_MOB1").click().run()
     assert len(at.exception) == 0
-    # Only one primary action at a time: "I sent it in WhatsApp" is gone,
-    # replaced by a checked line, and "Confirm dispatched" is the only
-    # button left for this job.
+    # Only one primary action at a time: "Copy job for technician" is
+    # gone, replaced by "Confirm sent in WhatsApp" -- never both at once.
     assert not any(b.key == "desk_wa_MOB1" for b in at.button)
-    assert any(b.key == "desk_confirm_dispatch_MOB1" for b in at.button)
-    rendered = "\n".join(m.value for m in at.markdown)
-    assert "✓ Sent in WhatsApp" in rendered
+    assert any(b.key == "desk_confirm_dispatch_MOB1" and b.label == "Confirm sent in WhatsApp" for b in at.button)
+
+    at.button(key="desk_confirm_dispatch_MOB1").click().run()
+    at.run()  # settle: AppTest's st.rerun()-inside-a-handler needs one more pass here
+    assert len(at.exception) == 0
+    # The only live job just got dispatched -- it leaves the live queue
+    # entirely (no other job to auto-select), so the empty state shows.
+    rendered = "\n".join(i.value for i in at.info)
+    assert "No new live jobs need attention." in rendered
+    assert not any(b.key == "desk_confirm_dispatch_MOB1" for b in at.button)
 
 
 # --------------------------------------------------------- Workflow strip
+# New Jobs deliberately does NOT get the workflow strip -- see
+# tests/test_new_jobs_action_screen.py and docs/operator_ui_blueprint.md's
+# "New Jobs mobile action screen" note for why this page was rebuilt as a
+# minimal action screen instead. Active Jobs/Closings/History are
+# unaffected by that rebuild and still carry the strip.
 @pytest.mark.parametrize(
     "page,stage",
     [
-        ("luxor_desk_pages/dispatch.py", "New"),
         ("luxor_desk_pages/active_jobs.py", "Active"),
         ("luxor_desk_pages/closings.py", "Closing"),
         ("luxor_desk_pages/history.py", "History"),
@@ -134,32 +145,9 @@ def test_workflow_strip_present_on_every_operational_page(desk_env, page, stage)
 
 
 # --------------------------------------------- Needs action / Waiting / All
-def test_new_jobs_view_pills_present_with_counts(desk_env, vehicle_rules):
-    seed_live_boundary(desk_env)
-    seed_kabaka(desk_env)
-    seed_pending(desk_env, "MOB2", agn_message("MOB2TICKET"))
-    at = app_for("luxor_desk_pages/dispatch.py", desk_env)
-    pills = at.pills(key="desk_dispatch_view")
-    assert "Needs action (1)" in pills.options
-    assert "Waiting (0)" in pills.options
-    assert "All (1)" in pills.options
-
-
-def test_new_job_stays_selected_after_moving_to_waiting_bucket(desk_env, vehicle_rules):
-    """The dispatcher's currently-open job must never disappear from the
-    workspace just because acting on it moved it into the "Waiting"
-    bucket -- see the selection-safety note in luxor_desk_pages/dispatch.py."""
-    seed_live_boundary(desk_env)
-    seed_kabaka(desk_env)
-    seed_pending(desk_env, "MOB3", agn_message("MOB3TICKET"))
-    at = app_for("luxor_desk_pages/dispatch.py", desk_env)
-    at.button(key="desk_k_MOB3").click().run()
-    assert len(at.exception) == 0
-    # Still on the default "Needs action" view, K-sent moved this job to
-    # "Waiting" -- the workspace must still show it (desk_wa button present).
-    assert any(b.key == "desk_wa_MOB3" for b in at.button)
-
-
+# New Jobs no longer has this view concept -- see
+# tests/test_new_jobs_action_screen.py for its replacement (the 60-minute
+# live-window / "Older unresolved jobs" split).
 def test_active_jobs_view_pills_present(desk_env, vehicle_rules):
     commit_job(desk_env, vehicle_rules, agn_message("MOB4"))
     at = app_for("luxor_desk_pages/active_jobs.py", desk_env)
@@ -193,18 +181,10 @@ def test_active_job_stays_selected_after_moving_to_waiting_bucket(desk_env, vehi
     assert "✓ Technician update saved: Going" in rendered
 
 
-# ------------------------------------------------------- Next job button --
-def test_next_job_button_advances_selection(desk_env, vehicle_rules):
-    seed_live_boundary(desk_env)
-    seed_kabaka(desk_env)
-    seed_pending(desk_env, "MOB7A", agn_message("MOB7ATICKET"))
-    seed_pending(desk_env, "MOB7B", agn_message("MOB7BTICKET"))
-    at = app_for("luxor_desk_pages/dispatch.py", desk_env)
-    first_selected = at.session_state["desk_dispatch_selected"]
-    at.button(key="desk_dispatch_next").click().run()
-    assert len(at.exception) == 0
-    second_selected = at.session_state["desk_dispatch_selected"]
-    assert second_selected != first_selected
+# Note: New Jobs no longer has a "Next job" button -- see
+# tests/test_new_jobs_action_screen.py for its replacement (automatic
+# reselection of the newest live job once the current one is dispatched).
+# Active Jobs/Closings keep their own "Next job" button, untouched.
 
 
 # ------------------------------------------------- Active Jobs Next: banner

@@ -104,28 +104,24 @@ def test_primary_rehearsal_full_agn_columbia_kabaka_lifecycle(desk_env, capsys):
 
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     assert len(at.exception) == 0
-    assert any(b.key == "desk_k_RHRSL1" and b.label == "I sent K in Quo" for b in at.button)
+    assert any(b.key == "desk_k_RHRSL1" and b.label == "Copy K" for b in at.button)
 
-    # ---- Step 3-4: prepare + confirm K sent manually ----
+    # ---- Step 3-4: reveal + confirm K sent manually (one stateful button) ----
     at.button(key="desk_k_RHRSL1").click().run()
     assert len(at.exception) == 0
+    at.button(key="desk_k_confirm_RHRSL1").click().run()
+    assert len(at.exception) == 0
 
-    # ---- Step 5-6: verify LUXOR message + Kabaka + destination ----
-    rendered_code = "\n".join(c.value for c in at.code)
-    assert "RHRSL-TICKET" in rendered_code
-    rendered_all = (
-        "\n".join(m.value for m in at.markdown)
-        + rendered_code
-        + "\n".join(c.value for c in at.caption)
-    )
+    # ---- Step 5-6: verify Kabaka + destination in the always-visible summary ----
+    rendered_all = "\n".join(m.value for m in at.markdown) + "\n".join(c.value for c in at.caption)
     assert "Kabaka" in rendered_all
     assert "Ismail columbia Dispatch" in rendered_all
 
-    # ---- Step 7: confirm manual dispatch ----
-    wa_button = next(b for b in at.button if b.key == "desk_wa_RHRSL1")
-    assert wa_button.disabled is False
+    # ---- Step 7: copy reveals the LUXOR message, then confirm manual dispatch ----
     at.button(key="desk_wa_RHRSL1").click().run()
     assert len(at.exception) == 0
+    rendered_code = "\n".join(c.value for c in at.code)
+    assert "RHRSL-TICKET" in rendered_code
     at.button(key="desk_confirm_dispatch_RHRSL1").click().run()
     assert len(at.exception) == 0
 
@@ -292,8 +288,8 @@ def test_edge_a_main_leads_no_k_ack_and_unsupported_closing(desk_env):
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     assert len(at.exception) == 0
     assert not any(b.key == "desk_k_ML1" for b in at.button)
-    rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "No K acknowledgment needed for Main Leads" in rendered_captions
+    rendered = "\n".join(c.value for c in at.caption) + "\n".join(m.value for m in at.markdown)
+    assert "K acknowledgment" not in rendered  # no K text, explanation, or placeholder at all
 
     wa_button = next(b for b in at.button if b.key == "desk_wa_ML1")
     assert wa_button.disabled is False
@@ -324,6 +320,7 @@ def test_edge_b_no_verified_quote_returns_human_review_needed(desk_env):
     seed_pending(db_path, "NOQ1", agn_message("NOQTICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_NOQ1").click().run()
+    at.button(key="desk_k_confirm_NOQ1").click().run()
     at.button(key="desk_wa_NOQ1").click().run()
     at.button(key="desk_confirm_dispatch_NOQ1").click().run()
     assert len(at.exception) == 0
@@ -347,6 +344,7 @@ def test_edge_c_hesitation_does_not_auto_cancel(desk_env):
     seed_pending(db_path, "HES1", agn_message("HESTICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_HES1").click().run()
+    at.button(key="desk_k_confirm_HES1").click().run()
     at.button(key="desk_wa_HES1").click().run()
     at.button(key="desk_confirm_dispatch_HES1").click().run()
 
@@ -376,6 +374,7 @@ def test_edge_d_duplicate_commercial_update_is_idempotent(desk_env):
     seed_pending(db_path, "DUP1", agn_message("DUPTICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_DUP1").click().run()
+    at.button(key="desk_k_confirm_DUP1").click().run()
     at.button(key="desk_wa_DUP1").click().run()
     at.button(key="desk_confirm_dispatch_DUP1").click().run()
 
@@ -402,6 +401,7 @@ def test_edge_e_process_restart_continues_same_episode_and_job(desk_env):
     seed_pending(db_path, "RST1", agn_message("RSTTICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_RST1").click().run()
+    at.button(key="desk_k_confirm_RST1").click().run()
     at.button(key="desk_wa_RST1").click().run()
     at.button(key="desk_confirm_dispatch_RST1").click().run()
 
@@ -438,6 +438,7 @@ def test_ui_no_button_implies_automatic_delivery(desk_env):
     seed_pending(db_path, "UI1", agn_message("UITICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_UI1").click().run()
+    at.button(key="desk_k_confirm_UI1").click().run()
     at.button(key="desk_wa_UI1").click().run()
     at.button(key="desk_confirm_dispatch_UI1").click().run()
 
@@ -475,6 +476,7 @@ def test_ui_commercial_fields_compact_parser_internals_hidden(desk_env):
     seed_pending(db_path, "UI2", agn_message("UI2TICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_UI2").click().run()
+    at.button(key="desk_k_confirm_UI2").click().run()
     at.button(key="desk_wa_UI2").click().run()
     at.button(key="desk_confirm_dispatch_UI2").click().run()
 
@@ -500,6 +502,7 @@ def test_ui_shadow_review_distinguishes_suggestion_from_actual(desk_env):
     seed_pending(db_path, "UI3", agn_message("UI3TICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
     at.button(key="desk_k_UI3").click().run()
+    at.button(key="desk_k_confirm_UI3").click().run()
     at.button(key="desk_wa_UI3").click().run()
     at.button(key="desk_confirm_dispatch_UI3").click().run()
 
@@ -524,11 +527,13 @@ def test_ui_quo_vs_whatsapp_channel_labels_correct(desk_env):
     seed_kabaka(db_path)
     seed_pending(db_path, "UI4", agn_message("UI4TICKET"))
     at = app_for("luxor_desk_pages/dispatch.py", db_path)
-    # Technician dispatch is explicitly WhatsApp
-    rendered_before = "\n".join(b.label or "" for b in at.button)
-    assert "I sent it in WhatsApp" in rendered_before
-
     at.button(key="desk_k_UI4").click().run()
+    at.button(key="desk_k_confirm_UI4").click().run()
+    # Technician dispatch is explicitly WhatsApp -- once K is confirmed,
+    # action area 2 becomes available.
+    rendered_before = "\n".join(b.label or "" for b in at.button)
+    assert "Copy job for technician" in rendered_before
+
     at.button(key="desk_wa_UI4").click().run()
     at.button(key="desk_confirm_dispatch_UI4").click().run()
 

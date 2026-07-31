@@ -1,9 +1,16 @@
-"""Dispatch -- the real, live-database-backed dispatch queue. Every row
-here is a genuine quo_pending_messages record; nothing is fabricated.
-Reuses luxor_desk_read_model for all data access and dispatcher.storage/
-outbound for every write action -- the exact same audit/tracking paths
-luxor_console_pages/dispatch_queue.py already uses. Quo outbound stays
-disabled; WhatsApp stays manual copy/open only.
+"""New Jobs -- a minimal mobile dispatch action screen, not a CRM
+dashboard. Every row here is a genuine quo_pending_messages record;
+nothing is fabricated. Reuses luxor_desk_read_model for all data access
+and dispatcher.storage/outbound for every write action -- the exact
+same audit/tracking paths luxor_console_pages/dispatch_queue.py already
+uses. Quo outbound stays disabled; WhatsApp stays manual copy/open only.
+
+The 60-minute live-window/"Older unresolved jobs" split below is a
+presentation rule only -- it never deletes, rejects, completes, or
+otherwise modifies a pending record; it only changes which section a
+row is listed under. See docs/operator_ui_blueprint.md's "New Jobs
+mobile action screen" note for why this replaced the earlier workflow
+strip / Needs action-Waiting-All view pills for this page specifically.
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ conn = storage.connect()
 if "desk_refresh_message" not in st.session_state:
     st.session_state.desk_refresh_message = None
 
-sync_clicked = shared_desk.render_header(conn, "New Jobs", show_sync=True)
+sync_clicked = shared_desk.render_compact_new_jobs_header(conn)
 if sync_clicked:
     api_key = os.environ.get(API_KEY_ENV_VAR)
     if not api_key:
@@ -61,8 +68,6 @@ if not shared_desk.require_current_schema(conn):
     conn.close()
     st.stop()
 
-shared_desk.render_workflow_strip(conn, "New")
-
 # --------------------------------------------------------- Queue build ---
 live_entries, backlog_pending, other_messages = rm.get_live_dispatch_queue(conn)
 
@@ -85,54 +90,6 @@ def entry_filter_match(e: rm.QueueEntry, name: str) -> bool:
     return True
 
 
-filter_counts = {name: sum(1 for e in live_entries if entry_filter_match(e, name)) for name in FILTER_OPTIONS}
-active_filter = st.pills(
-    "Filter", FILTER_OPTIONS, selection_mode="single", default="All",
-    key="desk_dispatch_filter", label_visibility="collapsed",
-    format_func=lambda n: f"{n} ({filter_counts[n]})",
-) or "All"
-
-filtered = [e for e in live_entries if entry_filter_match(e, active_filter)]
-st.caption(f"Previous backlog: {len(backlog_pending)} (not urgent, not counted here)")
-
-# ------------------------------------------------- Needs action / Waiting -
-# "Waiting" = the dispatcher already tapped something for this job (K sent
-# and/or WhatsApp opened) but hasn't confirmed dispatch yet -- come back
-# and finish it. "Needs action" = everything untouched, or blocked by
-# missing/conflicting data. See docs/operator_ui_blueprint.md's mobile
-# addendum for why New Jobs has no third, "nothing to do" bucket.
-VIEW_OPTIONS = ("Needs action", "Waiting", "All")
-
-
-def entry_bucket(e: rm.QueueEntry) -> str:
-    needs_review = bool(e.result.decision.missing_information) or bool(e.classify_result.conflicting_fields)
-    started = bool(e.tracking["acknowledged_at"]) or bool(e.tracking["whatsapp_opened_at"])
-    if needs_review or not started:
-        return "needs_action"
-    return "waiting"
-
-
-def view_match(e: rm.QueueEntry, name: str) -> bool:
-    if name == "All":
-        return True
-    return entry_bucket(e) == ("needs_action" if name == "Needs action" else "waiting")
-
-
-view_counts = {name: sum(1 for e in filtered if view_match(e, name)) for name in VIEW_OPTIONS}
-active_view = st.pills(
-    "View", VIEW_OPTIONS, selection_mode="single", default="Needs action",
-    key="desk_dispatch_view", label_visibility="collapsed",
-    format_func=lambda n: f"{n} ({view_counts[n]})",
-) or "Needs action"
-# The company-filtered set stays the *selectable* universe -- a job the
-# dispatcher is mid-flow on (e.g. just sent K) can move from "Needs
-# action" to "Waiting" the moment they act on it; it must not vanish out
-# from under them just because the view narrowed. view_filtered only
-# drives what the compact queue list and "Next job" show.
-company_filtered = filtered
-view_filtered = [e for e in company_filtered if view_match(e, active_view)]
-
-
 def entry_identity(e: rm.QueueEntry) -> str:
     """The canonical representative's own message_id -- always unique
     per canonical entry (it's quo_pending_messages' primary key, and
@@ -143,66 +100,78 @@ def entry_identity(e: rm.QueueEntry) -> str:
     return e.item["message_id"]
 
 
-GROUP_LABELS = {
-    "AGN": "AGN", "Lucky": "Lucky", "Main Leads": "Main Leads",
-}
+# The company/type filter is a supporting control, not part of the
+# primary operating view -- its widget is instantiated later, inside a
+# collapsed "Filters" expander placed after the selected job and
+# compact queue, but its current value is read here (standard Streamlit
+# pattern: session_state persists across reruns even before the widget
+# that owns it is re-instantiated later in the same script run).
+active_filter = st.session_state.get("desk_dispatch_filter", "All")
+filtered = [e for e in live_entries if entry_filter_match(e, active_filter)]
 
+# --------------------------------------------------- Live window split ---
+# "Live" = received within the last 60 minutes -- a presentation cutoff
+# only (see module docstring). Sorted newest-first within each section,
+# per the live-queue rule; get_live_dispatch_queue()'s own urgency-first
+# sort is not used for this page's default ordering.
+live_window = sorted(
+    (e for e in filtered if e.age_seconds <= shared_desk.NEW_JOBS_LIVE_WINDOW_SECONDS),
+    key=lambda e: e.age_seconds,
+)
+older_unresolved = sorted(
+    (e for e in filtered if e.age_seconds > shared_desk.NEW_JOBS_LIVE_WINDOW_SECONDS),
+    key=lambda e: e.age_seconds,
+)
 
-def group_for(e: rm.QueueEntry) -> str:
-    if e.item["group_label"] == "CLOSINGS":
-        return "Lucky — Closings & Replies"
-    return GROUP_LABELS.get(e.job.source.value, e.job.source.value)
+# ------------------------------------------------------------ Selection --
+# Never auto-select an older stale job on a fresh pick -- only ever from
+# the live window. But a job already selected (even one that aged past
+# the 60-minute cutoff mid-sequence) stays selected -- selection is
+# always resolved against the full filtered set, never the live-window
+# subset, so a job never disappears out from under the dispatcher
+# mid-acknowledgment/dispatch.
+all_identities = [entry_identity(e) for e in filtered]
+window_identities = [entry_identity(e) for e in live_window]
 
-
-company_identities = [entry_identity(e) for e in company_filtered]
-view_identities = [entry_identity(e) for e in view_filtered]
-
-if not company_filtered:
-    st.success("No jobs need your attention right now.")
-    selected = None
-    selected_id = None
-else:
+selected = None
+selected_id = None
+if filtered:
     selected_id = st.session_state.get("desk_dispatch_selected")
-    if selected_id not in company_identities:
-        fallback_pool = view_identities or company_identities
-        selected_id = fallback_pool[0]
-    st.session_state.desk_dispatch_selected = selected_id
-    selected = next(e for e in company_filtered if entry_identity(e) == selected_id)
-    shared_desk.render_next_job_button(view_identities or company_identities, selected_id, "desk_dispatch_selected", "desk_dispatch_next")
+    if selected_id not in all_identities:
+        selected_id = window_identities[0] if window_identities else None
+    if selected_id is not None:
+        st.session_state.desk_dispatch_selected = selected_id
+        selected = next(e for e in filtered if entry_identity(e) == selected_id)
 
-with st.container(key="desk_layout"):
-    with st.container(key="desk_area_workspace"):
-        if selected is not None:
-            shared_desk.render_job_workspace(conn, selected)
+# --------------------------------------------------------------- Layout --
+if selected is not None:
+    shared_desk.render_job_workspace(conn, selected)
+elif not live_window:
+    st.info("No new live jobs need attention.")
 
-    with st.container(key="desk_area_queue"):
-        if view_filtered:
-            st.markdown(f'<div class="desk-section-title">Queue ({len(view_filtered)})</div>', unsafe_allow_html=True)
-            if active_filter == "All":
-                groups: dict = {}
-                order = []
-                for e in view_filtered:
-                    g = group_for(e)
-                    if g not in groups:
-                        groups[g] = []
-                        order.append(g)
-                    groups[g].append(e)
-                for g in order:
-                    st.markdown(f'<div class="desk-meta" style="margin-top:0.4rem;"><strong>{g}</strong></div>', unsafe_allow_html=True)
-                    for e in groups[g]:
-                        shared_desk.render_queue_row(e, entry_identity(e), selected_id)
-            else:
-                for e in view_filtered:
-                    shared_desk.render_queue_row(e, entry_identity(e), selected_id)
-        elif company_filtered:
-            st.caption("No jobs in this view.")
+if live_window:
+    st.markdown(f'<div class="desk-section-title">Live queue ({len(live_window)})</div>', unsafe_allow_html=True)
+    for e in live_window:
+        shared_desk.render_queue_row(e, entry_identity(e), selected_id)
+
+if older_unresolved:
+    with st.expander(f"Older unresolved jobs ({len(older_unresolved)})"):
+        for e in older_unresolved:
+            shared_desk.render_queue_row(e, entry_identity(e), selected_id)
+
+with st.expander("Filters"):
+    filter_counts = {name: sum(1 for e in live_entries if entry_filter_match(e, name)) for name in FILTER_OPTIONS}
+    st.pills(
+        "Filter", FILTER_OPTIONS, selection_mode="single", default="All",
+        key="desk_dispatch_filter",
+        format_func=lambda n: f"{n} ({filter_counts[n]})",
+    )
 
 with st.expander(f"Other Messages ({len(other_messages)})"):
     for item in other_messages:
         st.caption(f"{shared.humanize_timestamp(item['received_at'] or item['fetched_at'])} — {shared.mask_sensitive(item['raw_text'])[:80]}")
 
 with st.expander(f"Previous Backlog ({len(backlog_pending)})"):
-    st.caption("Historical messages received before the live queue boundary. Preserved for audit; never urgent.")
     for item in backlog_pending:
         st.caption(f"{shared.humanize_timestamp(item['received_at'] or item['fetched_at'])} — {item['group_label']} · {shared.mask_sensitive(item['raw_text'])[:80]}")
 

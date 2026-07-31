@@ -86,6 +86,18 @@ h1, h2, h3, h4, p, div, span, label {{ color: {TEXT}; }}
     color: #34D399; font-size: 0.82rem; margin: 0.15rem 0; font-weight: 600;
 }}
 
+/* New Jobs' compact header only -- one short row (LUXOR + connection +
+   small Sync + small "..." menu), never a full-width Sync/Log out
+   button. Scoped to the desk_compact_header container so no other
+   page's render_header() is affected. */
+[class*="st-key-desk_compact_header"] {{ margin-bottom: 0.15rem; }}
+.desk-compact-header-title {{ font-size: 0.85rem; font-weight: 700; color: {TEXT}; line-height: 2.2; white-space: nowrap; }}
+.desk-compact-header-status {{ font-size: 0.68rem; font-weight: 400; color: {MUTED}; margin-left: 0.3rem; }}
+[class*="st-key-desk_compact_header"] button {{
+    padding: 0.3rem 0.7rem !important; font-size: 0.72rem !important; min-height: 44px !important;
+}}
+[class*="st-key-desk_compact_header"] [data-testid="stPopoverBody"] button {{ width: 100%; }}
+
 .desk-workflow-strip {{
     display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem;
     margin: 0.2rem 0 0.7rem 0; font-size: 0.72rem;
@@ -386,23 +398,70 @@ def _lifecycle_stage(tracking: dict) -> str:
     return "New"
 
 
+NEW_JOBS_LIVE_WINDOW_SECONDS = 3600  # 60 minutes -- presentation-only cutoff, see docs/operator_ui_blueprint.md
+
+
+def _age_minutes_clamped(age_seconds: float) -> int:
+    """Whole minutes only (never seconds), never negative (a handful of
+    test fixtures deliberately seed slightly-future received_at
+    timestamps for clock-skew tolerance -- this must never surface as
+    "-5m")."""
+    return max(0, int(age_seconds // 60))
+
+
+def render_compact_new_jobs_header(conn) -> bool:
+    """The one-row compact header for New Jobs only: LUXOR + connection
+    dot + a small Sync button + a small "..." menu (st.popover, not a
+    second full-width button) containing Log out. Every other page keeps
+    render_header() unchanged -- this is deliberately New-Jobs-specific,
+    not a shared redesign. Returns True exactly once, on the render
+    where Sync was clicked (same contract as render_header())."""
+    import os
+
+    import streamlit as st
+
+    import luxor_ops_shared as shared
+    from dispatcher.quo_client import API_KEY_ENV_VAR
+
+    with st.container(key="desk_compact_header"):
+        left, right = st.columns([5, 3])
+        with left:
+            api_key_configured = bool(os.environ.get(API_KEY_ENV_VAR))
+            _state, label = shared.connection_state(conn, api_key_configured)
+            st.markdown(
+                f'<div class="desk-compact-header-title">LUXOR <span class="desk-compact-header-status">{label}</span></div>',
+                unsafe_allow_html=True,
+            )
+        sync_clicked = False
+        with right:
+            sync_col, menu_col = st.columns(2)
+            with sync_col:
+                sync_clicked = st.button("Sync", key="desk_compact_sync")
+            with menu_col:
+                with st.popover("⋮"):
+                    if st.button("Log out", key="desk_compact_logout", width="stretch"):
+                        st.session_state[AUTH_SESSION_KEY] = False
+                        st.rerun()
+    return sync_clicked
+
+
 def render_queue_row(entry, identity: str, selected_id: str) -> None:
     """One compact, real, clickable queue row -- every field comes
     straight from the QueueEntry the caller built via
-    luxor_desk_read_model.get_live_dispatch_queue(). Clicking selects
-    this job as the workspace target; nothing else about it mutates."""
+    luxor_desk_read_model.get_live_dispatch_queue(). One line: source,
+    ticket, city, service, age in whole minutes -- never seconds, never
+    a full sentence. Clicking selects this job as the workspace target;
+    nothing else about it mutates."""
     import streamlit as st
 
-    from dispatcher.rules.sla_config import format_age
-
     job = entry.job
-    dispatch = "Dispatched" if entry.tracking["dispatched_manually_at"] else "Not dispatched"
-    area = ", ".join(p for p in (job.city.value, job.state.value) if p) or "Area unresolved"
+    city = job.city.value or job.state.value or "Area unknown"
+    age_minutes = _age_minutes_clamped(entry.age_seconds)
     extra = f" (+{entry.extra_count})" if entry.extra_count else ""
-    urgency_prefix = {"urgent": "🔴 ", "warning": "🟠 "}.get(entry.urgency, "")
+    marker = "🔴 " if entry.urgency == "urgent" else ""
     label = (
-        f"{urgency_prefix}{job.source.value} · {job.ticket_number.value or 'No ref'}{extra} — "
-        f"{area} · {job.service_type.value or 'Not specified'} — {format_age(entry.age_seconds)} — {dispatch}"
+        f"{marker}{job.source.value} • {job.ticket_number.value or 'No ref'}{extra} • "
+        f"{city} • {job.service_type.value or 'Service unclear'} • {age_minutes}m"
     )
     button_type = "primary" if identity == selected_id else "secondary"
     if st.button(label, key=f"desk_queue_row_{identity}", width="stretch", type=button_type):
@@ -411,23 +470,22 @@ def render_queue_row(entry, identity: str, selected_id: str) -> None:
 
 
 def render_job_workspace(conn, entry) -> None:
-    """The full real Job Workspace for one selected QueueEntry, built
-    around the dispatcher's actual workflow, not engineering mechanics:
-    header -> (HUMAN REVIEW NEEDED gate, if required data is missing) ->
-    acknowledgment -> the already-prepared Luxor message -> one combined
-    WhatsApp dispatch action -> secondary actions -> "View details" for
-    everything else (raw message, extracted fields, routing internals).
-    Every write here calls the exact same storage.save_audit_entry()/
-    mark_quo_pending_message_actioned()/dispatch_tracking path the
-    original Speed Dispatch Console uses -- no second persistence layer.
-    """
+    """The New Jobs action screen for one selected QueueEntry: a
+    compact always-visible summary, then at most three action areas
+    (company acknowledgment, technician dispatch, pass/handle manually
+    collapsed), then one collapsed "Job details" panel for everything
+    else. Every write here calls the exact same
+    storage.save_audit_entry()/mark_quo_pending_message_actioned()/
+    dispatch_tracking path the original Speed Dispatch Console uses --
+    no second persistence layer. See docs/operator_ui_blueprint.md's
+    "New Jobs mobile action screen" section for the exact state
+    machine each action area implements."""
     import streamlit as st
 
     import luxor_desk_read_model as rm
     from dispatcher import outbound
     from dispatcher.application import DispatcherService
     from dispatcher.policy import get_policy
-    from dispatcher.rules.sla_config import format_age
 
     job, classify_result, result, tracking = entry.job, entry.classify_result, entry.result, entry.tracking
     item = entry.item
@@ -436,130 +494,129 @@ def render_job_workspace(conn, entry) -> None:
 
     resolution, eligible, market_label = rm.resolve_job_routing(conn, job, item["raw_text"])
     area_label = resolution.canonical_area or "Area unresolved"
+    age_minutes = _age_minutes_clamped(entry.age_seconds)
 
-    # ---- Header: source, ticket, time received ----------------------
+    # ---- Always-visible compact summary --------------------------------
     st.markdown(
         f'<div class="desk-card-top">'
         f'{source_chip_html(job.source.value)}'
         f'<span class="desk-ticket">{job.ticket_number.value or "No reference"}</span>'
-        f'<span class="desk-age">Received {format_age(entry.age_seconds)} ago</span>'
+        f'<span class="desk-age">{age_minutes}m</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
-    # ---- City/state, service, and only the fields that are present --
-    meta_line = f"{area_label} · {job.service_type.value or 'Not specified'}"
+    meta_line = f"{area_label} · {job.service_type.value or 'Service unclear'}"
     if market_label:
         meta_line += f" ({market_label})"
     st.markdown(f'<div class="desk-meta">{meta_line}</div>', unsafe_allow_html=True)
-    if job.vehicle.value:
-        st.markdown(f'<div class="desk-meta">Vehicle: {job.vehicle.value}</div>', unsafe_allow_html=True)
 
     if not require_current_schema(conn):
-        with st.expander("Technical details"):
-            _render_details(conn, item, job, area_label, market_label, eligible, resolution)
+        with st.expander("Job details"):
+            _render_job_details(conn, item, job, area_label, market_label, eligible, resolution, result)
         return
 
     needs_review = bool(result.decision.missing_information) or bool(classify_result.conflicting_fields)
-
-    if needs_review:
-        problems = list(result.decision.missing_information) + [f"conflicting {f}" for f in classify_result.conflicting_fields]
-        st.warning(f"Please review this job before dispatching — {', '.join(problems)}.")
-        with st.expander("Technical details"):
-            _render_details(conn, item, job, area_label, market_label, eligible, resolution)
-        with st.expander("Handle manually or pass"):
-            _render_secondary_actions(conn, mid, job, classify_result, result)
-        return
-
-    # ---- Recommended technician + WhatsApp destination ---------------
     destination = eligible[0]["dispatch_group"] if eligible else None
     if len(eligible) == 1:
         tech_line = f"Technician: <strong>{eligible[0]['name']}</strong>"
     elif eligible:
-        tech_line = f"{len(eligible)} technicians eligible — pick one in WhatsApp"
+        tech_line = f"{len(eligible)} technicians eligible"
     else:
-        tech_line = "No technician configured for this area"
-    dest_line = f"WhatsApp: <strong>{destination}</strong>" if destination else "WhatsApp destination not configured"
+        tech_line = "No technician configured"
+    dest_line = (
+        f"WhatsApp: <strong>{destination}</strong>" if destination
+        else '<span class="desk-warning-chip">WhatsApp group not configured.</span>'
+    )
     st.markdown(f'<div class="desk-meta">{tech_line} · {dest_line}</div>', unsafe_allow_html=True)
+
+    if needs_review:
+        problems = list(result.decision.missing_information) + [f"conflicting {f}" for f in classify_result.conflicting_fields]
+        st.warning(f"Review before dispatching — {', '.join(problems)}.")
+        with st.expander("Job details"):
+            _render_job_details(conn, item, job, area_label, market_label, eligible, resolution, result)
+        with st.expander("Pass or handle manually"):
+            _render_secondary_actions(conn, mid, job, classify_result, result)
+        return
 
     stream_key = rm.policy_stream_key(item["group_label"], job.source.value)
     policy = get_policy(stream_key, classify_result.message_type.value)
+    is_closings_stream = item["group_label"] == "CLOSINGS"
 
-    if item["group_label"] == "CLOSINGS":
-        st.caption(
-            "Closings & Replies stream -- no new-job acknowledgment applies. Recording a "
-            "confirmed closing still uses the existing Closings & Payments tool for now."
-        )
+    # ---- Action area 1: Company acknowledgment (AGN/Lucky K only) ------
+    k_blocking = False
+    if is_closings_stream:
+        st.caption("Closings & Replies — use the Closings tool for this one.")
     elif policy.acknowledgment_required:
+        k_blocking = not tracking["acknowledged_at"]
         mode = outbound.current_mode()
         if mode in (outbound.OutboundMode.APPROVAL, outbound.OutboundMode.LIVE):
             if not tracking["acknowledged_at"]:
                 if st.button("Send K", key=f"desk_k_{mid}", type="primary", width="stretch"):
-                    ack_result = service.attempt_quo_acknowledgment(
+                    service.attempt_quo_acknowledgment(
                         mid, source=job.source.value, job_id=classify_result.existing_job_id,
                         quo_contact_id=item["group_label"], text="K",
                     )
-                    st.caption(ack_result.user_message)
                     st.rerun()
             else:
-                st.success("✅ K sent")
+                st.markdown('<div class="desk-checked-line">✓ K sent</div>', unsafe_allow_html=True)
         elif not tracking["acknowledged_at"]:
-            st.caption("Copy K")
-            k_cols = st.columns(2)
-            with k_cols[0]:
+            # One stateful button, two real taps: "Copy K" only reveals
+            # the code (copying is never sending); "Confirm K sent in
+            # Quo" is the one tap that actually records acknowledgment.
+            # Never shown simultaneously.
+            if st.session_state.get(f"njk_k_copy_{mid}"):
                 st.code("K")
-            with k_cols[1]:
-                if st.button("I sent K in Quo", key=f"desk_k_{mid}", width="stretch"):
+                if st.button("Confirm K sent in Quo", key=f"desk_k_confirm_{mid}", type="primary", width="stretch"):
                     service.acknowledge_job_manually(mid)
                     st.rerun()
+            else:
+                if st.button("Copy K", key=f"desk_k_{mid}", type="primary", width="stretch"):
+                    st.session_state[f"njk_k_copy_{mid}"] = True
+                    st.rerun()
         else:
-            st.success("✅ K sent")
-    else:
-        st.caption("No K acknowledgment needed for Main Leads")
+            st.markdown('<div class="desk-checked-line">✓ K sent</div>', unsafe_allow_html=True)
+    # Main Leads: no K text, no K placeholder, nothing rendered here.
 
-    # The already-prepared Luxor technician message -- visible
-    # immediately, never behind an "Extracted fields"/"Copy Luxor
-    # message" step first.
-    st.caption("Copy technician message")
-    st.code(result.luxor_message)
-
+    # ---- Action area 2: Technician dispatch -----------------------------
     dispatched = tracking["dispatched_manually_at"] is not None
+    if not is_closings_stream and not k_blocking:
+        if dispatched:
+            st.markdown('<div class="desk-checked-line">✓ Dispatched</div>', unsafe_allow_html=True)
+        elif not destination:
+            # No defined destination -- never offer a normal dispatch
+            # confirmation through an undefined channel. Copy-only.
+            if st.button("Copy job", key=f"desk_wa_copy_only_{mid}", width="stretch"):
+                st.session_state[f"njk_wa_preview_{mid}"] = True
+            if st.session_state.get(f"njk_wa_preview_{mid}"):
+                st.code(result.luxor_message)
+        elif not tracking["whatsapp_opened_at"]:
+            # One stateful button, two real taps -- same pattern as K.
+            if st.button("Copy job for technician", key=f"desk_wa_{mid}", type="primary", width="stretch"):
+                service.prepare_technician_dispatch(mid)
+                st.rerun()
+        else:
+            st.code(result.luxor_message)
+            if st.button("Confirm sent in WhatsApp", key=f"desk_confirm_dispatch_{mid}", type="primary", width="stretch"):
+                service.confirm_whatsapp_dispatch(mid, job, classify_result, result.luxor_message)
+                st.rerun()
 
-    if dispatched:
-        st.success("✅ Job dispatched")
-    elif tracking["whatsapp_opened_at"]:
-        # Only one primary action at a time -- once WhatsApp has been
-        # opened, "I sent it in WhatsApp" is done; "Confirm dispatched"
-        # becomes the sole primary action instead of showing both.
-        st.markdown('<div class="desk-checked-line">✓ Sent in WhatsApp</div>', unsafe_allow_html=True)
-        if st.button("Confirm dispatched", key=f"desk_confirm_dispatch_{mid}", type="primary", width="stretch"):
-            dispatch_result = service.confirm_whatsapp_dispatch(mid, job, classify_result, result.luxor_message)
-            st.success(dispatch_result.user_message)
-            st.rerun()
-    else:
-        if not destination:
-            st.caption("WhatsApp destination not configured")
-        if st.button("I sent it in WhatsApp", key=f"desk_wa_{mid}", type="primary", width="stretch", disabled=not destination):
-            service.prepare_technician_dispatch(mid)
-            st.rerun()
-
-    with st.expander("Technical details"):
-        _render_details(conn, item, job, area_label, market_label, eligible, resolution)
-
-    with st.expander("Handle manually or pass"):
+    # ---- Action area 3: Pass or handle manually (collapsed) -------------
+    with st.expander("Pass or handle manually"):
         _render_secondary_actions(conn, mid, job, classify_result, result)
 
+    with st.expander("Job details"):
+        _render_job_details(conn, item, job, area_label, market_label, eligible, resolution, result)
 
-def _render_details(conn, item, job, area_label, market_label, eligible, resolution) -> None:
+
+def _render_job_details(conn, item, job, area_label, market_label, eligible, resolution, result=None) -> None:
     """Everything that supports the dispatcher's decision but isn't the
-    decision itself: raw message, extracted fields, routing internals --
-    all one optional panel, per the standing "no accordions before a
-    normal job can be acted on" requirement."""
+    decision itself: contact info, the original message, the prepared
+    technician message, and routing internals nested one level further
+    under "Technical details" -- all one collapsed panel, opt-in, never
+    shown before the selected job's compact summary."""
     import streamlit as st
 
-    st.markdown("**Original message**")
-    st.code(shared_mask(item["raw_text"]))
-
-    st.markdown("**Extracted fields**")
+    st.markdown("**Contact**")
     st.markdown(f"Customer: {job.customer_name.value or '—'}")
     phone_line = job.phone.value or "—"
     if job.extension.value:
@@ -571,17 +628,24 @@ def _render_details(conn, item, job, area_label, market_label, eligible, resolut
     if job.notes.value:
         st.markdown(f"Notes: {job.notes.value}")
 
-    st.markdown("**Routing**")
-    st.markdown(f"Canonical area: {area_label}")
-    if market_label:
-        st.markdown(f"Market label: {market_label}")
-    if eligible:
-        for t in eligible:
-            st.caption(f"{t['name']} — {t['dispatch_group'] or 'WhatsApp destination not configured'}")
-    else:
-        st.caption("No eligible technician configured for this area/service.")
-    if not resolution.canonical_area:
-        st.caption(f"Routing: {resolution.reason}")
+    st.markdown("**Original message**")
+    st.code(shared_mask(item["raw_text"]))
+
+    if result is not None:
+        st.markdown("**Prepared technician message**")
+        st.code(result.luxor_message)
+
+    with st.expander("Technical details"):
+        st.markdown(f"Canonical area: {area_label}")
+        if market_label:
+            st.markdown(f"Market label: {market_label}")
+        if eligible:
+            for t in eligible:
+                st.caption(f"{t['name']} — {t['dispatch_group'] or 'WhatsApp destination not configured'}")
+        else:
+            st.caption("No eligible technician configured for this area/service.")
+        if not resolution.canonical_area:
+            st.caption(f"Routing: {resolution.reason}")
 
 
 def _render_secondary_actions(conn, mid, job, classify_result, result) -> None:

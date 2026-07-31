@@ -223,17 +223,6 @@ def test_company_filter_counts_correct(desk_env):
     assert "All (2)" in pills.options
 
 
-def test_company_grouping_shown_under_all_filter(desk_env):
-    seed_live_boundary(desk_env)
-    seed_pending(desk_env, "GAGN", agn_message("GAGNTICKET"))
-    seed_pending(desk_env, "GML", main_leads_message("GMLTICKET"), group_label="Main Leads 2")
-    at = login(make_app())
-    assert len(at.exception) == 0
-    rendered = "\n".join(m.value for m in at.markdown)
-    assert "<strong>AGN</strong>" in rendered
-    assert "<strong>Main Leads</strong>" in rendered
-
-
 # -------------------------------------------------------- Job workspace --
 def test_clicking_queue_row_opens_its_workspace(desk_env):
     seed_live_boundary(desk_env)
@@ -250,22 +239,34 @@ def test_clicking_queue_row_opens_its_workspace(desk_env):
 
 
 def test_agn_shows_k_ready_wording(desk_env):
+    """Copy K -> Confirm K sent in Quo -> checked line: one stateful
+    button, never both states shown simultaneously."""
     seed_live_boundary(desk_env)
     seed_pending(desk_env, "K1", agn_message("K1TICKET"))
     at = login(make_app())
-    # COPY K: the literal "K" text, shown via st.code so it has a native
-    # copy affordance -- plus "I sent K in Quo" to record confirmation.
+    assert any(b.key == "desk_k_K1" and b.label == "Copy K" for b in at.button)
+    assert not any(c.value == "K" for c in at.code)  # not revealed until tapped
+    assert not any(b.key == "desk_k_confirm_K1" for b in at.button)
+
+    at.button(key="desk_k_K1").click().run()
     assert any(c.value == "K" for c in at.code)
-    assert any(b.key == "desk_k_K1" and b.label == "I sent K in Quo" for b in at.button)
+    assert any(b.key == "desk_k_confirm_K1" and b.label == "Confirm K sent in Quo" for b in at.button)
+    assert not any(b.key == "desk_k_K1" for b in at.button)  # Copy K gone once revealed
+
+    at.button(key="desk_k_confirm_K1").click().run()
+    rendered = "\n".join(m.value for m in at.markdown)
+    assert "✓ K sent" in rendered
+    assert not any(b.key == "desk_k_confirm_K1" for b in at.button)
 
 
-def test_main_leads_shows_no_ack_required(desk_env):
+def test_main_leads_shows_no_k_wording(desk_env):
     seed_live_boundary(desk_env)
     seed_pending(desk_env, "ML1", main_leads_message("MLTICKET"), group_label="Main Leads 2")
     at = login(make_app())
-    rendered_captions = "\n".join(c.value for c in at.caption)
-    assert "No K acknowledgment needed for Main Leads" in rendered_captions
+    rendered = "\n".join(c.value for c in at.caption) + "\n".join(m.value for m in at.markdown)
+    assert "K acknowledgment" not in rendered
     assert not any(b.key == "desk_k_ML1" for b in at.button)
+    assert not any((b.label or "") in ("Copy K", "Confirm K sent in Quo") for b in at.button)
 
 
 def test_missing_required_fields_shows_human_review_needed(desk_env):
@@ -275,7 +276,7 @@ def test_missing_required_fields_shows_human_review_needed(desk_env):
     at = login(make_app())
     assert len(at.exception) == 0
     rendered = "\n".join(w.value for w in at.warning)
-    assert "Please review this job before dispatching" in rendered
+    assert "Review before dispatching" in rendered
     # Dispatch actions must be replaced, not merely warned alongside.
     assert not any(b.key == "desk_wa_INC1" for b in at.button)
     assert not any(b.key == "desk_k_INC1" for b in at.button)
@@ -296,18 +297,21 @@ def test_multiple_eligible_technicians_all_shown(desk_env):
 
 
 def test_no_whatsapp_or_dispatch_claim_without_destination(desk_env):
-    """The formatted message may still be copied (it's always shown via
-    st.code), and the "I sent it in WhatsApp" button is visible but
-    disabled -- never claims a destination that doesn't exist, and never
-    silently hides the action either."""
+    """No normal dispatch-confirmation path is ever offered through an
+    undefined WhatsApp destination -- only a copy-only fallback. AGN
+    requires K confirmed first (action area 2 stays gated until then)."""
     seed_live_boundary(desk_env)
     seed_pending(desk_env, "NODEST1", agn_message("NODESTTICKET", area="Charlotte, NC"))
     at = login(make_app())
-    wa_button = next(b for b in at.button if b.key == "desk_wa_NODEST1")
-    assert wa_button.disabled is True
+    at.button(key="desk_k_NODEST1").click().run()
+    at.button(key="desk_k_confirm_NODEST1").click().run()
+    assert len(at.exception) == 0
+
+    assert not any(b.key == "desk_wa_NODEST1" for b in at.button)
     assert not any(b.key == "desk_confirm_dispatch_NODEST1" for b in at.button)
-    rendered = "\n".join(c.value for c in at.caption)
-    assert "WhatsApp destination not configured" in rendered
+    assert any(b.key == "desk_wa_copy_only_NODEST1" for b in at.button)
+    rendered = "\n".join(m.value for m in at.markdown)
+    assert "WhatsApp group not configured." in rendered
 
 
 def test_pass_cancel_requires_reason(desk_env):
