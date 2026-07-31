@@ -85,6 +85,12 @@ const Api = {
 
   getReports() { return this._call("GET", "/api/reports"); },
 
+  getPerformance(filters) {
+    const q = new URLSearchParams(Object.entries(filters || {}).filter(([, v]) => v));
+    const qs = q.toString();
+    return this._call("GET", `/api/performance${qs ? "?" + qs : ""}`);
+  },
+
   getLearningReview() { return this._call("GET", "/api/learning_review"); },
   setLearningReviewStatus(episodeId, reviewStatus) {
     return this._call("POST", `/api/learning_review/${encodeURIComponent(episodeId)}/status`, { review_status: reviewStatus });

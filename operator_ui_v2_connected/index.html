@@ -38,6 +38,7 @@
 <div class="settings-menu" id="settingsMenu">
   <div class="settings-menu-item" data-screen="technicians">Technicians</div>
   <div class="settings-menu-item" data-screen="learning">Learning Review</div>
+  <div class="settings-menu-item" data-screen="performance">Performance</div>
   <div class="settings-menu-divider"></div>
   <div class="settings-menu-item" id="settingsLogoutItem">Log out</div>
 </div>
@@ -206,6 +207,45 @@
         </div>
         <div class="detail-pane" id="learningDetailPane"></div>
       </div>
+    </section>
+
+    <!-- ===================================================== PERFORMANCE -->
+    <section class="screen" id="screen-performance">
+      <div class="section-title">
+        Performance
+        <select id="perfPeriodSelect" style="min-height:30px; font-size:12px;">
+          <option value="shift">Current shift</option>
+          <option value="24h" selected>Last 24 hours</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+      </div>
+      <div class="scope-note">Read-only. Figures reflect only what's recorded in the database -- low-volume periods will honestly show "Insufficient data" rather than a misleading percentage.</div>
+
+      <div class="perf-summary-grid" id="perfSummaryGrid"></div>
+
+      <div id="perfAttentionSection" style="display:none;">
+        <div class="subsection-label">Attention now</div>
+        <div id="perfAttentionList"></div>
+      </div>
+
+      <div class="subsection-label">Operations</div>
+      <div class="perf-card" id="perfOperationsCard"></div>
+
+      <div class="subsection-label">Technicians</div>
+      <div class="perf-card" id="perfTechniciansCard"></div>
+
+      <div class="subsection-label">Sources</div>
+      <div class="perf-card" id="perfSourcesCard"></div>
+
+      <div class="subsection-label">AI Quality</div>
+      <div class="perf-card" id="perfAiQualityCard"></div>
+
+      <div class="subsection-label">Data Quality</div>
+      <div class="perf-card" id="perfDataQualityCard"></div>
+
+      <div class="subsection-label">Owner summary</div>
+      <div class="perf-card" id="perfBossViewCard"></div>
     </section>
 
   </main>

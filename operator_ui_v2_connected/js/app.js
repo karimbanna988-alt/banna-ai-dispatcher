@@ -221,6 +221,7 @@ async function refreshAll() {
   else if (state.screen === "reports") await loadReports();
   else if (state.screen === "technicians") await loadTechnicians();
   else if (state.screen === "learning") await loadLearningReview();
+  else if (state.screen === "performance") await loadPerformance();
 }
 
 async function loadJobs() {
@@ -1260,6 +1261,181 @@ function wireTechEditForms() {
       }
     });
   });
+}
+
+/* =========================================================== PERFORMANCE */
+let perfDashboard = null;
+let perfTechniciansShowAll = false;
+
+function fmtKpi(kpi, suffix) {
+  if (!kpi) return "—";
+  if (kpi.data_quality === "insufficient_data") return "Insufficient data";
+  if (kpi.data_quality === "needs_business_definition") return "Blocked -- needs definition";
+  if (kpi.value === null || kpi.value === undefined) return "—";
+  return `${kpi.value}${suffix || ""}`;
+}
+
+function kpiBadgeClass(kpi) {
+  if (!kpi) return "chip-waiting";
+  if (kpi.data_quality === "insufficient_data") return "chip-waiting";
+  if (kpi.data_quality === "needs_business_definition") return "chip-warning";
+  if (kpi.data_quality === "zero") return "chip-waiting";
+  return "chip-settled";
+}
+
+async function loadPerformance() {
+  const period = document.getElementById("perfPeriodSelect").value;
+  const data = await callOrHandleAuth(() => Api.getPerformance({ period }));
+  if (!data) return;
+  perfDashboard = data;
+  renderPerformanceScreen();
+}
+document.getElementById("perfPeriodSelect").addEventListener("change", () => loadPerformance());
+
+function renderPerformanceScreen() {
+  const dash = perfDashboard;
+  if (!dash) return;
+
+  const grid = document.getElementById("perfSummaryGrid");
+  const s = dash.summary;
+  const tiles = [
+    ["New jobs", fmtKpi(s.jobs_received)],
+    ["Waiting now", fmtKpi(s.jobs_waiting)],
+    ["Active jobs", fmtKpi(s.active_jobs)],
+    ["Closings due", fmtKpi(s.closings_due)],
+    ["Median dispatch", fmtKpi(s.median_dispatch_minutes, " min")],
+    ["Completion rate", fmtKpi(s.completion_rate, "%")],
+  ];
+  grid.innerHTML = tiles.map(([label, value]) => `
+    <div class="perf-tile">
+      <div class="perf-tile-value">${esc(value)}</div>
+      <div class="perf-tile-label">${esc(label)}</div>
+    </div>`).join("");
+
+  const attnSection = document.getElementById("perfAttentionSection");
+  const attnList = document.getElementById("perfAttentionList");
+  if (dash.attention_now.length) {
+    attnSection.style.display = "block";
+    attnList.innerHTML = dash.attention_now.slice(0, 5).map(item => `
+      <div class="mobile-row" data-jobid="${item.job_id}">
+        <div class="row-top">${sourceChip(item.source)} <strong>${esc(item.ticket || "No ref")}</strong></div>
+        <div class="row-bottom">${esc(item.type === "not_dispatched_within_target" ? "Not dispatched within target" : "Active job stale beyond target")}</div>
+        <button type="button" class="btn btn-primary btn-block card-primary-btn" data-perfaction="${esc(item.primary_action)}" data-jobid="${item.job_id}">${esc(item.primary_action)}</button>
+      </div>`).join("");
+    attnList.querySelectorAll("[data-perfaction]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        // Deep-link: jump to the screen most likely to hold this job.
+        setScreen("active");
+      });
+    });
+  } else {
+    attnSection.style.display = "none";
+  }
+
+  document.getElementById("perfOperationsCard").innerHTML = perfOperationsHtml(dash.operations);
+  document.getElementById("perfTechniciansCard").innerHTML = perfTechniciansHtml(dash.technicians);
+  wirePerfTechniciansShowMore();
+  document.getElementById("perfSourcesCard").innerHTML = perfSourcesHtml(dash.sources);
+  document.getElementById("perfAiQualityCard").innerHTML = perfAiQualityHtml(dash.ai_quality);
+  document.getElementById("perfDataQualityCard").innerHTML = perfDataQualityHtml(dash);
+  document.getElementById("perfBossViewCard").innerHTML = perfBossViewHtml(dash);
+}
+
+function perfKpiRow(label, kpi, suffix) {
+  return `<div class="perf-kpi-row">
+    <span class="perf-kpi-label">${esc(label)}</span>
+    <span class="chip ${kpiBadgeClass(kpi)}">${esc(fmtKpi(kpi, suffix))}</span>
+  </div>`;
+}
+
+function perfOperationsHtml(ops) {
+  return [
+    perfKpiRow("Jobs received", ops.jobs_received),
+    perfKpiRow("Jobs dispatched", ops.jobs_dispatched),
+    perfKpiRow("Dispatch rate", ops.dispatch_rate, "%"),
+    perfKpiRow("Median receive-to-review", ops.median_receive_to_review_minutes, " min"),
+    perfKpiRow("Median receive-to-dispatch", ops.median_receive_to_dispatch_minutes, " min"),
+    perfKpiRow("P90 receive-to-dispatch", ops.p90_receive_to_dispatch_minutes, " min"),
+    perfKpiRow("Completed jobs", ops.completed_jobs),
+    perfKpiRow("Cancellation rate", ops.cancellation_rate, "%"),
+    perfKpiRow("Pass / manual-handle rate", ops.pass_manual_handle_rate, "%"),
+    perfKpiRow("Closing completion rate", ops.closing_completion_rate, "%"),
+  ].join("");
+}
+
+function perfTechniciansHtml(technicians) {
+  if (!technicians.length) return `<div class="empty-state">No technicians configured.</div>`;
+  const toShow = perfTechniciansShowAll ? technicians : technicians.slice(0, 5);
+  const rows = toShow.map(t => `
+    <div class="perf-kpi-row">
+      <span class="perf-kpi-label">${esc(t.name)} <span class="age">(${t.jobs_assigned} assigned)</span></span>
+      <span class="chip ${kpiBadgeClass(t.completion_rate)}">${esc(fmtKpi(t.completion_rate, "%"))}</span>
+    </div>`).join("");
+  const hiddenCount = technicians.length - toShow.length;
+  const showMore = hiddenCount > 0
+    ? `<button type="button" class="btn btn-secondary btn-block" id="perfTechShowMoreBtn" style="margin-top:6px;">View all ${technicians.length}</button>`
+    : (perfTechniciansShowAll && technicians.length > 5 ? `<button type="button" class="btn btn-secondary btn-block" id="perfTechShowMoreBtn" style="margin-top:6px;">Show fewer</button>` : "");
+  return rows + showMore;
+}
+
+function wirePerfTechniciansShowMore() {
+  const btn = document.getElementById("perfTechShowMoreBtn");
+  if (btn) btn.addEventListener("click", () => { perfTechniciansShowAll = !perfTechniciansShowAll; renderPerformanceScreen(); });
+}
+
+function perfSourcesHtml(sources) {
+  const names = Object.keys(sources);
+  if (!names.length) return `<div class="empty-state">No sources recorded.</div>`;
+  return names.map(name => {
+    const s = sources[name];
+    return `
+      <div class="perf-source-block">
+        <div class="perf-kpi-label" style="font-weight:700; margin-bottom:4px;">${sourceChip(name)}</div>
+        ${perfKpiRow("Received", s.jobs_received)}
+        ${perfKpiRow("Dispatch rate", s.dispatch_rate, "%")}
+        ${perfKpiRow("Completion rate", s.completion_rate, "%")}
+        ${perfKpiRow("Cancellation rate", s.cancellation_rate, "%")}
+        ${perfKpiRow("Median dispatch", s.median_dispatch_minutes, " min")}
+      </div>`;
+  }).join("");
+}
+
+function perfAiQualityHtml(ai) {
+  return [
+    perfKpiRow("Human-review-required rate", ai.human_review_required_rate, "%"),
+    perfKpiRow("Suggestion acceptance rate", ai.acceptance_rate, "%"),
+    perfKpiRow("Correction rate", ai.correction_rate, "%"),
+    perfKpiRow("Excluded / sensitive / incomplete", ai.excluded_sensitive_incomplete_count),
+    perfKpiRow("Unrecognized-message rate", ai.unrecognized_message_rate, "%"),
+    perfKpiRow("Duplicate-message rate", ai.duplicate_message_rate, "%"),
+  ].join("");
+}
+
+function perfDataQualityHtml(dash) {
+  const allKpis = [
+    ...Object.values(dash.summary), ...Object.values(dash.operations),
+    dash.ai_quality.human_review_required_rate, dash.ai_quality.acceptance_rate, dash.ai_quality.correction_rate,
+  ];
+  const insufficient = allKpis.filter(k => k && k.data_quality === "insufficient_data").length;
+  return `
+    <div class="detail-meta">${esc(dash.data_quality.real_data_volume_note)}</div>
+    <div class="perf-kpi-row"><span class="perf-kpi-label">KPIs showing "Insufficient data" this period</span><span class="chip ${insufficient ? "chip-waiting" : "chip-settled"}">${insufficient}</span></div>`;
+}
+
+function perfBossViewHtml(dash) {
+  const bestSource = Object.entries(dash.sources)
+    .map(([name, s]) => [name, s.completion_rate && s.completion_rate.value])
+    .filter(([, v]) => v !== null && v !== undefined)
+    .sort((a, b) => b[1] - a[1])[0];
+  const topTech = dash.technicians.filter(t => t.completion_rate && t.completion_rate.value !== null).sort((a, b) => b.completion_rate.value - a.completion_rate.value)[0];
+  return `
+    <div class="detail-meta">Jobs in: <strong>${esc(fmtKpi(dash.summary.jobs_received))}</strong> · Dispatched in a median of <strong>${esc(fmtKpi(dash.summary.median_dispatch_minutes, " min"))}</strong></div>
+    <div class="detail-meta">Still waiting: <strong>${esc(fmtKpi(dash.summary.jobs_waiting))}</strong> · Active: <strong>${esc(fmtKpi(dash.summary.active_jobs))}</strong> · Completed: <strong>${esc(fmtKpi(dash.operations.completed_jobs))}</strong></div>
+    <div class="detail-meta">Best-performing source: <strong>${bestSource ? esc(bestSource[0]) + " (" + bestSource[1] + "%)" : "Insufficient data"}</strong></div>
+    <div class="detail-meta">Most reliable technician: <strong>${topTech ? esc(topTech.name) + " (" + topTech.completion_rate.value + "%)" : "Insufficient data"}</strong></div>
+    <div class="detail-meta">Jobs stuck (attention now): <strong>${dash.attention_now.length}</strong></div>
+    <div class="detail-meta">AI correction rate: <strong>${esc(fmtKpi(dash.ai_quality.correction_rate, "%"))}</strong></div>
+    <div class="detail-meta">Data trustworthy enough? <strong>${dash.summary.jobs_received.data_quality === "insufficient_data" ? "Not yet -- too little history" : "Reasonable for the KPIs marked Good above"}</strong></div>`;
 }
 
 window.addEventListener("resize", () => { if (!isMobile()) closeSheet(); });
