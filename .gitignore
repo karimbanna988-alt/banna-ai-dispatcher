@@ -6,3 +6,9 @@ data/*.db
 .claude/
 .env
 .deploy_logs/
+
+# WhatsApp Shadow Bridge -- session/pairing data must never be committed
+.runtime/
+whatsapp_shadow_bridge/node_modules/
+whatsapp_shadow_bridge/.env
+whatsapp_shadow_bridge/*.log

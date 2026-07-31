@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-shadow-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental, disabled-by-default, local-only, read-only incoming WhatsApp Shadow Bridge for LUXOR Operator UI V2. Isolated from the Python dispatcher runtime -- see README.md for the account-risk warning before ever pairing.",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
