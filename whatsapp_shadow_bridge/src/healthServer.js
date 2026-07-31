@@ -27,10 +27,20 @@ function createHealthServer(config, state) {
     }
 
     if (req.method === "GET" && req.url === "/groups") {
-      if (!state.getGroups) return send(503, { error: "Bridge not connected yet." });
+      if (!state.paired || !state.getGroups) {
+        return send(503, { error: "bridge_not_ready", message: "The WhatsApp session is not ready yet." });
+      }
       return state.getGroups()
         .then((groups) => send(200, { groups }))
-        .catch((err) => send(500, { error: err.message }));
+        .catch((err) => {
+          // Never echo the raw internal error back over HTTP -- it comes
+          // from whatsapp-web.js/Puppeteer internals and could be an
+          // unhelpful fragment or, in principle, something derived from
+          // chat state. Log locally (this terminal only) for the
+          // operator, return a sanitized code to the caller.
+          console.error("WhatsApp Shadow Bridge: group discovery failed:", err && err.message);
+          send(500, { error: "group_discovery_failed", message: "Could not list groups right now. Check the bridge terminal for details." });
+        });
     }
 
     if (req.method === "GET" && req.url === "/allowlist") {

@@ -119,7 +119,7 @@ test("POST /allowlist with a malformed (non-JID) group id is rejected, not crash
   server.close();
 });
 
-test("GET /groups before pairing returns 503, not a crash", async () => {
+test("GET /groups before pairing returns 503 bridge_not_ready, not a crash", async () => {
   const config = tmpConfig();
   const state = { paired: false, getGroups: null };
   const server = createHealthServer(config, state);
@@ -128,6 +128,49 @@ test("GET /groups before pairing returns 503, not a crash", async () => {
 
   const res = await request(port, "GET", "/groups");
   assert.equal(res.status, 503);
+  assert.equal(res.json.error, "bridge_not_ready");
+  server.close();
+});
+
+test("GET /groups returns 503 even if getGroups exists but paired is still false", async () => {
+  // Defense in depth: paired=false must gate /groups even if something
+  // else left a stale getGroups function around (e.g. after a
+  // disconnect that didn't fully clear state).
+  const config = tmpConfig();
+  const state = { paired: false, getGroups: async () => ([{ id: "1@g.us", name: "Should not be reachable" }]) };
+  const server = createHealthServer(config, state);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const res = await request(port, "GET", "/groups");
+  assert.equal(res.status, 503);
+  server.close();
+});
+
+test("GET /groups succeeds once paired is true and getGroups is set", async () => {
+  const config = tmpConfig();
+  const state = { paired: true, getGroups: async () => ([{ id: "111@g.us", name: "Kabaka Dispatch" }]) };
+  const server = createHealthServer(config, state);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const res = await request(port, "GET", "/groups");
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json.groups, [{ id: "111@g.us", name: "Kabaka Dispatch" }]);
+  server.close();
+});
+
+test("GET /groups sanitizes an internal getGroups failure instead of echoing raw internal error text", async () => {
+  const config = tmpConfig();
+  const state = { paired: true, getGroups: async () => { throw new Error("r"); } };
+  const server = createHealthServer(config, state);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const res = await request(port, "GET", "/groups");
+  assert.equal(res.status, 500);
+  assert.equal(res.json.error, "group_discovery_failed");
+  assert.notEqual(res.json.error, "r");
   server.close();
 });
 

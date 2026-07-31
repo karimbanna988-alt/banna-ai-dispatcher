@@ -12,3 +12,5 @@ data/*.db
 whatsapp_shadow_bridge/node_modules/
 whatsapp_shadow_bridge/.env
 whatsapp_shadow_bridge/*.log
+whatsapp_shadow_bridge/.wwebjs_cache/
+whatsapp_shadow_bridge/.wwebjs_auth/

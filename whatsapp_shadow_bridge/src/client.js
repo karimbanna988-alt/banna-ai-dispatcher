@@ -55,6 +55,11 @@ function initializeBridge(config, options = {}) {
     if (options.onDisconnected) options.onDisconnected(reason);
   });
 
+  client.on("auth_failure", (message) => {
+    log("WhatsApp Shadow Bridge: authentication failed -- the bridge is not connected.");
+    if (options.onAuthFailure) options.onAuthFailure(message);
+  });
+
   client.on("message", async (msg) => {
     try {
       const chat = await msg.getChat();

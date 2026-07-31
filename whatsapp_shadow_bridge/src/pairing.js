@@ -7,7 +7,7 @@
 
 "use strict";
 
-function runPairing(config, initializeBridge, log = console.log) {
+function runPairing(config, initializeBridge, log = console.log, hooks = {}) {
   if (!config.enabled) {
     log("WHATSAPP_SHADOW_ENABLED is not true -- refusing to pair. Set it explicitly to begin pairing.");
     return null;
@@ -30,7 +30,16 @@ function runPairing(config, initializeBridge, log = console.log) {
       log("Scan this QR code from your phone: WhatsApp > Settings > Linked Devices > Link a Device");
       qrcodeTerminal.generate(qr, { small: true });
     },
-    onReady: () => log("Pairing complete. The bridge is now connected (incoming/read-only)."),
+    onReady: () => {
+      log("Pairing complete. The bridge is now connected (incoming/read-only).");
+      if (hooks.onReady) hooks.onReady();
+    },
+    onDisconnected: (reason) => {
+      if (hooks.onDisconnected) hooks.onDisconnected(reason);
+    },
+    onAuthFailure: (message) => {
+      if (hooks.onAuthFailure) hooks.onAuthFailure(message);
+    },
   });
   client.initialize();
   return client;
