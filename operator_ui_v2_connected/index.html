@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>LUXOR Operator UI V2 (Connected)</title>
 <link rel="stylesheet" href="css/styles.css">
 <link rel="stylesheet" href="css/connected.css">
@@ -69,7 +69,10 @@
             <tbody id="jobsTableBody"></tbody>
           </table>
           <div class="mobile-row-list" id="jobsMobileList"></div>
-          <div id="jobsEmptyState" class="empty-state" style="display:none;">No live jobs received in the last 60 minutes.</div>
+          <div id="jobsShowMoreWrap" style="display:none; margin-top:8px;">
+            <button class="btn btn-secondary btn-block" id="jobsShowMoreBtn"></button>
+          </div>
+          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new jobs received in the last 60 minutes.</div>
 
           <div id="recentJobsSection" style="display:none;">
             <div class="subsection-label">Recent unresolved jobs</div>
@@ -82,6 +85,9 @@
 
           <details class="disclosure" id="olderJobsDetails" style="margin-top:14px; display:none;">
             <summary id="olderJobsSummary">Older unresolved jobs</summary>
+            <div class="toolbar" style="margin-top:8px;">
+              <input type="text" id="olderJobsSearch" placeholder="Search ticket, company, city...">
+            </div>
             <table class="data-table" id="olderJobsTable">
               <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
               <tbody id="olderJobsTableBody"></tbody>

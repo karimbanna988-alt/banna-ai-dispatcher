@@ -83,8 +83,11 @@ button { font-family: inherit; }
 .desktop-sidebar .nav-item.active { color: var(--primary); background: #eef2ff; border-left-color: var(--primary); }
 .desktop-sidebar .nav-item:hover:not(.active) { background: var(--bg); }
 
-.main-content { flex: 1; min-width: 0; padding: 12px 14px 70px 14px; }
-@media (min-width: 900px) {
+.main-content { flex: 1; min-width: 0; padding: 12px 14px calc(70px + env(safe-area-inset-bottom, 0px)) 14px; }
+/* Desktop mode requires both width AND height headroom -- a landscape
+   phone (e.g. 932x430) is wider than 900px but far too short to be a
+   desktop window, and must keep the mobile bottom-nav/card layout. */
+@media (min-width: 900px) and (min-height: 500px) {
   .desktop-sidebar { display: block; }
   .main-content { padding: 16px 20px; }
   .mobile-bottom-nav { display: none !important; }
@@ -128,13 +131,13 @@ button { font-family: inherit; }
   display: none; width: 360px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 14px; position: sticky; top: 58px; max-height: calc(100vh - 80px); overflow-y: auto;
 }
-@media (min-width: 900px) {
+@media (min-width: 900px) and (min-height: 500px) {
   .split .detail-pane.open { display: block; }
 }
 
 /* -------------------------------------------------------- Desktop table - */
 .data-table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: none; }
-@media (min-width: 900px) { .data-table { display: table; } .mobile-row-list { display: none !important; } }
+@media (min-width: 900px) and (min-height: 500px) { .data-table { display: table; } .mobile-row-list { display: none !important; } }
 .data-table thead th {
   text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted);
   background: #fafbfc; padding: 8px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
@@ -147,7 +150,7 @@ button { font-family: inherit; }
 
 /* ---------------------------------------------------------- Mobile rows - */
 .mobile-row-list { display: block; }
-@media (min-width: 900px) { .mobile-row-list { display: none; } }
+@media (min-width: 900px) and (min-height: 500px) { .mobile-row-list { display: none; } }
 .mobile-row {
   background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--muted-gray-border);
   border-radius: var(--radius); padding: 8px 10px; margin-bottom: 6px; cursor: pointer;
@@ -192,23 +195,36 @@ details.disclosure summary { cursor: pointer; font-size: 12px; font-weight: 600;
 .sheet-backdrop.open { display: block; }
 .bottom-sheet {
   position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-radius: 14px 14px 0 0;
-  max-height: 86vh; overflow-y: auto; z-index: 41; padding: 12px 14px 20px 14px;
+  max-height: 86vh; max-height: 86dvh; overflow-y: auto; z-index: 41;
+  padding: 12px 14px calc(20px + env(safe-area-inset-bottom, 0px)) 14px;
   box-shadow: 0 -4px 16px rgba(0,0,0,0.15);
 }
 .sheet-handle { width: 36px; height: 4px; background: var(--border); border-radius: 999px; margin: 0 auto 10px auto; }
-@media (min-width: 900px) { .sheet-backdrop, .bottom-sheet { display: none !important; } }
+@media (min-width: 900px) and (min-height: 500px) { .sheet-backdrop, .bottom-sheet { display: none !important; } }
 
 /* ------------------------------------------------------- Mobile bottom nav */
 .mobile-bottom-nav {
   position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-top: 1px solid var(--border);
-  display: flex; z-index: 20;
+  display: flex; z-index: 20; padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 .mobile-bottom-nav .nav-item {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
-  padding: 7px 0; color: var(--text-muted); font-size: 10.5px; font-weight: 600; cursor: pointer;
+  padding: 7px 0; color: var(--text-muted); font-size: 10.5px; font-weight: 600; cursor: pointer; min-height: 44px;
 }
 .mobile-bottom-nav .nav-item .nav-icon { font-size: 17px; line-height: 1; }
 .mobile-bottom-nav .nav-item.active { color: var(--primary); }
+
+/* Larger touch targets on phones/tablets only -- desktop is unaffected. */
+@media (max-width: 899px), (max-height: 499px) {
+  .btn { min-height: 44px; }
+  .icon-btn { width: 40px; height: 40px; }
+}
+
+/* ------------------------------------------------------ Mobile job cards - */
+.mobile-row.job-card { padding-bottom: 10px; }
+.mobile-row .row-status { margin-top: 6px; }
+.mobile-row .card-primary-btn { margin-top: 8px; }
+.mobile-row .row-next-action { margin-top: 6px; font-size: 12px; color: var(--text-muted); font-style: italic; }
 
 /* ------------------------------------------------------------- Reports -- */
 .report-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
@@ -223,8 +239,8 @@ details.disclosure summary { cursor: pointer; font-size: 12px; font-weight: 600;
 .report-table tbody tr:hover { background: #f8f9fb; }
 .report-table tfoot td { font-weight: 800; padding: 8px 9px; border-top: 2px solid var(--border); background: #fafbfc; }
 .report-mobile-list { display: block; }
-@media (min-width: 900px) { .report-mobile-list { display: none; } .report-table-wrap { display: block; } }
-@media (max-width: 899px) { .report-table-wrap { display: none; } }
+@media (min-width: 900px) and (min-height: 500px) { .report-mobile-list { display: none; } .report-table-wrap { display: block; } }
+@media (max-width: 899px), (max-height: 499px) { .report-table-wrap { display: none; } }
 .report-row-mobile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 6px; cursor: pointer; }
 .report-row-mobile .rrm-top { display: flex; justify-content: space-between; font-weight: 700; font-size: 12.5px; }
 .report-row-mobile .rrm-bottom { color: var(--text-muted); font-size: 11.5px; margin-top: 2px; }

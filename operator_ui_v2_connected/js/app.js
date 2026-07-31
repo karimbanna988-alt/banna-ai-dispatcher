@@ -19,6 +19,8 @@ const state = {
   activeRawText: {},       // job_id -> last pasted text, preserved verbatim across re-renders
   closingDraft: {},        // job_id -> in-progress technician-closing form values
   learningSelected: null,
+  jobsShowAllLive: false,  // "Show N more" toggle for the live-jobs landing list
+  olderJobsSearch: "",     // client-side-only filter text for the Older jobs disclosure
 };
 
 let newJobsLive = [];
@@ -109,6 +111,7 @@ function clearAllLocalData() {
   newJobsLive = []; newJobsOlder = []; activeJobs = []; closingsEntries = []; historyEntries = []; technicians = []; learningEpisodes = []; whatsappPending = [];
   state.jobsSelected = null; state.activeSelected = null; state.closingsSelected = null; state.historySelected = null; state.learningSelected = null;
   state.kRevealed = {}; state.activePreview = {}; state.activeRawText = {}; state.closingDraft = {};
+  state.jobsShowAllLive = false; state.olderJobsSearch = "";
   ["jobsTableBody", "jobsMobileList", "recentJobsTableBody", "recentJobsMobileList", "olderJobsTableBody", "olderJobsMobileList", "jobsDetailPane",
    "activeTableBody", "activeMobileList", "activeDetailPane",
    "closingsTableBody", "closingsMobileList", "closingsDetailPane",
@@ -243,6 +246,36 @@ document.getElementById("syncBtn").addEventListener("click", async () => {
 });
 
 const RECENT_WINDOW_MINUTES = 24 * 60;
+const LIVE_DISPLAY_CAP = 5;
+
+function ageText(minutes) {
+  if (minutes === null || minutes === undefined) return "";
+  if (minutes < 1) return "just now";
+  if (minutes === 1) return "1 min ago";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hrs = Math.floor(minutes / 60);
+  return hrs === 1 ? "1 hr ago" : `${hrs} hr ago`;
+}
+
+function jobStatusText(j) {
+  if (j.is_closings_stream) return "Closings & Replies";
+  if (j.needs_review) return "Needs review";
+  if (j.k_required && !j.k_sent) return "Needs K sent";
+  if (!j.destination) return "Group not configured";
+  if (!j.copied) return "Ready to dispatch";
+  if (!j.dispatched) return "Sent -- confirm";
+  return "Dispatched";
+}
+
+function jobStatusChipClass(j) {
+  if (j.needs_review || (!j.destination && !j.is_closings_stream)) return "chip-warning";
+  if (j.dispatched) return "chip-settled";
+  return j.bucket === "needs_action" ? "chip-needs-action" : "chip-waiting";
+}
+
+function jobPrimaryLabel(j) {
+  return j.dispatched ? "View job" : "Review job";
+}
 
 function renderJobsScreen() {
   const allSelectable = newJobsLive.concat(newJobsOlder);
@@ -251,16 +284,30 @@ function renderJobsScreen() {
   const tbody = document.getElementById("jobsTableBody");
   const mobileList = document.getElementById("jobsMobileList");
   const emptyState = document.getElementById("jobsEmptyState");
+  const showMoreWrap = document.getElementById("jobsShowMoreWrap");
+  const showMoreBtn = document.getElementById("jobsShowMoreBtn");
   if (!newJobsLive.length) {
     tbody.innerHTML = "";
     mobileList.innerHTML = "";
     emptyState.style.display = "block";
+    showMoreWrap.style.display = "none";
   } else {
     emptyState.style.display = "none";
-    tbody.innerHTML = newJobsLive.map(j => jobRowHtml(j, "jobsTableBody")).join("");
-    mobileList.innerHTML = newJobsLive.map(j => jobMobileRowHtml(j)).join("");
+    const liveToShow = state.jobsShowAllLive ? newJobsLive : newJobsLive.slice(0, LIVE_DISPLAY_CAP);
+    tbody.innerHTML = liveToShow.map(j => jobRowHtml(j, "jobsTableBody")).join("");
+    mobileList.innerHTML = liveToShow.map(j => jobMobileRowHtml(j)).join("");
+    wireJobRowClicks(tbody, mobileList);
+    const hiddenCount = newJobsLive.length - liveToShow.length;
+    if (hiddenCount > 0) {
+      showMoreWrap.style.display = "block";
+      showMoreBtn.textContent = `Show ${hiddenCount} more live job${hiddenCount === 1 ? "" : "s"}`;
+    } else if (state.jobsShowAllLive && newJobsLive.length > LIVE_DISPLAY_CAP) {
+      showMoreWrap.style.display = "block";
+      showMoreBtn.textContent = "Show fewer";
+    } else {
+      showMoreWrap.style.display = "none";
+    }
   }
-  wireJobRowClicks(tbody, mobileList);
 
   // "Recent unresolved jobs" only appears as a helpful fallback when
   // there is nothing live to act on -- newest 3 unresolved jobs from
@@ -284,18 +331,8 @@ function renderJobsScreen() {
     recentSection.style.display = "none";
   }
 
-  const olderDetails = document.getElementById("olderJobsDetails");
-  if (olderForCollapsed.length) {
-    olderDetails.style.display = "block";
-    document.getElementById("olderJobsSummary").textContent = `Older unresolved jobs (${olderForCollapsed.length})`;
-    const olderBody = document.getElementById("olderJobsTableBody");
-    const olderMobile = document.getElementById("olderJobsMobileList");
-    olderBody.innerHTML = olderForCollapsed.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
-    olderMobile.innerHTML = olderForCollapsed.map(j => jobMobileRowHtml(j)).join("");
-    wireJobRowClicks(olderBody, olderMobile);
-  } else {
-    olderDetails.style.display = "none";
-  }
+  _olderJobsFull = olderForCollapsed;
+  renderOlderJobsSection();
 
   // Never auto-select an older/recent job while a live job exists; if no
   // live job exists, the dispatcher may still deliberately pick a recent
@@ -306,6 +343,44 @@ function renderJobsScreen() {
   if (state.jobsSelected) renderJobDetail(state.jobsSelected, allSelectable);
   else { document.getElementById("jobsDetailPane").classList.remove("open"); document.getElementById("jobsDetailPane").innerHTML = ""; }
 }
+
+document.getElementById("jobsShowMoreBtn").addEventListener("click", () => {
+  state.jobsShowAllLive = !state.jobsShowAllLive;
+  renderJobsScreen();
+});
+
+// Older-jobs disclosure: a small client-side-only search filter, never a
+// new API call -- it filters the already-fetched newJobsOlder array.
+let _olderJobsFull = [];
+function renderOlderJobsSection() {
+  const olderDetails = document.getElementById("olderJobsDetails");
+  if (!_olderJobsFull.length) {
+    olderDetails.style.display = "none";
+    return;
+  }
+  olderDetails.style.display = "block";
+  const q = state.olderJobsSearch.trim().toLowerCase();
+  const filtered = q ? _olderJobsFull.filter(j => olderJobMatches(j, q)) : _olderJobsFull;
+  document.getElementById("olderJobsSummary").textContent = q
+    ? `Older unresolved jobs (${filtered.length} of ${_olderJobsFull.length})`
+    : `Older unresolved jobs (${_olderJobsFull.length})`;
+  const olderBody = document.getElementById("olderJobsTableBody");
+  const olderMobile = document.getElementById("olderJobsMobileList");
+  olderBody.innerHTML = filtered.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
+  olderMobile.innerHTML = filtered.map(j => jobMobileRowHtml(j)).join("");
+  wireJobRowClicks(olderBody, olderMobile);
+}
+
+function olderJobMatches(j, q) {
+  return [j.ticket, j.source, j.service, j.city, j.state, j.technician_name]
+    .some(v => (v || "").toString().toLowerCase().includes(q));
+}
+
+const olderJobsSearchInput = document.getElementById("olderJobsSearch");
+olderJobsSearchInput.addEventListener("input", () => {
+  state.olderJobsSearch = olderJobsSearchInput.value;
+  renderOlderJobsSection();
+});
 
 function jobRowHtml(j, bodyId) {
   return `
@@ -321,9 +396,11 @@ function jobRowHtml(j, bodyId) {
 
 function jobMobileRowHtml(j) {
   return `
-    <div class="mobile-row ${j.bucket === "needs_action" ? "needs-action" : "waiting"}" data-mid="${esc(j.message_id)}">
-      <div class="row-top">${sourceChip(j.source)} <strong>${esc(j.ticket || "No ref")}</strong> <span class="age">${j.age_minutes}m</span></div>
+    <div class="mobile-row job-card ${j.bucket === "needs_action" ? "needs-action" : "waiting"}" data-mid="${esc(j.message_id)}">
+      <div class="row-top">${sourceChip(j.source)} <strong>${esc(j.ticket || "No ref")}</strong> <span class="age">${esc(ageText(j.age_minutes))}</span></div>
       <div class="row-bottom">${esc(j.service || "Unclear")} · ${esc(j.city || "")}${j.state ? ", " + esc(j.state) : ""}</div>
+      <div class="row-status"><span class="chip ${jobStatusChipClass(j)}">${esc(jobStatusText(j))}</span></div>
+      <button type="button" class="btn btn-primary btn-block card-primary-btn">${esc(jobPrimaryLabel(j))}</button>
     </div>`;
 }
 
@@ -585,6 +662,19 @@ async function handleWhatsappPendingAction(action, messageId) {
   }
 }
 
+function activeMobileRowHtml(j) {
+  const actionable = j.bucket === "needs_action";
+  return `
+    <div class="mobile-row job-card ${actionable ? "needs-action" : "waiting"}" data-id="${j.id}">
+      <div class="row-top">${sourceChip(j.source)} <strong>${esc(j.ticket || "No ref")}</strong></div>
+      <div class="row-bottom">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")}</div>
+      <div class="row-status"><span class="chip ${actionable ? "chip-needs-action" : "chip-waiting"}">${esc(j.status)}</span></div>
+      ${actionable
+        ? `<button type="button" class="btn btn-primary btn-block card-primary-btn">${esc(j.next_action)}</button>`
+        : `<div class="row-next-action">${esc(j.next_action)}</div>`}
+    </div>`;
+}
+
 function renderActiveScreen() {
   document.getElementById("activeCount").textContent = `(${activeJobs.length})`;
   const tbody = document.getElementById("activeTableBody");
@@ -600,11 +690,7 @@ function renderActiveScreen() {
   tbody.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => selectActive(parseInt(tr.dataset.id, 10))));
 
   const mobileList = document.getElementById("activeMobileList");
-  mobileList.innerHTML = activeJobs.length ? activeJobs.map(j => `
-    <div class="mobile-row ${j.bucket === "needs_action" ? "needs-action" : "waiting"}" data-id="${j.id}">
-      <div class="row-top">${sourceChip(j.source)} <strong>${esc(j.ticket || "No ref")}</strong></div>
-      <div class="row-bottom">${esc(j.technician_name || "Unassigned")} · ${esc(j.next_action)}</div>
-    </div>`).join("") : `<div class="empty-state">No active jobs.</div>`;
+  mobileList.innerHTML = activeJobs.length ? activeJobs.map(j => activeMobileRowHtml(j)).join("") : `<div class="empty-state">No active jobs.</div>`;
   mobileList.querySelectorAll(".mobile-row").forEach(row => row.addEventListener("click", () => selectActive(parseInt(row.dataset.id, 10))));
 
   if (!activeJobs.find(j => j.id === state.activeSelected)) state.activeSelected = activeJobs.length ? activeJobs[0].id : null;
