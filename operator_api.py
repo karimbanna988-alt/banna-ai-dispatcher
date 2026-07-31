@@ -7,16 +7,29 @@ is a thin wrapper around an existing, already-audited
 dispatcher.application.DispatcherService method or a pure read -- this
 file owns no SQL and no business logic of its own; see
 dispatcher/application.py and luxor_desk_read_model.py, which it reuses
-exactly as luxor_desk.py already does.
+exactly as luxor_desk.py already does. (Structural guard:
+tests/test_operator_api.py greps this file for raw-SQL call literals
+and fails if any appear.)
 
 WhatsApp itself is never touched programmatically: this server never
 opens a socket to web.whatsapp.com, never drives a browser, never reads
-a session cookie. "Open WhatsApp" is a purely client-side (JS) action;
-this server only records that a human later confirmed a message was
-sent -- the same manual-confirmation contract
+a session cookie *from WhatsApp*. "Open WhatsApp" is a purely
+client-side (JS) action; this server only records that a human later
+confirmed a message was sent -- the same manual-confirmation contract
 adapters.ManualWhatsAppHandoffAdapter already implements.
 
-Run: python operator_api.py [--port 8512] [--db path/to.db]
+Authentication: one dispatcher, one password (LUXOR_DEMO_PASSWORD --
+the exact same gitignored env var luxor_desk.py already uses, so there
+is only ever one password to remember/rotate). Sessions are stateless,
+HMAC-signed cookies (no server-side session store, no new database
+table) verified against a separate, auto-generated, gitignored signing
+secret (OPERATOR_API_SESSION_SECRET). See SecurityHeaders/AuthGate
+below for the full contract: HttpOnly/SameSite cookies, CSRF tokens on
+every mutating request, login-attempt throttling, and no-store caching
+so no page or API response is ever cached with real customer data on it
+after logout.
+
+Run: python operator_api.py [--port 8512]
 The default DB is the real one (dispatcher.storage.connect()'s default)
 -- set OPERATOR_API_DB_PATH to point at a different file (tests always
 do this, and always use a temporary path, never the real database).
@@ -25,27 +38,42 @@ do this, and always use a temporary path, never the real database).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sys
+import time
 import traceback
+from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(REPO_ROOT / ".env")
+
 import luxor_desk_read_model as rm  # noqa: E402
+import luxor_desk_shared  # noqa: E402
 import luxor_ops_shared as shared  # noqa: E402
 from dispatcher import commercial, storage  # noqa: E402
+from dispatcher.action_names import ActionName  # noqa: E402
+from dispatcher.app_models import ClosingCommand  # noqa: E402
 from dispatcher.application import DispatcherService  # noqa: E402
+from dispatcher.closing import ClosingInput, render_closing_from_persisted_fields  # noqa: E402
 from dispatcher.policy import get_policy  # noqa: E402
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
+LIVE_WINDOW_MINUTES = luxor_desk_shared.NEW_JOBS_LIVE_WINDOW_SECONDS // 60  # 60 -- single source of truth
 
 
 class ApiError(Exception):
@@ -68,6 +96,100 @@ def _service(conn) -> DispatcherService:
     return DispatcherService(conn, queue_reader=rm.LuxorDeskQueueReader())
 
 
+# =============================================================== AUTH ====
+PASSWORD_ENV_VAR = luxor_desk_shared.PASSWORD_ENV_VAR  # "LUXOR_DEMO_PASSWORD" -- same one password, reused, never duplicated
+SESSION_SECRET_ENV_VAR = "OPERATOR_API_SESSION_SECRET"
+SESSION_COOKIE_NAME = "operator_session"
+SESSION_TTL_SECONDS = 12 * 3600  # one dispatcher shift
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 300
+
+
+def _env_file_path() -> Path:
+    override = os.environ.get("OPERATOR_API_ENV_FILE")
+    return Path(override) if override else REPO_ROOT / ".env"
+
+
+def _get_or_create_session_secret() -> bytes:
+    """Reads OPERATOR_API_SESSION_SECRET, or generates one and appends
+    it to .env (gitignored, never printed) the first time this runs --
+    "a separate ignored session-signing secret", never hard-coded, never
+    the same value as the dispatcher's own password."""
+    secret = os.environ.get(SESSION_SECRET_ENV_VAR)
+    if secret:
+        return secret.encode("utf-8")
+    generated = secrets.token_hex(32)
+    env_path = _env_file_path()
+    with open(env_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{SESSION_SECRET_ENV_VAR}={generated}\n")
+    os.environ[SESSION_SECRET_ENV_VAR] = generated
+    print(f"Generated a new {SESSION_SECRET_ENV_VAR} and appended it to {env_path.name} (value not printed).")
+    return generated.encode("utf-8")
+
+
+SESSION_SECRET = _get_or_create_session_secret()
+_LOGIN_ATTEMPTS: dict = {}  # client ip -> list[float] of recent failed-attempt timestamps, in-memory only
+_ACTIVE_SESSIONS: set = set()  # in-memory only -- a server restart itself acts as "log everyone out"
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(SESSION_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_session_token() -> str:
+    """Issues a new signed session token AND records it as active --
+    signature/expiry alone are not enough to satisfy "logout invalidates
+    the session": a captured pre-logout cookie value must stop working
+    the moment logout is called, not merely once it expires 12 hours
+    later. See invalidate_session_token()."""
+    expires_at = int(time.time()) + SESSION_TTL_SECONDS
+    payload = str(expires_at)
+    token = f"{payload}.{_sign(payload)}"
+    _ACTIVE_SESSIONS.add(token)
+    return token
+
+
+def verify_session_token(token: Optional[str]) -> bool:
+    if not token or token not in _ACTIVE_SESSIONS or "." not in token:
+        return False
+    payload, _, signature = token.rpartition(".")
+    if not signature or not hmac.compare_digest(_sign(payload), signature):
+        return False
+    try:
+        expires_at = int(payload)
+    except ValueError:
+        return False
+    if time.time() >= expires_at:
+        _ACTIVE_SESSIONS.discard(token)
+        return False
+    return True
+
+
+def invalidate_session_token(token: Optional[str]) -> None:
+    if token:
+        _ACTIVE_SESSIONS.discard(token)
+
+
+def csrf_token_for(session_token: str) -> str:
+    return _sign(f"{session_token}:csrf")
+
+
+def _check_login_rate_limit(client_ip: str) -> None:
+    now = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(client_ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+    _LOGIN_ATTEMPTS[client_ip] = attempts
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        raise ApiError(429, "Too many login attempts. Try again in a few minutes.")
+
+
+def _record_failed_login(client_ip: str) -> None:
+    _LOGIN_ATTEMPTS.setdefault(client_ip, []).append(time.time())
+
+
+def _clear_login_attempts(client_ip: str) -> None:
+    _LOGIN_ATTEMPTS.pop(client_ip, None)
+
+
 # --------------------------------------------------------------- Helpers --
 def _age_minutes(age_seconds: float) -> int:
     return max(0, int(age_seconds // 60))
@@ -79,7 +201,10 @@ def _find_new_job_entry(conn, message_id: str):
     the Jobs list itself used -- never a second parse/cache of the raw
     text. Raises ApiError(404) if the message is no longer live
     (already dispatched, or aged past the boundary in a way that
-    removed it -- callers should refresh their list)."""
+    removed it -- callers should refresh their list). Search covers the
+    full "live-since-activation" universe, not just the <=60-minute
+    presentation window -- an older-unresolved job must still be
+    actionable."""
     live, _backlog, _other = rm.get_live_dispatch_queue(conn)
     for entry in live:
         if entry.item["message_id"] == message_id:
@@ -105,6 +230,15 @@ def _new_job_dto(conn, entry) -> dict:
         policy = get_policy(stream_key, classify_result.message_type.value)
         k_required = bool(policy.acknowledgment_required)
 
+    copied = tracking["copied_at"] is not None
+    k_sent = tracking["acknowledged_at"] is not None
+    if k_required and not k_sent:
+        bucket = "needs_action"
+    elif not copied:
+        bucket = "needs_action"
+    else:
+        bucket = "waiting"
+
     return {
         "message_id": item["message_id"],
         "source": job.source.value,
@@ -114,12 +248,13 @@ def _new_job_dto(conn, entry) -> dict:
         "state": job.state.value,
         "age_minutes": _age_minutes(entry.age_seconds),
         "urgency": entry.urgency,
+        "bucket": bucket,
         "is_closings_stream": is_closings_stream,
         "needs_review": needs_review,
         "review_problems": review_problems,
         "k_required": k_required,
-        "k_sent": tracking["acknowledged_at"] is not None,
-        "copied": tracking["copied_at"] is not None,
+        "k_sent": k_sent,
+        "copied": copied,
         "whatsapp_opened": tracking["whatsapp_opened_at"] is not None,
         "dispatched": tracking["dispatched_manually_at"] is not None,
         "destination": destination,
@@ -151,8 +286,7 @@ def _technician_dto(t: dict) -> dict:
 
 
 def _action_result_dto(result) -> dict:
-    d = dataclasses.asdict(result)
-    return d
+    return dataclasses.asdict(result)
 
 
 def _read_json_body(handler: "Handler") -> dict:
@@ -173,6 +307,12 @@ def _read_json_body(handler: "Handler") -> dict:
     return parsed
 
 
+def _parse_query(path: str) -> dict:
+    query = urlparse(path).query
+    parsed = parse_qs(query)
+    return {k: v[0] for k, v in parsed.items()}
+
+
 def _require(body: dict, field: str) -> str:
     value = body.get(field)
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -180,12 +320,83 @@ def _require(body: dict, field: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------- AUTH ROUTES
+def route_login(handler: "Handler", match: dict, body: dict) -> dict:
+    client_ip = handler.client_ip if handler else "test"
+    _check_login_rate_limit(client_ip)
+    password = body.get("password") or ""
+    expected = os.environ.get(PASSWORD_ENV_VAR)
+    if not expected:
+        raise ApiError(500, f"Login is not configured ({PASSWORD_ENV_VAR} is not set).")
+    if not hmac.compare_digest(password, expected):
+        _record_failed_login(client_ip)
+        raise ApiError(401, "Invalid password.")
+    _clear_login_attempts(client_ip)
+    token = make_session_token()
+    if handler:
+        handler.set_session_cookie(token)
+    return {"success": True, "csrf_token": csrf_token_for(token)}
+
+
+def route_logout(handler: "Handler", match: dict, body: dict) -> dict:
+    if handler:
+        invalidate_session_token(handler._session_token())
+        handler.clear_session_cookie()
+    return {"success": True}
+
+
+def route_me(handler: "Handler", match: dict, body: dict) -> dict:
+    return {"authenticated": True}
+
+
 # --------------------------------------------------------- Route handlers -
 def route_new_jobs(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
         live, _backlog, _other = rm.get_live_dispatch_queue(conn)
-        return {"entries": [_new_job_dto(conn, e) for e in live]}
+        dtos = [_new_job_dto(conn, e) for e in live]
+        bucket_rank = {"needs_action": 0, "waiting": 1}
+        live_window = sorted(
+            (d for d in dtos if d["age_minutes"] <= LIVE_WINDOW_MINUTES),
+            key=lambda d: (bucket_rank.get(d["bucket"], 2), d["age_minutes"]),
+        )
+        older_unresolved = sorted(
+            (d for d in dtos if d["age_minutes"] > LIVE_WINDOW_MINUTES),
+            key=lambda d: d["age_minutes"],
+        )
+        return {"live": live_window, "older": older_unresolved, "live_window_minutes": LIVE_WINDOW_MINUTES}
+    finally:
+        conn.close()
+
+
+def route_sync(handler: "Handler", match: dict, body: dict) -> dict:
+    """Explicit manual ingestion -- the same dispatcher.quo_ingest.poll_for_new_messages()
+    the Streamlit New Jobs "Sync" button already calls; nothing here
+    fetches Quo automatically or on a timer. See
+    docs/whatsapp_groups_readiness.md-adjacent note in the final report
+    for why: no approved background poller is currently running (see
+    scripts/background_poller.py's own docstring -- it must be started
+    by a human and stays running only as long as that terminal does)."""
+    from dispatcher import quo_client
+    from dispatcher.quo_client import API_KEY_ENV_VAR, QuoAPIError, QuoConfigError
+    from dispatcher.quo_ingest import poll_for_new_messages
+
+    conn = get_conn()
+    try:
+        api_key = os.environ.get(API_KEY_ENV_VAR)
+        if not api_key:
+            raise ApiError(400, "Quo is not configured in this environment.")
+        try:
+            client = quo_client.QuoClient(api_key=api_key)
+            outcome = poll_for_new_messages(conn, client)
+        except QuoConfigError as exc:
+            storage.record_poll_error(conn, str(exc))
+            raise ApiError(400, "Quo is not configured.") from exc
+        except QuoAPIError as exc:
+            storage.record_poll_error(conn, str(exc))
+            raise ApiError(502, "Quo temporarily unavailable.") from exc
+        shared.clear_pending_caches()
+        return {"success": True, "queued": len(outcome.queued)}
     finally:
         conn.close()
 
@@ -194,10 +405,25 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
         jobs = rm.get_active_jobs_detailed(conn)
+        entries = []
         for j in jobs:
             episode = storage.get_shadow_episode_for_job(conn, j["id"])
-            j["shadow_episode"] = _episode_summary(episode) if episode else None
-        return {"entries": jobs}
+            entries.append({
+                "id": j["id"],
+                "source": j["source"],
+                "ticket": j["ticket_number"],
+                "status": j["status"],
+                "technician_name": j.get("assigned_technician_name"),
+                "technician_dispatch_group": j.get("assigned_technician_dispatch_group"),
+                "city": j.get("service_area"),
+                "description": j.get("description"),
+                "latest_technician_update": j.get("latest_technician_update"),
+                "next_action": luxor_desk_shared.active_job_next_action_label(j),
+                "bucket": luxor_desk_shared.active_job_bucket(j),
+                "waiting_since": j.get("last_event_at") or j.get("updated_at"),
+                "shadow_episode": _episode_summary(episode) if episode else None,
+            })
+        return {"entries": entries}
     finally:
         conn.close()
 
@@ -206,7 +432,12 @@ def route_technicians(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
         technicians = storage.list_technicians(conn, active_only=False)
-        return {"technicians": [_technician_dto(t) for t in technicians]}
+        dtos = [_technician_dto(t) for t in technicians]
+        return {
+            "technicians": dtos,
+            "missing_dispatch_group": [t["name"] for t in dtos if not (t["dispatch_group"] or "").strip()],
+            "missing_closing_group": [t["name"] for t in dtos if not (t["closing_group"] or "").strip()],
+        }
     finally:
         conn.close()
 
@@ -398,46 +629,366 @@ def _episode_summary(episode: dict) -> dict:
     }
 
 
-ROUTES = [
-    ("GET", r"^/api/new_jobs$", route_new_jobs),
-    ("GET", r"^/api/active$", route_active),
-    ("GET", r"^/api/technicians$", route_technicians),
-    ("POST", r"^/api/technicians/(?P<id>\d+)/destinations$", route_update_destinations),
-    ("GET", r"^/api/job/(?P<id>\d+)$", route_job_workspace),
-    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/acknowledge$", route_acknowledge),
-    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/prepare$", route_prepare_dispatch),
-    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/confirm$", route_confirm_dispatch),
-    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/handle_manually$", route_handle_manually),
-    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/pass$", route_pass),
-    ("POST", r"^/api/job/(?P<id>\d+)/commercial/preview$", route_commercial_preview),
-    ("POST", r"^/api/job/(?P<id>\d+)/commercial/save$", route_commercial_save),
-    ("POST", r"^/api/job/(?P<id>\d+)/commercial/confirm_reply_sent$", route_commercial_confirm_reply_sent),
-]
+# ================================================================ CLOSINGS
+def _closing_dto(conn, service: DispatcherService, job: dict) -> dict:
+    workspace = service.get_job_workspace(job["id"])
+    area, description = luxor_desk_shared._service_area_and_description(workspace["fields"])
+    details = storage.get_latest_closing_details(conn, job["id"])
 
-import re  # noqa: E402
-_COMPILED_ROUTES = [(method, re.compile(pattern), fn) for method, pattern, fn in ROUTES]
+    missing = []
+    supported = None
+    unsupported_reason = None
+    prepared_text = None
+    if job["status"] == "Closed":
+        if not details or not details.get("amount"):
+            missing.append("amount")
+        if not details or not details.get("payment_method"):
+            missing.append("payment method")
+        if not missing:
+            closing_input = ClosingInput(
+                amount=details["amount"], payment_method=details["payment_method"], parts_amount=details.get("parts_amount"),
+            )
+            result = render_closing_from_persisted_fields(job["source"], job["ticket_number"], workspace["fields"], closing_input)
+            supported = result.supported
+            if result.supported:
+                prepared_text = result.text
+            else:
+                unsupported_reason = result.reason
+
+    history = service.get_job_history(job["id"])
+    sent_confirmed = any(e.get("final_action") == ActionName.COMPANY_CLOSING_SENT_MANUALLY.value for e in history)
+
+    return {
+        "id": job["id"],
+        "source": job["source"],
+        "ticket": job["ticket_number"],
+        "status": job["status"],
+        "technician_name": job.get("assigned_technician_name"),
+        "area": area,
+        "description": description,
+        "bucket": luxor_desk_shared.closing_job_bucket(job),
+        "closing_recorded": job["status"] == "Closed",
+        "amount": details.get("amount") if details else None,
+        "payment_method": details.get("payment_method") if details else None,
+        "parts_amount": details.get("parts_amount") if details else None,
+        "company_share": details.get("company_share") if details else None,
+        "technician_share": details.get("technician_share") if details else None,
+        "missing": missing,
+        "supported": supported,
+        "unsupported_reason": unsupported_reason,
+        "prepared_text": prepared_text,
+        "sent_confirmed": sent_confirmed,
+    }
+
+
+def route_closings(handler: "Handler", match: dict, body: dict) -> dict:
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        candidates = rm.get_closing_candidates(conn)
+        return {"entries": [_closing_dto(conn, service, j) for j in candidates]}
+    finally:
+        conn.close()
+
+
+def route_closing_record(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    raw_closing = _require(body, "raw_closing")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        command = ClosingCommand(
+            job_id=job_id, raw_closing=raw_closing,
+            final_amount=body.get("final_amount") or None, payment_method=body.get("payment_method") or None,
+            parts=body.get("parts") or None, company_share=body.get("company_share") or None,
+            technician_share=body.get("technician_share") or None,
+        )
+        result = service.record_closing(command)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not record this closing.")
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+def route_closing_prepare(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.prepare_company_closing(job_id)
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+def route_closing_confirm_sent(handler: "Handler", match: dict, body: dict) -> dict:
+    """Recomputes the company-specific closing text fresh, server-side,
+    from currently-persisted fields -- exactly like the existing
+    Streamlit Closings workspace does -- rather than trusting any
+    client-supplied message text."""
+    job_id = int(match["id"])
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        job = service.get_job_workspace(job_id)
+        if job is None:
+            raise ApiError(404, f"No job with id {job_id}.")
+        details = storage.get_latest_closing_details(conn, job_id)
+        if not details or not details.get("amount") or not details.get("payment_method"):
+            raise ApiError(400, "Missing amount or payment method -- cannot confirm sent yet.")
+        closing_input = ClosingInput(
+            amount=details["amount"], payment_method=details["payment_method"], parts_amount=details.get("parts_amount"),
+        )
+        result = render_closing_from_persisted_fields(job["source"], job["ticket_number"], job["fields"], closing_input)
+        if not result.supported:
+            raise ApiError(400, result.reason)
+        action_result = service.confirm_company_closing_sent(job_id, result.text)
+        if not action_result.success:
+            raise ApiError(400, action_result.user_message)
+        return _action_result_dto(action_result)
+    finally:
+        conn.close()
+
+
+def route_closing_complete(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.complete_job(job_id)
+        if not result.success:
+            raise ApiError(400, result.user_message)
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+# ================================================================= HISTORY
+def _history_event_dto(e: dict) -> dict:
+    return {
+        "created_at": e.get("created_at"),
+        "label": luxor_desk_shared.history_event_label(e),
+        "note": shared.mask_sensitive(e.get("dispatcher_edits")),
+    }
+
+
+def route_history(handler: "Handler", match: dict, body: dict) -> dict:
+    conn = get_conn()
+    try:
+        completed = rm.get_completed_jobs(conn)
+        search = (body.get("search") or "").strip().lower()
+        source_filter = body.get("source") or "All"
+        technician_filter = body.get("technician") or "All"
+        status_filter = body.get("status") or "All"
+        date_from = body.get("date_from")
+        date_to = body.get("date_to")
+
+        def matches(job: dict) -> bool:
+            if search and search not in (job.get("ticket_number") or "").lower():
+                return False
+            if source_filter != "All" and job.get("source") != source_filter:
+                return False
+            if technician_filter != "All" and job.get("assigned_technician_name") != technician_filter:
+                return False
+            if status_filter != "All" and job.get("status") != status_filter:
+                return False
+            job_date_raw = job.get("last_event_at") or job.get("updated_at")
+            if job_date_raw and (date_from or date_to):
+                job_date = str(job_date_raw)[:10]
+                if date_from and job_date < date_from:
+                    return False
+                if date_to and job_date > date_to:
+                    return False
+            return True
+
+        filtered = [j for j in completed if matches(j)]
+        entries = []
+        for j in filtered:
+            details = storage.get_latest_closing_details(conn, j["id"])
+            entries.append({
+                "id": j["id"], "source": j["source"], "ticket": j["ticket_number"], "status": j["status"],
+                "technician_name": j.get("assigned_technician_name"),
+                "completed_at": j.get("last_event_at") or j.get("updated_at"),
+                "amount": details.get("amount") if details else None,
+                "payment_method": details.get("payment_method") if details else None,
+            })
+        return {
+            "entries": entries,
+            "total": len(completed),
+            "filter_options": {
+                "sources": sorted({j["source"] for j in completed if j.get("source")}),
+                "technicians": sorted({j["assigned_technician_name"] for j in completed if j.get("assigned_technician_name")}),
+                "statuses": sorted({j["status"] for j in completed if j.get("status")}),
+            },
+        }
+    finally:
+        conn.close()
+
+
+def route_history_detail(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        job = service.get_job_workspace(job_id)
+        if job is None:
+            raise ApiError(404, f"No job with id {job_id}.")
+        history = service.get_job_history(job_id)
+        details = storage.get_latest_closing_details(conn, job_id)
+        episode = storage.get_shadow_episode_for_job(conn, job_id)
+        area, description = luxor_desk_shared._service_area_and_description(job["fields"])
+        return {
+            "job": {
+                "id": job["id"], "source": job["source"], "ticket": job["ticket_number"], "status": job["status"],
+                "technician_name": job.get("assigned_technician_name"), "area": area, "description": description,
+            },
+            "closing": details,
+            "commercial_history": _episode_summary(episode) if episode else None,
+            "timeline": [_history_event_dto(e) for e in history],
+        }
+    finally:
+        conn.close()
+
+
+# ================================================================= REPORTS
+def route_reports(handler: "Handler", match: dict, body: dict) -> dict:
+    """Read-only. Only fields that actually exist in the database --
+    never a computed percentage/profit/balance/parts/fees breakdown,
+    since no such fields are persisted anywhere in this schema. Missing
+    values are sent as null; the frontend renders "Not recorded", never
+    a fabricated number."""
+    conn = get_conn()
+    try:
+        entries = []
+        for j in rm.get_completed_jobs(conn):
+            details = storage.get_latest_closing_details(conn, j["id"])
+            quote = storage.get_latest_verified_commercial_update_for_job(conn, j["id"]) if storage.shadow_schema_present(conn) else None
+            entries.append({
+                "job": j["ticket_number"],
+                "company": j["source"],
+                "date": j.get("last_event_at") or j.get("updated_at"),
+                "technician": j.get("assigned_technician_name"),
+                "area": j.get("service_area"),
+                "quoted_amount": (quote.get("quote_amount_text") or quote.get("quote_amount")) if quote else None,
+                "final_amount": details.get("amount") if details else None,
+                "payment_method": details.get("payment_method") if details else None,
+            })
+        return {"entries": entries}
+    finally:
+        conn.close()
+
+
+ROUTES = [
+    ("POST", r"^/api/login$", route_login, {"public": True, "skip_csrf": True}),
+    ("POST", r"^/api/logout$", route_logout, {}),
+    ("GET", r"^/api/me$", route_me, {}),
+    ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
+    ("POST", r"^/api/sync$", route_sync, {}),
+    ("GET", r"^/api/active$", route_active, {}),
+    ("GET", r"^/api/technicians$", route_technicians, {}),
+    ("POST", r"^/api/technicians/(?P<id>\d+)/destinations$", route_update_destinations, {}),
+    ("GET", r"^/api/job/(?P<id>\d+)$", route_job_workspace, {}),
+    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/acknowledge$", route_acknowledge, {}),
+    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/prepare$", route_prepare_dispatch, {}),
+    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/confirm$", route_confirm_dispatch, {}),
+    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/handle_manually$", route_handle_manually, {}),
+    ("POST", r"^/api/new_jobs/(?P<message_id>[^/]+)/pass$", route_pass, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/commercial/preview$", route_commercial_preview, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/commercial/save$", route_commercial_save, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/commercial/confirm_reply_sent$", route_commercial_confirm_reply_sent, {}),
+    ("GET", r"^/api/closings$", route_closings, {}),
+    ("POST", r"^/api/closings/(?P<id>\d+)/record$", route_closing_record, {}),
+    ("POST", r"^/api/closings/(?P<id>\d+)/prepare$", route_closing_prepare, {}),
+    ("POST", r"^/api/closings/(?P<id>\d+)/confirm_sent$", route_closing_confirm_sent, {}),
+    ("POST", r"^/api/closings/(?P<id>\d+)/complete$", route_closing_complete, {}),
+    ("GET", r"^/api/history$", route_history, {}),
+    ("GET", r"^/api/history/(?P<id>\d+)$", route_history_detail, {}),
+    ("GET", r"^/api/reports$", route_reports, {}),
+]
+_COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
+
+
+SECURITY_HEADERS = (
+    ("Cache-Control", "no-store"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+)
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "OperatorAPI/1.0"
 
-    def log_message(self, fmt, *args):  # quieter, no request logging of raw bodies
+    def log_message(self, fmt, *args):  # quieter, never logs headers/cookies/body
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
 
+    @property
+    def client_ip(self) -> str:
+        return self.client_address[0]
+
+    def _cookies(self) -> http_cookies.SimpleCookie:
+        jar = http_cookies.SimpleCookie()
+        raw = self.headers.get("Cookie")
+        if raw:
+            try:
+                jar.load(raw)
+            except http_cookies.CookieError:
+                pass
+        return jar
+
+    def _session_token(self) -> Optional[str]:
+        jar = self._cookies()
+        morsel = jar.get(SESSION_COOKIE_NAME)
+        return morsel.value if morsel else None
+
+    def _is_https(self) -> bool:
+        return (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+
+    def set_session_cookie(self, token: str) -> None:
+        parts = [f"{SESSION_COOKIE_NAME}={token}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={SESSION_TTL_SECONDS}"]
+        if self._is_https():
+            parts.append("Secure")
+        self._pending_set_cookie = "; ".join(parts)
+
+    def clear_session_cookie(self) -> None:
+        parts = [f"{SESSION_COOKIE_NAME}=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"]
+        if self._is_https():
+            parts.append("Secure")
+        self._pending_set_cookie = "; ".join(parts)
+
+    def _require_auth(self) -> str:
+        token = self._session_token()
+        if not verify_session_token(token):
+            raise ApiError(401, "Not authenticated.")
+        return token
+
+    def _require_csrf(self, session_token: str) -> None:
+        supplied = self.headers.get("X-CSRF-Token")
+        expected = csrf_token_for(session_token)
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            raise ApiError(403, "Missing or invalid CSRF token.")
+
     def _dispatch(self, method: str) -> None:
+        self._pending_set_cookie = None
         parsed = urlparse(self.path)
         path = parsed.path
         if not path.startswith("/api/"):
             self._serve_static(method)
             return
-        for route_method, pattern, fn in _COMPILED_ROUTES:
+        for route_method, pattern, fn, opts in _COMPILED_ROUTES:
             if route_method != method:
                 continue
             m = pattern.match(path)
             if not m:
                 continue
             try:
-                body = _read_json_body(self) if method == "POST" else {}
+                session_token = None
+                if not opts.get("public"):
+                    session_token = self._require_auth()
+                if method == "POST" and not opts.get("skip_csrf"):
+                    self._require_csrf(session_token)
+                body = _read_json_body(self) if method == "POST" else _parse_query(self.path)
                 result = fn(self, m.groupdict(), body)
                 self._send_json(200, result)
             except ApiError as exc:
@@ -454,18 +1005,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._dispatch("POST")
 
+    def _send_common_headers(self) -> None:
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        if getattr(self, "_pending_set_cookie", None):
+            self.send_header("Set-Cookie", self._pending_set_cookie)
+            self._pending_set_cookie = None
+
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_static(self, method: str) -> None:
         """Minimal, dependency-free static file server for
-        operator_ui_v2_connected/ -- GET only, no directory listing,
-        no traversal above STATIC_DIR."""
+        operator_ui_v2_connected/ -- GET only, no directory listing, no
+        traversal above STATIC_DIR. Unauthenticated by design: these
+        files are pure code/CSS (the login screen itself lives here) and
+        carry no customer data -- see the module docstring's "code is
+        public, data is protected" split."""
         if method != "GET":
             self._send_json(405, {"error": "Method not allowed for static files."})
             return
@@ -489,6 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(data)
 
