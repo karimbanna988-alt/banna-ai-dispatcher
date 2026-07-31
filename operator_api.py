@@ -66,7 +66,7 @@ import luxor_desk_read_model as rm  # noqa: E402
 import luxor_desk_shared  # noqa: E402
 import luxor_ops_shared as shared  # noqa: E402
 import whatsapp_bridge_adapter  # noqa: E402
-from dispatcher import commercial, storage  # noqa: E402
+from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.app_models import ClosingCommand  # noqa: E402
 from dispatcher.application import DispatcherService  # noqa: E402
@@ -904,6 +904,35 @@ def route_reports(handler: "Handler", match: dict, body: dict) -> dict:
         conn.close()
 
 
+# ============================================================= PERFORMANCE
+_PERFORMANCE_PERIODS = ("shift", "24h", "7d", "30d", "custom")
+
+
+def route_performance(handler: "Handler", match: dict, body: dict) -> dict:
+    """Read-only KPI dashboard for the Performance screen. Every figure
+    comes from kpi_read_model.get_dashboard(), which only ever reads
+    jobs/events/shadow_episodes -- this route never writes anything and
+    never exposes phone numbers, addresses, or raw message bodies."""
+    period = body.get("period") or "24h"
+    if period not in _PERFORMANCE_PERIODS:
+        raise ApiError(400, f"period must be one of {_PERFORMANCE_PERIODS}")
+    source = body.get("source") or None
+    area = body.get("area") or None
+    custom_start = body.get("start") if period == "custom" else None
+    custom_end = body.get("end") if period == "custom" else None
+    conn = get_conn()
+    try:
+        try:
+            return kpi_read_model.get_dashboard(
+                conn, period=period, source=source, area=area,
+                custom_start=custom_start, custom_end=custom_end,
+            )
+        except ValueError as exc:
+            raise ApiError(400, str(exc)) from exc
+    finally:
+        conn.close()
+
+
 # =========================================================== LEARNING REVIEW
 _REVIEW_STATUSES = ("VERIFIED", "CORRECTED", "EXCLUDE", "SENSITIVE", "INCOMPLETE")
 
@@ -1029,6 +1058,7 @@ ROUTES = [
     ("GET", r"^/api/history$", route_history, {}),
     ("GET", r"^/api/history/(?P<id>\d+)$", route_history_detail, {}),
     ("GET", r"^/api/reports$", route_reports, {}),
+    ("GET", r"^/api/performance$", route_performance, {}),
     ("GET", r"^/api/learning_review$", route_learning_review, {}),
     ("POST", r"^/api/learning_review/(?P<episode_id>[^/]+)/status$", route_learning_review_status, {}),
     ("GET", r"^/api/whatsapp_pending$", route_whatsapp_pending, {}),

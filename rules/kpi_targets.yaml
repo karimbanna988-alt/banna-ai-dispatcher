@@ -1,0 +1,30 @@
+# Configurable SLA targets and thresholds for the KPI read model
+# (src/dispatcher/kpi_read_model.py). Business config, not code -- change
+# these values as the owner defines real operational targets. Every
+# default below is a documented placeholder, not a measured or
+# owner-approved number -- see docs/kpi_definitions.md.
+
+# Minutes after job creation before a still-New/Needs-Review job counts as
+# "waiting over target" in the "Jobs waiting over target" KPI and the
+# Performance screen's "Attention now" section.
+dispatch_target_minutes: 30
+
+# Minutes since a job's last event before an Approved/In-Progress job
+# counts as "stale" (no recent update) in KPIs and "Attention now".
+stale_target_minutes: 120
+
+# Minimum number of reviewed Shadow episodes (or any other sampled
+# population) required before a rate/percentage KPI is computed at all.
+# Below this, the KPI reports data_quality=insufficient_data instead of a
+# potentially misleading percentage from a tiny sample.
+min_sample_size: 5
+
+# Default "current shift" boundary in America/New_York local time, used
+# only until the owner defines real shift hours. 00:00 means "since local
+# midnight today" -- i.e. "today so far".
+shift_start_local_time: "00:00"
+
+# IANA time zone used for all period-boundary computation (shift/24h/7d/
+# 30d/custom range). All stored timestamps remain UTC; this only affects
+# how period boundaries are drawn.
+operational_timezone: "America/New_York"
