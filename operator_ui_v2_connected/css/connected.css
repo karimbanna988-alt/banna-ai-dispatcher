@@ -1,0 +1,48 @@
+/* Additive-only styles for the connected build -- everything in
+   styles.css (copied unchanged from operator_ui_v2) stays as-is. Reuses
+   the same design tokens (var(--...)) defined there. */
+
+.form-field { margin: 8px 0; }
+.form-field label { display: block; font-size: 11.5px; font-weight: 700; color: var(--text-muted); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.02em; }
+.form-field input[type="text"], .form-field textarea, .form-field select {
+  width: 100%; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 9px;
+  font-size: 13px; font-family: inherit; background: var(--surface); color: var(--text);
+}
+.form-field textarea { min-height: 88px; resize: vertical; }
+.form-row { display: flex; gap: 8px; }
+.form-row .form-field { flex: 1; }
+
+.review-banner {
+  background: var(--pale-yellow); border: 1px solid var(--pale-yellow-border); color: #7a6006;
+  border-radius: var(--radius); padding: 8px 10px; font-size: 12.5px; font-weight: 700; margin: 8px 0;
+}
+.info-banner {
+  background: #eef2ff; border: 1px solid #c7d2ff; color: #29459e;
+  border-radius: var(--radius); padding: 8px 10px; font-size: 12px; margin: 8px 0;
+}
+
+/* Confirm-return modal -- same visual language as the bottom sheet, but
+   also usable on desktop (unlike .bottom-sheet, which is mobile-only). */
+.confirm-modal-backdrop {
+  display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45); z-index: 50;
+  align-items: center; justify-content: center;
+}
+.confirm-modal-backdrop.open { display: flex; }
+.confirm-modal {
+  background: var(--surface); border-radius: 10px; padding: 18px; width: 92%; max-width: 380px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.22);
+}
+.confirm-modal h3 { margin: 0 0 6px 0; font-size: 15px; }
+.confirm-modal .confirm-group-name { font-weight: 800; color: var(--primary); }
+.confirm-modal .confirm-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+
+.shadow-panel {
+  border-top: 1px dashed var(--border); margin-top: 12px; padding-top: 10px; font-size: 12px; color: var(--text-muted);
+}
+.shadow-panel .shadow-row { margin: 3px 0; }
+.shadow-panel .shadow-label { font-weight: 700; color: var(--text); }
+
+.tech-edit-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.tech-edit-row .btn { min-height: 32px; padding: 6px 10px; font-size: 12px; }
+
+.scope-note { color: var(--text-muted); font-size: 11.5px; padding: 8px 4px 2px 4px; }
