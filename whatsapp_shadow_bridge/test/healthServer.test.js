@@ -174,6 +174,33 @@ test("GET /groups sanitizes an internal getGroups failure instead of echoing raw
   server.close();
 });
 
+// Whatever shape the rejection takes -- Error, bare string, minified
+// object, circular object -- the HTTP response must always be the same
+// fixed, sanitized code. Full detail only ever goes to this process's
+// own console (see src/diagnostics.js), never over the wire.
+const REJECTION_SHAPES = [
+  ["a normal Error", () => { throw new Error("r"); }],
+  ["a bare thrown string", () => { throw "r"; }], // eslint-disable-line no-throw-literal
+  ["a minified/non-Error object", () => { throw { code: 1, m: "r" }; }], // eslint-disable-line no-throw-literal
+  ["a circular object", () => { const c = { name: "loop" }; c.self = c; throw c; }],
+];
+
+for (const [label, thrower] of REJECTION_SHAPES) {
+  test(`GET /groups returns only group_discovery_failed for ${label}`, async () => {
+    const config = tmpConfig();
+    const state = { paired: true, getGroups: async () => thrower() };
+    const server = createHealthServer(config, state);
+    await new Promise((resolve) => server.once("listening", resolve));
+    const port = server.address().port;
+
+    const res = await request(port, "GET", "/groups");
+    assert.equal(res.status, 500);
+    assert.deepEqual(Object.keys(res.json).sort(), ["error", "message"]);
+    assert.equal(res.json.error, "group_discovery_failed");
+    server.close();
+  });
+}
+
 test("unknown route returns 404", async () => {
   const config = tmpConfig();
   const state = { paired: false };

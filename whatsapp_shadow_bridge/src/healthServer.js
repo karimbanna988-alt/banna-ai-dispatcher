@@ -9,6 +9,7 @@
 
 const http = require("node:http");
 const { loadAllowlist, addGroup, removeGroup } = require("./allowlist");
+const { formatDiagnosticError } = require("./diagnostics");
 
 function createHealthServer(config, state) {
   const server = http.createServer((req, res) => {
@@ -36,9 +37,16 @@ function createHealthServer(config, state) {
           // Never echo the raw internal error back over HTTP -- it comes
           // from whatsapp-web.js/Puppeteer internals and could be an
           // unhelpful fragment or, in principle, something derived from
-          // chat state. Log locally (this terminal only) for the
-          // operator, return a sanitized code to the caller.
-          console.error("WhatsApp Shadow Bridge: group discovery failed:", err && err.message);
+          // chat state. The full diagnostic (safe to inspect, never safe
+          // to transmit) goes to this local terminal only; the HTTP
+          // caller always gets the same fixed, sanitized code.
+          let diagnostic;
+          try {
+            diagnostic = formatDiagnosticError(err);
+          } catch (diagErr) {
+            diagnostic = { formatterFailed: true };
+          }
+          console.error("WhatsApp Shadow Bridge: group discovery failed -- local diagnostic:", JSON.stringify(diagnostic, null, 2));
           send(500, { error: "group_discovery_failed", message: "Could not list groups right now. Check the bridge terminal for details." });
         });
     }
