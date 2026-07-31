@@ -200,6 +200,10 @@ def run_bridge_adapter(port: Optional[int] = None) -> ThreadingHTTPServer:
     """Starts the loopback-only adapter server. Caller is responsible
     for running serve_forever() on a background thread -- see
     operator_api.py's startup, which does exactly that."""
-    bind_port = port or int(os.environ.get(ADAPTER_PORT_ENV_VAR, DEFAULT_ADAPTER_PORT))
+    # `port or default` would silently treat port=0 (the ephemeral/OS-
+    # assigned port tests rely on) the same as "not provided", binding
+    # the real production port instead -- 0 is falsy but a meaningful,
+    # distinct value here, so it must be checked with `is not None`.
+    bind_port = port if port is not None else int(os.environ.get(ADAPTER_PORT_ENV_VAR, DEFAULT_ADAPTER_PORT))
     server = ThreadingHTTPServer(("127.0.0.1", bind_port), BridgeAdapterHandler)
     return server
