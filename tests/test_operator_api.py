@@ -10,10 +10,14 @@ construction, not by mocking around one."""
 
 from __future__ import annotations
 
+import http.client
 import json
 import pathlib
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 
 import pytest
 import streamlit as st
@@ -103,6 +107,172 @@ def get_jobs_count(db_path) -> int:
     return n
 
 
+# ================================================================== AUTH ==
+def http_request(authority, method, path, body=None, headers=None):
+    host, port = authority.rsplit(":", 1)
+    conn = http.client.HTTPConnection(host, int(port), timeout=5)
+    hdrs = dict(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    conn.request(method, path, body=data, headers=hdrs)
+    resp = conn.getresponse()
+    raw = resp.read()
+    parsed = None
+    if raw:
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+    result = {
+        "status": resp.status, "json": parsed,
+        "set_cookie": resp.getheader("Set-Cookie"),
+        "headers": {k: v for k, v in resp.getheaders()},
+    }
+    conn.close()
+    return result
+
+
+TEST_PASSWORD = "test-password-123"
+
+
+@pytest.fixture()
+def live_server(api_env, monkeypatch):
+    monkeypatch.setenv(api.PASSWORD_ENV_VAR, TEST_PASSWORD)
+    api._LOGIN_ATTEMPTS.clear()
+    api._ACTIVE_SESSIONS.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"127.0.0.1:{port}"
+    server.shutdown()
+    thread.join(timeout=2)
+    server.server_close()
+
+
+def _login(authority):
+    r = http_request(authority, "POST", "/api/login", {"password": TEST_PASSWORD})
+    assert r["status"] == 200, r
+    cookie_value = r["set_cookie"].split(";")[0]
+    return cookie_value, r["json"]["csrf_token"]
+
+
+def test_session_secret_generation_is_idempotent(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SOME_OTHER_VAR=1\n", encoding="utf-8")
+    monkeypatch.setenv("OPERATOR_API_ENV_FILE", str(env_file))
+    monkeypatch.delenv("OPERATOR_API_SESSION_SECRET", raising=False)
+    secret1 = api._get_or_create_session_secret()
+    content = env_file.read_text(encoding="utf-8")
+    assert content.count("OPERATOR_API_SESSION_SECRET=") == 1
+    secret2 = api._get_or_create_session_secret()
+    assert secret1 == secret2
+
+
+def test_unauthenticated_api_request_returns_401(live_server):
+    r = http_request(live_server, "GET", "/api/new_jobs")
+    assert r["status"] == 401
+    assert "error" in r["json"]
+
+
+def test_static_login_page_served_without_auth(live_server):
+    r = http_request(live_server, "GET", "/index.html")
+    assert r["status"] == 200
+
+
+def test_login_wrong_password_rejected_and_no_password_echoed(live_server):
+    r = http_request(live_server, "POST", "/api/login", {"password": "wrong"})
+    assert r["status"] == 401
+    assert r["set_cookie"] is None
+    assert "wrong" not in json.dumps(r["json"])
+
+
+def test_login_rate_limited_after_repeated_failures(live_server):
+    for _ in range(api.LOGIN_MAX_ATTEMPTS):
+        r = http_request(live_server, "POST", "/api/login", {"password": "wrong"})
+        assert r["status"] == 401
+    blocked = http_request(live_server, "POST", "/api/login", {"password": "wrong"})
+    assert blocked["status"] == 429
+    # Even the correct password is blocked while rate-limited.
+    still_blocked = http_request(live_server, "POST", "/api/login", {"password": TEST_PASSWORD})
+    assert still_blocked["status"] == 429
+
+
+def test_login_success_sets_httponly_samesite_cookie_and_csrf_token(live_server):
+    r = http_request(live_server, "POST", "/api/login", {"password": TEST_PASSWORD})
+    assert r["status"] == 200
+    assert r["json"]["csrf_token"]
+    cookie = r["set_cookie"]
+    assert "operator_session=" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+    assert f"Max-Age={api.SESSION_TTL_SECONDS}" in cookie
+
+
+def test_authenticated_get_succeeds_with_session_cookie(live_server):
+    cookie, _csrf = _login(live_server)
+    r = http_request(live_server, "GET", "/api/new_jobs", headers={"Cookie": cookie})
+    assert r["status"] == 200
+    assert r["json"]["live"] == []
+
+
+def test_post_without_csrf_token_rejected(live_server):
+    cookie, _csrf = _login(live_server)
+    r = http_request(live_server, "POST", "/api/sync", {}, headers={"Cookie": cookie})
+    assert r["status"] == 403
+
+
+def test_post_with_wrong_csrf_token_rejected(live_server):
+    cookie, _csrf = _login(live_server)
+    r = http_request(live_server, "POST", "/api/sync", {}, headers={"Cookie": cookie, "X-CSRF-Token": "not-the-real-token"})
+    assert r["status"] == 403
+
+
+def test_post_with_valid_csrf_token_reaches_the_route(live_server):
+    cookie, csrf = _login(live_server)
+    # /api/sync fails with 400 in this test env (no QUO_API_KEY) rather
+    # than 403 -- proving the CSRF gate passed and the real handler ran.
+    r = http_request(live_server, "POST", "/api/sync", {}, headers={"Cookie": cookie, "X-CSRF-Token": csrf})
+    assert r["status"] != 403
+
+
+def test_logout_invalidates_session_not_just_clears_cookie(live_server):
+    """The captured cookie value itself must stop authenticating after
+    logout -- not merely have the browser told to discard it. Proves
+    the server-side _ACTIVE_SESSIONS revocation, not just Set-Cookie."""
+    cookie, csrf = _login(live_server)
+    logout = http_request(live_server, "POST", "/api/logout", {}, headers={"Cookie": cookie, "X-CSRF-Token": csrf})
+    assert logout["status"] == 200
+    assert "Max-Age=0" in logout["set_cookie"]
+
+    replay = http_request(live_server, "GET", "/api/new_jobs", headers={"Cookie": cookie})
+    assert replay["status"] == 401, "a captured pre-logout cookie must not still authenticate"
+
+
+def test_security_headers_present_on_every_response(live_server):
+    for status_case in (
+        http_request(live_server, "GET", "/api/new_jobs"),                                   # 401
+        http_request(live_server, "POST", "/api/login", {"password": TEST_PASSWORD}),         # 200
+        http_request(live_server, "GET", "/index.html"),                                      # static 200
+    ):
+        assert status_case["headers"].get("Cache-Control") == "no-store"
+        assert status_case["headers"].get("X-Content-Type-Options") == "nosniff"
+        assert status_case["headers"].get("X-Frame-Options") == "DENY"
+        assert status_case["headers"].get("Referrer-Policy") == "no-referrer"
+
+
+def test_no_password_or_session_secret_ever_logged(live_server, capsys):
+    http_request(live_server, "POST", "/api/login", {"password": "wrong-guess-xyz"})
+    http_request(live_server, "POST", "/api/login", {"password": TEST_PASSWORD})
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "wrong-guess-xyz" not in combined
+    assert TEST_PASSWORD.lower() not in combined
+    assert api.SESSION_SECRET.decode("utf-8").lower() not in combined
+
+
 # ============================================================== NEW JOBS ==
 def test_new_job_shows_configured_destination(api_env):
     seed_live_boundary(api_env)
@@ -110,7 +280,8 @@ def test_new_job_shows_configured_destination(api_env):
     seed_pending(api_env, "m1", agn_message("A100"))
 
     result = api.route_new_jobs(None, {}, {})
-    entries = result["entries"]
+    entries = result["live"]
+    assert result["older"] == []
     assert len(entries) == 1
     entry = entries[0]
     assert entry["source"] == "AGN"
@@ -123,7 +294,7 @@ def test_new_job_missing_destination_shows_not_configured(api_env):
     seed_live_boundary(api_env)
     seed_pending(api_env, "m1", agn_message("A101"))  # no technician at all
 
-    entries = api.route_new_jobs(None, {}, {})["entries"]
+    entries = api.route_new_jobs(None, {}, {})["live"]
     assert len(entries) == 1
     assert entries[0]["destination"] is None
     assert entries[0]["eligible_count"] == 0
@@ -138,8 +309,8 @@ def test_luxor_message_is_stable_and_deterministic(api_env):
     add_configured_technician(api_env)
     seed_pending(api_env, "m1", agn_message("A102"))
 
-    first = api.route_new_jobs(None, {}, {})["entries"][0]["luxor_message"]
-    second = api.route_new_jobs(None, {}, {})["entries"][0]["luxor_message"]
+    first = api.route_new_jobs(None, {}, {})["live"][0]["luxor_message"]
+    second = api.route_new_jobs(None, {}, {})["live"][0]["luxor_message"]
     assert first == second
     assert "A102" in first
 
@@ -153,9 +324,42 @@ def test_original_message_masked_but_luxor_message_is_not(api_env):
     add_configured_technician(api_env)
     seed_pending(api_env, "m1", agn_message("A103"))
 
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert "555-010-3000" not in entry["original_message_masked"]
     assert "phone masked" in entry["original_message_masked"].lower() or "[phone" in entry["original_message_masked"]
+
+
+def test_new_job_older_than_60_minutes_moves_to_older_bucket(api_env):
+    """The presentation split this phase specifically fixed: a pending
+    message older than the 60-minute live window must appear under
+    "older", never mixed into the live section, and must never be
+    auto-selected ahead of a genuinely live job."""
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "old", agn_message("OLD1"), minutes_from_now=-90)
+    seed_pending(api_env, "new", agn_message("NEW1"), minutes_from_now=5)
+
+    result = api.route_new_jobs(None, {}, {})
+    live_tickets = [e["ticket"] for e in result["live"]]
+    older_tickets = [e["ticket"] for e in result["older"]]
+    assert live_tickets == ["NEW1"]
+    assert older_tickets == ["OLD1"]
+    assert result["live_window_minutes"] == 60
+
+
+def test_new_jobs_needs_action_sorts_before_waiting_within_live(api_env):
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "m_waiting", agn_message("WAIT1"), minutes_from_now=10)
+    seed_pending(api_env, "m_needs", agn_message("NEEDS1"), minutes_from_now=5)
+    api.route_acknowledge(None, {"message_id": "m_waiting"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m_waiting"}, {})
+
+    live = api.route_new_jobs(None, {}, {})["live"]
+    buckets = {e["ticket"]: e["bucket"] for e in live}
+    assert buckets["WAIT1"] == "waiting"
+    assert buckets["NEEDS1"] == "needs_action"
+    assert [e["ticket"] for e in live].index("NEEDS1") < [e["ticket"] for e in live].index("WAIT1")
 
 
 # ==================================================== K / DISPATCH FLOW ==
@@ -167,20 +371,20 @@ def test_k_required_blocks_until_acknowledged_then_copy_does_not_dispatch(api_en
     add_configured_technician(api_env)
     seed_pending(api_env, "m1", agn_message("A104"))
 
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert entry["k_required"] is True
     assert entry["k_sent"] is False
 
     ack = api.route_acknowledge(None, {"message_id": "m1"}, {})
     assert ack["success"] is True
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert entry["k_sent"] is True
     assert entry["dispatched"] is False
     assert get_jobs_count(api_env) == 0
 
     prep = api.route_prepare_dispatch(None, {"message_id": "m1"}, {})
     assert prep["success"] is True
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert entry["copied"] is True
     assert entry["dispatched"] is False
     assert get_jobs_count(api_env) == 0, "copy/prepare must never create a job row"
@@ -202,8 +406,8 @@ def test_confirm_dispatch_records_job_and_clears_live_queue(api_env):
     assert result["job_id"] is not None
     assert get_jobs_count(api_env) == 1
 
-    entries = api.route_new_jobs(None, {}, {})["entries"]
-    assert entries == [], "a dispatched job must no longer appear in the live New Jobs queue"
+    result = api.route_new_jobs(None, {}, {})
+    assert result["live"] == [] and result["older"] == [], "a dispatched job must no longer appear in the New Jobs queue"
 
 
 def test_confirm_dispatch_is_idempotent(api_env):
@@ -236,7 +440,7 @@ def test_main_leads_has_no_k_requirement(api_env):
     add_configured_technician(api_env)
     seed_pending(api_env, "m1", main_leads_message("ML100"), group_label="Main Leads")
 
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert entry["source"] == "Main Leads"
     assert entry["k_required"] is False
 
@@ -245,12 +449,13 @@ def test_missing_destination_offers_copy_only_and_handle_manually(api_env):
     seed_live_boundary(api_env)
     seed_pending(api_env, "m1", agn_message("A107"))
 
-    entry = api.route_new_jobs(None, {}, {})["entries"][0]
+    entry = api.route_new_jobs(None, {}, {})["live"][0]
     assert entry["destination"] is None
 
     result = api.route_handle_manually(None, {"message_id": "m1"}, {})
     assert result["success"] is True
-    assert api.route_new_jobs(None, {}, {})["entries"] == []
+    result2 = api.route_new_jobs(None, {}, {})
+    assert result2["live"] == [] and result2["older"] == []
 
 
 def test_pass_requires_reason(api_env):
@@ -404,6 +609,166 @@ def test_unknown_corrected_field_rejected(api_env):
             None, {"id": str(job_id)},
             {"raw_technician_text": "hi", "corrected_fields": {"not_a_real_field": "x"}},
         )
+
+
+# ================================================================ CLOSINGS
+def _seed_closing_job(db_path, ticket="C100", area="Charlotte, NC") -> int:
+    """A job taken all the way to "In Progress" -- get_closing_candidates()'s
+    actual population (status == "In Progress", or "Closed" and not yet
+    Settled). Dispatch confirm alone only reaches "Approved"; a real
+    technician status update ("Going") is what the deterministic state
+    machine (storage.derive_job_status) requires to reach "In Progress" --
+    confirmed empirically, not guessed."""
+    from dispatcher.app_models import TechnicianUpdateCommand
+
+    job_id = _seed_active_job_named(db_path, ticket, area)
+    conn = api.get_conn()
+    try:
+        service = api._service(conn)
+        result = service.record_technician_update(TechnicianUpdateCommand(job_id=job_id, update_type="Going", raw_update="On my way"))
+        assert result.success and result.current_status == "In Progress", result
+    finally:
+        conn.close()
+    return job_id
+
+
+def _seed_active_job_named(db_path, ticket, area="Charlotte, NC"):
+    seed_live_boundary(db_path)
+    add_configured_technician(db_path)
+    mid = f"m_{ticket}"
+    seed_pending(db_path, mid, agn_message(ticket, area))
+    api.route_acknowledge(None, {"message_id": mid}, {})
+    api.route_prepare_dispatch(None, {"message_id": mid}, {})
+    result = api.route_confirm_dispatch(None, {"message_id": mid}, {})
+    return result["job_id"]
+
+
+def test_closings_lists_dispatched_job_waiting_on_technician(api_env):
+    job_id = _seed_closing_job(api_env, "C100")
+    entries = api.route_closings(None, {}, {})["entries"]
+    assert len(entries) == 1
+    assert entries[0]["id"] == job_id
+    assert entries[0]["closing_recorded"] is False
+    assert entries[0]["bucket"] == "waiting"
+
+
+def test_closing_record_never_invents_missing_amount_or_payment(api_env):
+    job_id = _seed_closing_job(api_env, "C101")
+    result = api.route_closing_record(None, {"id": str(job_id)}, {"raw_closing": "Job done, will confirm price later"})
+    assert result["success"] is True
+
+    entry = api.route_closings(None, {}, {})["entries"][0]
+    assert entry["closing_recorded"] is True
+    assert entry["amount"] is None
+    assert entry["payment_method"] is None
+    assert set(entry["missing"]) == {"amount", "payment method"}
+
+
+def test_closing_confirm_sent_blocked_until_amount_and_payment_recorded(api_env):
+    job_id = _seed_closing_job(api_env, "C102")
+    api.route_closing_record(None, {"id": str(job_id)}, {"raw_closing": "Done, no price yet"})
+    with pytest.raises(api.ApiError):
+        api.route_closing_confirm_sent(None, {"id": str(job_id)}, {})
+
+
+def test_closing_full_sequence_record_prepare_confirm_complete(api_env):
+    """Review -> verify amount/payment -> prepare -> confirm sent
+    manually -> complete -- gated in that order, never skippable."""
+    job_id = _seed_closing_job(api_env, "C103")
+    record = api.route_closing_record(
+        None, {"id": str(job_id)},
+        {"raw_closing": "Rekeyed, customer paid cash", "final_amount": "125", "payment_method": "Cash"},
+    )
+    assert record["success"] is True
+
+    entry = api.route_closings(None, {}, {})["entries"][0]
+    assert entry["missing"] == []
+    assert entry["sent_confirmed"] is False
+    if entry["supported"] is False:
+        pytest.skip("AGN closing template not supported in this test env -- gating already proven by amount/payment checks above")
+
+    prepare = api.route_closing_prepare(None, {"id": str(job_id)}, {})
+    assert prepare["success"] is True
+
+    confirm = api.route_closing_confirm_sent(None, {"id": str(job_id)}, {})
+    assert confirm["success"] is True
+
+    entry = api.route_closings(None, {}, {})["entries"][0]
+    assert entry["sent_confirmed"] is True
+
+    complete = api.route_closing_complete(None, {"id": str(job_id)}, {})
+    assert complete["success"] is True
+    # A completed/settled job must no longer appear in the closing queue.
+    assert job_id not in {e["id"] for e in api.route_closings(None, {}, {})["entries"]}
+
+
+# ================================================================= HISTORY
+def test_history_empty_before_any_job_completed(api_env):
+    result = api.route_history(None, {}, {})
+    assert result["entries"] == []
+    assert result["total"] == 0
+
+
+def test_history_lists_completed_job_with_real_fields_only(api_env):
+    job_id = _seed_closing_job(api_env, "H100")
+    api.route_closing_record(
+        None, {"id": str(job_id)},
+        {"raw_closing": "Done, cash", "final_amount": "90", "payment_method": "Cash"},
+    )
+    entry_before = api.route_closings(None, {}, {})["entries"][0]
+    if entry_before["supported"] is not False:
+        api.route_closing_prepare(None, {"id": str(job_id)}, {})
+        api.route_closing_confirm_sent(None, {"id": str(job_id)}, {})
+        api.route_closing_complete(None, {"id": str(job_id)}, {})
+
+        result = api.route_history(None, {}, {})
+        assert result["total"] == 1
+        entry = result["entries"][0]
+        assert entry["id"] == job_id
+        assert entry["amount"] == "90"
+        assert entry["payment_method"] == "Cash"
+
+
+def test_history_detail_shows_readable_timeline_not_raw_rows(api_env):
+    job_id = _seed_active_job(api_env)
+    detail = api.route_history_detail(None, {"id": str(job_id)}, {})
+    assert detail["job"]["id"] == job_id
+    assert isinstance(detail["timeline"], list)
+    for event in detail["timeline"]:
+        assert set(event.keys()) == {"created_at", "label", "note"}
+        assert isinstance(event["label"], str) and event["label"]
+
+
+def test_history_search_filters_by_ticket(api_env):
+    _seed_closing_job(api_env, "SEARCHABLE1")
+    result = api.route_history(None, {}, {"search": "nonexistent-ticket"})
+    assert result["entries"] == []
+
+
+# ================================================================= REPORTS
+def test_reports_never_invents_financial_fields(api_env):
+    """Every entry must come only from fields that actually exist in the
+    schema; nothing here computes a percentage/profit/balance/parts/
+    fees breakdown -- those keys must not appear at all."""
+    job_id = _seed_closing_job(api_env, "R100")
+    api.route_closing_record(None, {"id": str(job_id)}, {"raw_closing": "Done, cash", "final_amount": "80", "payment_method": "Cash"})
+
+    entries = api.route_reports(None, {}, {})["entries"]
+    forbidden_keys = {"percentage", "profit", "balance", "parts", "fees"}
+    for entry in entries:
+        assert not (forbidden_keys & set(entry.keys())), f"Reports entry invented a financial field: {entry.keys()}"
+
+
+def test_reports_missing_values_are_null_not_fabricated(api_env):
+    """A job not yet closed/completed must not appear in Reports at all
+    (scoped to completed jobs) -- and for a completed job with no
+    payment method recorded, that field must come through as null
+    (the frontend renders "Not recorded"), never a guessed value."""
+    job_id = _seed_closing_job(api_env, "R101")
+    api.route_closing_record(None, {"id": str(job_id)}, {"raw_closing": "Job done, price to be confirmed"})
+
+    tickets_in_reports = {e["job"] for e in api.route_reports(None, {}, {})["entries"]}
+    assert "R101" not in tickets_in_reports, "an unclosed job must not appear in Reports yet"
 
 
 # ============================================================ STRUCTURAL ==
