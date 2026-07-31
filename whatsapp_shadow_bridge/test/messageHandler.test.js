@@ -16,6 +16,17 @@ function fakeDeps(overrides = {}) {
   };
 }
 
+test("an outgoing message (fromMe) is rejected and never forwarded, even if it targets an allowlisted group", async () => {
+  const deps = fakeDeps();
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", text: "sent by the paired account", fromMe: true },
+    deps,
+  );
+  assert.equal(result.forwarded, false);
+  assert.equal(result.reason, "outgoing_message");
+  assert.equal(deps._posted.length, 0);
+});
+
 test("a direct (non-group) message is ignored and never forwarded", async () => {
   const deps = fakeDeps();
   const result = await handleIncomingMessage(

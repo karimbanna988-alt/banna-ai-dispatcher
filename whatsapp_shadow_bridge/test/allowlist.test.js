@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { loadAllowlist, isApproved, addGroup, removeGroup } = require("../src/allowlist");
+const { loadAllowlist, isApproved, addGroup, removeGroup, isValidGroupId } = require("../src/allowlist");
 
 function tmpFile() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wsb-test-")), "allowlist.json");
@@ -39,4 +39,24 @@ test("removeGroup (kill switch) revokes approval immediately", () => {
   assert.equal(isApproved(file, "111@g.us"), true);
   removeGroup(file, "111@g.us");
   assert.equal(isApproved(file, "111@g.us"), false);
+});
+
+test("isValidGroupId accepts real WhatsApp group JID shapes", () => {
+  assert.equal(isValidGroupId("111@g.us"), true);
+  assert.equal(isValidGroupId("1700000000-1700000001@g.us"), true);
+});
+
+test("isValidGroupId rejects non-JID strings", () => {
+  assert.equal(isValidGroupId("not-a-group"), false);
+  assert.equal(isValidGroupId("15555550100@c.us"), false); // a personal/DM JID, not a group
+  assert.equal(isValidGroupId(""), false);
+  assert.equal(isValidGroupId(null), false);
+  assert.equal(isValidGroupId(undefined), false);
+});
+
+test("addGroup rejects a malformed group id instead of silently accepting it", () => {
+  const file = tmpFile();
+  assert.throws(() => addGroup(file, { id: "totally not a jid", name: "Fake" }));
+  const data = loadAllowlist(file);
+  assert.equal(data.groups.length, 0);
 });

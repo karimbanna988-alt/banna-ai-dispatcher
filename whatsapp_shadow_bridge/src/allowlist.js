@@ -38,8 +38,19 @@ function isApproved(allowlistFile, groupId) {
   return data.groups.some((g) => g.id === groupId);
 }
 
+// Real WhatsApp group JIDs are "<digits>@g.us" or the older
+// "<digits>-<digits>@g.us" -- anything else (a typo, a pasted display
+// name, a non-group JID) is rejected here rather than silently
+// accepted into the allowlist.
+const GROUP_JID_PATTERN = /^\d+(-\d+)?@g\.us$/;
+
+function isValidGroupId(id) {
+  return typeof id === "string" && GROUP_JID_PATTERN.test(id);
+}
+
 function addGroup(allowlistFile, group) {
   if (!group || !group.id) throw new Error("group.id is required");
+  if (!isValidGroupId(group.id)) throw new Error("group.id is not a valid WhatsApp group JID");
   const data = loadAllowlist(allowlistFile);
   if (data.groups.some((g) => g.id === group.id)) return data;
   data.groups.push({ id: group.id, name: group.name || group.id, addedAt: new Date().toISOString() });
@@ -54,4 +65,4 @@ function removeGroup(allowlistFile, groupId) {
   return data;
 }
 
-module.exports = { loadAllowlist, saveAllowlist, isApproved, addGroup, removeGroup };
+module.exports = { loadAllowlist, saveAllowlist, isApproved, addGroup, removeGroup, isValidGroupId };

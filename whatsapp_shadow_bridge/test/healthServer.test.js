@@ -104,6 +104,21 @@ test("malformed JSON body on POST /allowlist is rejected, not crashed on", async
   server.close();
 });
 
+test("POST /allowlist with a malformed (non-JID) group id is rejected, not crashed on", async () => {
+  const config = tmpConfig();
+  const state = { paired: false };
+  const server = createHealthServer(config, state);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const res = await request(port, "POST", "/allowlist", { id: "not-a-real-group-id", name: "Fake" });
+  assert.equal(res.status, 400);
+
+  const list = await request(port, "GET", "/allowlist");
+  assert.equal(list.json.groups.length, 0);
+  server.close();
+});
+
 test("GET /groups before pairing returns 503, not a crash", async () => {
   const config = tmpConfig();
   const state = { paired: false, getGroups: null };

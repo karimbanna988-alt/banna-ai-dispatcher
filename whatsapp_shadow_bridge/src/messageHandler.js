@@ -11,13 +11,24 @@
 const { extractTicket } = require("./ticketExtractor");
 
 /**
- * @param {object} message - { id, groupId, groupName, sender, timestamp, text, isGroupMessage }
+ * @param {object} message - { id, groupId, groupName, sender, timestamp, text, isGroupMessage, fromMe }
  * @param {object} deps - { config, isApproved, markIfNew, postObservation, log }
  * @returns {Promise<{forwarded: boolean, reason: string}>}
  */
 async function handleIncomingMessage(message, deps) {
   const { config, isApproved, markIfNew, postObservation, log } = deps;
   const logger = log || (() => {});
+
+  // Defense in depth: whatsapp-web.js's "message" event (the only one
+  // client.js subscribes to) should never fire for the paired account's
+  // own outgoing messages -- that's "message_create", which this bridge
+  // never listens for. This check exists anyway, in case that library
+  // guarantee is ever wrong, so an outgoing message can never be
+  // mistaken for an incoming technician update.
+  if (message.fromMe) {
+    logger("ignored: outgoing message (sent by the paired account itself)");
+    return { forwarded: false, reason: "outgoing_message" };
+  }
 
   if (!message.isGroupMessage) {
     logger("ignored: not a group message (personal DM)");

@@ -66,6 +66,7 @@ function initializeBridge(config, options = {}) {
         timestamp: msg.timestamp,
         text: msg.body,
         isGroupMessage: !!chat.isGroup,
+        fromMe: !!msg.fromMe,
       };
       await handleIncomingMessage(message, { config, isApproved, markIfNew, postObservation, log });
     } catch (err) {

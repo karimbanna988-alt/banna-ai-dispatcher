@@ -66,3 +66,26 @@ test("no bulk-messaging helper (loop calling sendMessage) exists anywhere in src
     assert.ok(!/for\s*\([^)]*\)\s*\{[^}]*sendMessage/s.test(source), `${file} looks like a bulk-send loop`);
   }
 });
+
+// Permanent static check: nothing under src/ may fetch historical/earlier
+// messages. This bridge only ever reacts to the live "message" event as
+// it happens -- it must never reach backward into chat history.
+const FORBIDDEN_HISTORY_PATTERNS = [
+  /\.fetchMessages\s*\(/,
+  /\.loadEarlierMessages\s*\(/,
+  /\.loadPreviousMessages\s*\(/,
+  /searchMessages\s*\(/,
+];
+
+test("no file under whatsapp_shadow_bridge/src/ calls a historical-message-fetch method", () => {
+  const files = allJsFiles(SRC_DIR);
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const pattern of FORBIDDEN_HISTORY_PATTERNS) {
+      assert.ok(
+        !pattern.test(source),
+        `${path.relative(SRC_DIR, file)} must not match forbidden history-fetch pattern ${pattern}`,
+      );
+    }
+  }
+});

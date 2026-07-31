@@ -47,7 +47,7 @@ function createHealthServer(config, state) {
           const updated = addGroup(config.allowlistFile, { id: parsed.id, name: parsed.name });
           send(200, updated);
         } catch (err) {
-          send(400, { error: "Invalid JSON body" });
+          send(400, { error: err.message || "Invalid request body" });
         }
       });
       return;
