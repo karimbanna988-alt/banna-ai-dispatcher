@@ -771,7 +771,194 @@ def test_reports_missing_values_are_null_not_fabricated(api_env):
     assert "R101" not in tickets_in_reports, "an unclosed job must not appear in Reports yet"
 
 
+# ==================================================== LEARNING REVIEW =====
+def test_learning_review_empty_shows_zero_count(api_env):
+    result = api.route_learning_review(None, {}, {})
+    assert result["episodes"] == []
+    assert result["reviewed_count"] == 0
+    assert result["total_count"] == 0
+
+
+def test_learning_review_lists_real_episode_and_updates_status(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_commercial_save(
+        None, {"id": str(job_id)},
+        {"raw_technician_text": "starting 95, thinking it over", "corrected_fields": {"quote_type": "STARTING", "quote_amount": "95", "customer_response": "THINKING"}},
+    )
+
+    result = api.route_learning_review(None, {}, {})
+    assert result["total_count"] == 1
+    episode = result["episodes"][0]
+    assert episode["review_status"] == "UNREVIEWED"
+    assert episode["original_observation"] == "starting 95, thinking it over"
+    assert result["reviewed_count"] == 0
+
+    updated = api.route_learning_review_status(None, {"episode_id": episode["episode_id"]}, {"review_status": "VERIFIED"})
+    assert updated["success"] is True
+
+    result2 = api.route_learning_review(None, {}, {})
+    assert result2["reviewed_count"] == 1
+    assert result2["episodes"][0]["review_status"] == "VERIFIED"
+
+
+def test_learning_review_rejects_unknown_status(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_commercial_save(
+        None, {"id": str(job_id)},
+        {"raw_technician_text": "fixed 100, accepted", "corrected_fields": {"quote_type": "FIXED", "quote_amount": "100", "customer_response": "ACCEPTED"}},
+    )
+    episode = api.route_learning_review(None, {}, {})["episodes"][0]
+    with pytest.raises(api.ApiError):
+        api.route_learning_review_status(None, {"episode_id": episode["episode_id"]}, {"review_status": "NOT_A_REAL_STATUS"})
+
+
+# ===================================================== ACTIVE NEXT ACTION =
+def test_active_next_action_awaiting_technician_when_no_update(api_env):
+    job_id = _seed_active_job(api_env)
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["next_action"] == "Awaiting technician"
+
+
+def test_active_next_action_record_closing_when_technician_completed(api_env):
+    from dispatcher.app_models import TechnicianUpdateCommand
+
+    job_id = _seed_active_job(api_env)
+    conn = api.get_conn()
+    try:
+        service = api._service(conn)
+        service.record_technician_update(TechnicianUpdateCommand(job_id=job_id, update_type="Completed", raw_update="All done"))
+    finally:
+        conn.close()
+
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["next_action"] == "Record closing"
+
+
+def test_active_next_action_uses_only_the_fixed_label_set(api_env):
+    job_id = _seed_active_job(api_env)
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["next_action"] in api._ACTIVE_NEXT_ACTION_LABELS
+
+
+# ==================================================== WHATSAPP BRIDGE =====
+import whatsapp_bridge_adapter as bridge_adapter  # noqa: E402
+
+
+@pytest.fixture()
+def clean_bridge_state():
+    bridge_adapter._reset_state_for_tests()
+    yield
+    bridge_adapter._reset_state_for_tests()
+
+
+def _seed_observation(message_id="wamid.1", text="PDL: A200 -- job done, $95 cash"):
+    bridge_adapter.add_observation({
+        "event_type": "incoming_message", "message_id": message_id, "group_id": "111@g.us",
+        "group_name": "Kabaka Dispatch", "sender": "1555", "timestamp": "1700000000", "text": text,
+    })
+
+
+def test_whatsapp_bridge_status_says_not_paired_before_any_observation(clean_bridge_state):
+    result = api.route_whatsapp_bridge_status(None, {}, {})
+    assert result["paired"] is False
+    assert "not paired yet" in result["status"]
+
+
+def test_whatsapp_bridge_status_flips_only_after_a_real_observation(clean_bridge_state):
+    _seed_observation()
+    result = api.route_whatsapp_bridge_status(None, {}, {})
+    assert result["paired"] is True
+    assert result["observations_received"] == 1
+
+
+def test_whatsapp_pending_lists_unresolved_observations(clean_bridge_state):
+    _seed_observation("wamid.1")
+    _seed_observation("wamid.2")
+    result = api.route_whatsapp_pending(None, {}, {})
+    assert len(result["pending"]) == 2
+
+
+def test_whatsapp_attach_never_calls_dispatcher_service_itself(api_env, clean_bridge_state):
+    """Attaching only hands the raw text back to the frontend for the
+    EXISTING commercial/save flow to use -- it must never itself create
+    a shadow episode or touch the jobs table. Confirms both no DB write
+    happened AND the exact original text is returned unmodified."""
+    job_id = _seed_active_job(api_env)
+    raw_text = "PDL: A200 -- fixed 150, customer accepted"
+    _seed_observation("wamid.attach1", text=raw_text)
+
+    before_events = get_events_count(api_env)
+    result = api.route_whatsapp_attach(None, {"message_id": "wamid.attach1"}, {"job_id": str(job_id)})
+    assert result["job_id"] == job_id
+    assert result["text"] == raw_text
+    assert get_events_count(api_env) == before_events, "attach must not itself write any audit event"
+
+    conn = storage.connect(api_env)
+    assert storage.get_shadow_episode_for_job(conn, job_id) is None, "attach must not itself create a shadow episode"
+    conn.close()
+
+    # Now confirmed via the existing, unchanged commercial/save route --
+    # this is the only thing allowed to actually record anything.
+    save_result = api.route_commercial_save(
+        None, {"id": str(job_id)},
+        {"raw_technician_text": raw_text, "corrected_fields": {"quote_type": "FIXED", "quote_amount": "150", "customer_response": "ACCEPTED"}},
+    )
+    assert save_result["success"] is True
+
+
+def test_whatsapp_attach_removes_observation_from_pending_list(api_env, clean_bridge_state):
+    job_id = _seed_active_job(api_env)
+    _seed_observation("wamid.attach2")
+    assert len(api.route_whatsapp_pending(None, {}, {})["pending"]) == 1
+    api.route_whatsapp_attach(None, {"message_id": "wamid.attach2"}, {"job_id": str(job_id)})
+    assert api.route_whatsapp_pending(None, {}, {})["pending"] == []
+
+
+def test_whatsapp_ignore_removes_observation_without_any_db_write(api_env, clean_bridge_state):
+    _seed_observation("wamid.ignore1")
+    before_events = get_events_count(api_env)
+    result = api.route_whatsapp_ignore(None, {"message_id": "wamid.ignore1"}, {})
+    assert result["success"] is True
+    assert api.route_whatsapp_pending(None, {}, {})["pending"] == []
+    assert get_events_count(api_env) == before_events
+
+
+def test_whatsapp_attach_unknown_message_id_404s(clean_bridge_state):
+    with pytest.raises(api.ApiError):
+        api.route_whatsapp_attach(None, {"message_id": "no-such-id"}, {"job_id": "1"})
+
+
+def test_active_screen_works_normally_when_bridge_has_never_sent_anything(api_env, clean_bridge_state):
+    """Bridge disconnected/never-paired must never break the CRM --
+    Active still loads fine with an empty pending list."""
+    _seed_active_job(api_env)
+    active_result = api.route_active(None, {}, {})
+    assert len(active_result["entries"]) == 1
+    pending_result = api.route_whatsapp_pending(None, {}, {})
+    assert pending_result["pending"] == []
+
+
 # ============================================================ STRUCTURAL ==
+def test_connected_server_never_loads_fabricated_data_js():
+    """The production connected server must never see the isolated
+    prototype's fabricated data.js -- proves the two builds stay fully
+    separate, not just by convention."""
+    connected_dir = REPO_ROOT / "operator_ui_v2_connected"
+    assert not (connected_dir / "js" / "data.js").exists(), "operator_ui_v2_connected must never have its own data.js"
+    assert api.STATIC_DIR.resolve() == connected_dir.resolve()
+    assert "operator_ui_v2" != connected_dir.name  # the fabricated prototype's own directory, never served here
+
+    for js_file in (connected_dir / "js").glob("*.js"):
+        text = js_file.read_text(encoding="utf-8")
+        assert "data.js" not in text, f"{js_file.name} must never reference the fabricated prototype's data.js"
+    index_html = (connected_dir / "index.html").read_text(encoding="utf-8")
+    assert "data.js" not in index_html
+
+
+
 def test_operator_api_module_owns_no_sql():
     """operator_api.py must never write anything itself -- every
     persisted fact goes through an existing DispatcherService/storage.py
