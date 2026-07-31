@@ -45,6 +45,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import traceback
 from http import cookies as http_cookies
@@ -64,6 +65,7 @@ load_dotenv(REPO_ROOT / ".env")
 import luxor_desk_read_model as rm  # noqa: E402
 import luxor_desk_shared  # noqa: E402
 import luxor_ops_shared as shared  # noqa: E402
+import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, storage  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.app_models import ClosingCommand  # noqa: E402
@@ -401,6 +403,29 @@ def route_sync(handler: "Handler", match: dict, body: dict) -> dict:
         conn.close()
 
 
+_ACTIVE_NEXT_ACTION_LABELS = (
+    "Awaiting technician", "Add technician update", "Prepare company reply",
+    "Waiting for customer", "Record closing",
+)
+
+
+def _active_next_action_label(conn, job: dict) -> str:
+    """The fixed 5-label vocabulary Phase 4D requires -- derived from
+    exactly the same facts luxor_desk_shared.active_job_next_step_sentence()
+    already uses (never a second, competing next-action computation),
+    just mapped onto shorter row labels instead of a full sentence."""
+    latest = job.get("latest_technician_update")
+    if latest is None:
+        return "Awaiting technician"
+    if latest.get("update_type") == "Custom":
+        return "Add technician update"
+    if latest.get("update_type") == "Completed":
+        return "Record closing"
+    if luxor_desk_shared._reply_already_sent_since(conn, job["id"], latest.get("created_at")):
+        return "Waiting for customer"
+    return "Prepare company reply"
+
+
 def route_active(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
@@ -418,7 +443,7 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "city": j.get("service_area"),
                 "description": j.get("description"),
                 "latest_technician_update": j.get("latest_technician_update"),
-                "next_action": luxor_desk_shared.active_job_next_action_label(j),
+                "next_action": _active_next_action_label(conn, j),
                 "bucket": luxor_desk_shared.active_job_bucket(j),
                 "waiting_since": j.get("last_event_at") or j.get("updated_at"),
                 "shadow_episode": _episode_summary(episode) if episode else None,
@@ -879,6 +904,105 @@ def route_reports(handler: "Handler", match: dict, body: dict) -> dict:
         conn.close()
 
 
+# =========================================================== LEARNING REVIEW
+_REVIEW_STATUSES = ("VERIFIED", "CORRECTED", "EXCLUDE", "SENSITIVE", "INCOMPLETE")
+
+
+def _learning_episode_dto(episode: dict) -> dict:
+    commercial_update = episode.get("commercial_update") or {}
+    return {
+        "episode_id": episode["episode_id"],
+        "job_id": episode.get("job_id"),
+        "source": episode.get("source"),
+        "ticket_or_pdl": episode.get("ticket_or_pdl"),
+        "normalized_intent": episode.get("normalized_intent"),
+        "original_observation": commercial_update.get("raw_technician_text"),
+        "shadow_suggested_reply": episode.get("shadow_suggested_reply"),
+        "dispatcher_actual_reply": episode.get("dispatcher_actual_reply"),
+        "customer_response": episode.get("customer_response"),
+        "negotiation_outcome": episode.get("negotiation_outcome"),
+        "final_job_outcome": episode.get("final_job_outcome"),
+        "human_review_required": bool(episode.get("human_review_required")),
+        "review_status": episode.get("review_status") or "UNREVIEWED",
+        "created_at": episode.get("created_at"),
+        "reviewed_at": episode.get("reviewed_at"),
+    }
+
+
+def route_learning_review(handler: "Handler", match: dict, body: dict) -> dict:
+    conn = get_conn()
+    try:
+        episodes = storage.list_shadow_episodes(conn, limit=200)
+        dtos = [_learning_episode_dto(e) for e in episodes]
+        reviewed_count = sum(1 for d in dtos if d["review_status"] != "UNREVIEWED")
+        return {"episodes": dtos, "reviewed_count": reviewed_count, "total_count": len(dtos)}
+    finally:
+        conn.close()
+
+
+def route_learning_review_status(handler: "Handler", match: dict, body: dict) -> dict:
+    episode_id = match["episode_id"]
+    review_status = _require(body, "review_status")
+    if review_status not in _REVIEW_STATUSES:
+        raise ApiError(400, f"review_status must be one of {_REVIEW_STATUSES}")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.set_shadow_review(episode_id, review_status, reviewed_by=DISPATCHER_ACTOR)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not update review status.")
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+# =================================================== WHATSAPP SHADOW BRIDGE
+# Read-only from this app's perspective: the bridge (a separate Node.js
+# process) POSTs captured observations to whatsapp_bridge_adapter's own
+# loopback-only listener (a different port, never proxied through the
+# tunnel); this module only ever reads that in-memory queue and lets a
+# human decide what happens next. Attaching an observation never calls
+# DispatcherService itself -- it only hands the raw text back to the
+# frontend so the EXISTING, already-audited commercial-update flow
+# (route_commercial_save above, unchanged) is what actually records
+# anything. No route here can send a WhatsApp message; nothing in this
+# module has ever opened a real WhatsApp session (whatsapp_bridge_adapter.py
+# never imports whatsapp-web.js -- it doesn't even run in this process).
+
+def route_whatsapp_pending(handler: "Handler", match: dict, body: dict) -> dict:
+    return {"pending": whatsapp_bridge_adapter.list_pending()}
+
+
+def route_whatsapp_bridge_status(handler: "Handler", match: dict, body: dict) -> dict:
+    """Never polls the bridge over the network (this app has no
+    outbound HTTP capability -- see test_operator_api_makes_no_outbound_network_calls).
+    Status is derived only from observations the bridge has actually
+    sent us -- so this can never claim "connected" before a real,
+    supervised pairing and incoming message have actually happened."""
+    ever = whatsapp_bridge_adapter.list_pending(include_resolved=True)
+    if ever:
+        return {"paired": True, "status": "Incoming WhatsApp Shadow Bridge — receiving messages.", "observations_received": len(ever)}
+    return {"paired": False, "status": "Experimental incoming WhatsApp Shadow Bridge — not paired yet.", "observations_received": 0}
+
+
+def route_whatsapp_attach(handler: "Handler", match: dict, body: dict) -> dict:
+    message_id = match["message_id"]
+    job_id = _require(body, "job_id")
+    observation = whatsapp_bridge_adapter.get_observation(message_id)
+    if observation is None:
+        raise ApiError(404, "No such pending WhatsApp observation.")
+    whatsapp_bridge_adapter.resolve_observation(message_id, "attached")
+    return {"message_id": message_id, "job_id": int(job_id), "text": observation["text"]}
+
+
+def route_whatsapp_ignore(handler: "Handler", match: dict, body: dict) -> dict:
+    message_id = match["message_id"]
+    observation = whatsapp_bridge_adapter.resolve_observation(message_id, "ignored")
+    if observation is None:
+        raise ApiError(404, "No such pending WhatsApp observation.")
+    return {"success": True}
+
+
 ROUTES = [
     ("POST", r"^/api/login$", route_login, {"public": True, "skip_csrf": True}),
     ("POST", r"^/api/logout$", route_logout, {}),
@@ -905,6 +1029,12 @@ ROUTES = [
     ("GET", r"^/api/history$", route_history, {}),
     ("GET", r"^/api/history/(?P<id>\d+)$", route_history_detail, {}),
     ("GET", r"^/api/reports$", route_reports, {}),
+    ("GET", r"^/api/learning_review$", route_learning_review, {}),
+    ("POST", r"^/api/learning_review/(?P<episode_id>[^/]+)/status$", route_learning_review_status, {}),
+    ("GET", r"^/api/whatsapp_pending$", route_whatsapp_pending, {}),
+    ("GET", r"^/api/whatsapp_bridge_status$", route_whatsapp_bridge_status, {}),
+    ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/attach$", route_whatsapp_attach, {}),
+    ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/ignore$", route_whatsapp_ignore, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
 
@@ -1067,15 +1197,30 @@ def _guess_content_type(path: Path) -> str:
     }.get(path.suffix, "application/octet-stream")
 
 
-def run(port: int = 8512) -> None:
+def run(port: int = 8512, start_bridge_adapter: bool = True) -> None:
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Operator API (connected) serving on http://localhost:{port}  (static: {STATIC_DIR})")
+
+    bridge_server = None
+    if start_bridge_adapter:
+        whatsapp_bridge_adapter._get_or_create_adapter_secret(_env_file_path())
+        bridge_server = whatsapp_bridge_adapter.run_bridge_adapter()
+        bridge_thread = threading.Thread(target=bridge_server.serve_forever, daemon=True)
+        bridge_thread.start()
+        print(
+            f"WhatsApp Shadow Bridge adapter listening on http://127.0.0.1:{bridge_server.server_address[1]} "
+            "(loopback only -- never reachable through the public tunnel)."
+        )
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        if bridge_server is not None:
+            bridge_server.shutdown()
+            bridge_server.server_close()
 
 
 if __name__ == "__main__":
@@ -1083,5 +1228,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8512)
+    parser.add_argument("--no-bridge-adapter", action="store_true", help="Skip starting the WhatsApp bridge adapter listener.")
     args = parser.parse_args()
-    run(args.port)
+    run(args.port, start_bridge_adapter=not args.no_bridge_adapter)
