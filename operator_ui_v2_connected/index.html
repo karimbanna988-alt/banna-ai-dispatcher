@@ -9,6 +9,20 @@
 </head>
 <body>
 
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <div class="login-brand">LUXOR</div>
+    <div class="login-sub">Operator UI V2 -- dispatcher login</div>
+    <div class="form-field">
+      <label>Password</label>
+      <input type="password" id="loginPassword" autocomplete="current-password">
+    </div>
+    <button class="btn btn-primary btn-block" id="loginSubmitBtn">Log in</button>
+    <div class="detail-warning" id="loginError" style="display:none; margin-top:10px;"></div>
+  </div>
+</div>
+
+<div id="appShell" style="display:none;">
 <header class="app-header">
   <div class="brand">
     LUXOR
@@ -16,6 +30,7 @@
   </div>
   <div class="header-actions">
     <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>
+    <button class="icon-btn" id="logoutBtn" title="Log out">&#9211;</button>
   </div>
 </header>
 
@@ -23,6 +38,9 @@
   <nav class="desktop-sidebar" id="desktopSidebar">
     <div class="nav-item" data-screen="jobs">Jobs</div>
     <div class="nav-item" data-screen="active">Active</div>
+    <div class="nav-item" data-screen="closings">Closings</div>
+    <div class="nav-item" data-screen="history">History</div>
+    <div class="nav-item" data-screen="reports">Reports</div>
     <div class="nav-item" data-screen="technicians">Technicians</div>
   </nav>
 
@@ -30,10 +48,14 @@
 
     <!-- ============================================================ JOBS -->
     <section class="screen" id="screen-jobs">
-      <div class="section-title">Jobs <span class="count" id="jobsCount"></span></div>
-      <div class="scope-note">Real pending messages. Closings and Reports are not connected in this build -- see operator_ui_v2/ for that visual demo.</div>
+      <div class="section-title">
+        Jobs <span class="count" id="jobsCount"></span>
+        <button class="btn btn-secondary" id="syncBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Sync</button>
+      </div>
+      <div id="jobsSyncMsg" class="info-banner" style="display:none;"></div>
       <div class="split">
         <div class="list-pane">
+          <div class="subsection-label">Live jobs (last 60 minutes)</div>
           <table class="data-table" id="jobsTable">
             <thead>
               <tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr>
@@ -41,6 +63,15 @@
             <tbody id="jobsTableBody"></tbody>
           </table>
           <div class="mobile-row-list" id="jobsMobileList"></div>
+          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new live jobs need attention.</div>
+          <details class="disclosure" id="olderJobsDetails" style="margin-top:14px; display:none;">
+            <summary id="olderJobsSummary">Older unresolved jobs</summary>
+            <table class="data-table" id="olderJobsTable">
+              <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
+              <tbody id="olderJobsTableBody"></tbody>
+            </table>
+            <div class="mobile-row-list" id="olderJobsMobileList"></div>
+          </details>
         </div>
         <div class="detail-pane" id="jobsDetailPane"></div>
       </div>
@@ -53,7 +84,7 @@
         <div class="list-pane">
           <table class="data-table" id="activeTable">
             <thead>
-              <tr><th>Job</th><th>Technician</th><th>Status</th><th>Latest update</th></tr>
+              <tr><th>Job</th><th>Company</th><th>Technician</th><th>City</th><th>Waiting since</th><th>Next action</th></tr>
             </thead>
             <tbody id="activeTableBody"></tbody>
           </table>
@@ -63,9 +94,66 @@
       </div>
     </section>
 
+    <!-- ======================================================== CLOSINGS -->
+    <section class="screen" id="screen-closings">
+      <div class="section-title">Closings <span class="count" id="closingsCount"></span></div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="closingsTable">
+            <thead>
+              <tr><th>Job</th><th>Company</th><th>Technician</th><th>Amount</th><th>Payment</th><th>Status</th></tr>
+            </thead>
+            <tbody id="closingsTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="closingsMobileList"></div>
+        </div>
+        <div class="detail-pane" id="closingsDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ========================================================= HISTORY -->
+    <section class="screen" id="screen-history">
+      <div class="section-title">History <span class="count" id="historyCount"></span></div>
+      <div class="toolbar">
+        <input type="text" id="historySearch" placeholder="Search ticket / PDL">
+        <select id="historySourceFilter"><option value="All">All sources</option></select>
+        <select id="historyTechFilter"><option value="All">All technicians</option></select>
+        <select id="historyStatusFilter"><option value="All">All statuses</option></select>
+        <input type="date" id="historyDateFrom">
+        <input type="date" id="historyDateTo">
+        <button class="btn btn-secondary" id="historyFilterBtn">Filter</button>
+      </div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="historyTable">
+            <thead><tr><th>Job</th><th>Company</th><th>Technician</th><th>Status</th><th>Completed</th></tr></thead>
+            <tbody id="historyTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="historyMobileList"></div>
+        </div>
+        <div class="detail-pane" id="historyDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ========================================================= REPORTS -->
+    <section class="screen" id="screen-reports">
+      <div class="section-title">Reports</div>
+      <div class="scope-note">Read-only. Only fields recorded in the database are shown -- nothing here is calculated or estimated.</div>
+      <div class="report-table-wrap">
+        <table class="report-table" id="reportTable">
+          <thead>
+            <tr><th>Job</th><th>Company</th><th>Date</th><th>Technician</th><th>Area</th><th>Quoted</th><th>Final</th><th>Payment</th></tr>
+          </thead>
+          <tbody id="reportTableBody"></tbody>
+        </table>
+      </div>
+      <div class="report-mobile-list" id="reportMobileList"></div>
+    </section>
+
     <!-- ===================================================== TECHNICIANS -->
     <section class="screen" id="screen-technicians">
       <div class="section-title">Technicians <span class="count" id="techCount"></span></div>
+      <div id="techMissingBanner" class="review-banner" style="display:none;"></div>
       <table class="data-table" id="techTable">
         <thead><tr><th>Technician</th><th>Area</th><th>Active</th><th>Dispatch group</th><th>Closing group</th><th></th></tr></thead>
         <tbody id="techTableBody"></tbody>
@@ -79,6 +167,9 @@
 <nav class="mobile-bottom-nav" id="mobileBottomNav">
   <div class="nav-item" data-screen="jobs"><span class="nav-icon">&#128203;</span>Jobs</div>
   <div class="nav-item" data-screen="active"><span class="nav-icon">&#9889;</span>Active</div>
+  <div class="nav-item" data-screen="closings"><span class="nav-icon">&#9989;</span>Close</div>
+  <div class="nav-item" data-screen="history"><span class="nav-icon">&#128220;</span>History</div>
+  <div class="nav-item" data-screen="reports"><span class="nav-icon">&#128202;</span>Reports</div>
   <div class="nav-item" data-screen="technicians"><span class="nav-icon">&#128101;</span>Techs</div>
 </nav>
 
@@ -90,6 +181,7 @@
 
 <div class="confirm-modal-backdrop" id="confirmModalBackdrop">
   <div class="confirm-modal" id="confirmModal"></div>
+</div>
 </div>
 
 <script src="js/api.js"></script>

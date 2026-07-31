@@ -1,10 +1,20 @@
 /* Thin fetch wrapper around operator_api.py's JSON routes. Same-origin
    only -- this file never talks to any other host, never touches
-   WhatsApp, never stores a credential. */
+   WhatsApp, never stores a credential. The session itself lives in an
+   HttpOnly cookie the browser manages automatically (this file never
+   reads or writes it); the CSRF token is kept in an ordinary JS
+   variable (not localStorage/sessionStorage) and is lost -- by design
+   -- on page reload or logout, at which point the login screen asks
+   for the password again. */
 
 const Api = {
+  _csrfToken: null,
+
   async _call(method, path, body) {
-    const opts = { method, headers: {} };
+    const opts = { method, headers: {}, credentials: "same-origin" };
+    if (method === "POST" && this._csrfToken) {
+      opts.headers["X-CSRF-Token"] = this._csrfToken;
+    }
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -12,13 +22,30 @@ const Api = {
     const res = await fetch(path, opts);
     let data = null;
     try { data = await res.json(); } catch (e) { /* no body */ }
+    if (res.status === 401) {
+      const err = new Error((data && data.error) || "Not authenticated.");
+      err.authRequired = true;
+      throw err;
+    }
     if (!res.ok) {
       const message = (data && data.error) || `Request failed (${res.status})`;
       throw new Error(message);
     }
     return data;
   },
+
+  async login(password) {
+    const result = await this._call("POST", "/api/login", { password });
+    this._csrfToken = result.csrf_token;
+    return result;
+  },
+  async logout() {
+    try { await this._call("POST", "/api/logout", {}); } finally { this._csrfToken = null; }
+  },
+  checkSession() { return this._call("GET", "/api/me"); },
+
   getNewJobs() { return this._call("GET", "/api/new_jobs"); },
+  sync() { return this._call("POST", "/api/sync", {}); },
   getActive() { return this._call("GET", "/api/active"); },
   getTechnicians() { return this._call("GET", "/api/technicians"); },
   getJob(id) { return this._call("GET", `/api/job/${id}`); },
@@ -42,4 +69,19 @@ const Api = {
   confirmReplySent(jobId, sentChannel) {
     return this._call("POST", `/api/job/${jobId}/commercial/confirm_reply_sent`, { sent_channel: sentChannel });
   },
+
+  getClosings() { return this._call("GET", "/api/closings"); },
+  recordClosing(jobId, fields) { return this._call("POST", `/api/closings/${jobId}/record`, fields); },
+  prepareClosing(jobId) { return this._call("POST", `/api/closings/${jobId}/prepare`, {}); },
+  confirmClosingSent(jobId) { return this._call("POST", `/api/closings/${jobId}/confirm_sent`, {}); },
+  completeClosing(jobId) { return this._call("POST", `/api/closings/${jobId}/complete`, {}); },
+
+  getHistory(filters) {
+    const q = new URLSearchParams(Object.entries(filters || {}).filter(([, v]) => v));
+    const qs = q.toString();
+    return this._call("GET", `/api/history${qs ? "?" + qs : ""}`);
+  },
+  getHistoryDetail(id) { return this._call("GET", `/api/history/${id}`); },
+
+  getReports() { return this._call("GET", "/api/reports"); },
 };
