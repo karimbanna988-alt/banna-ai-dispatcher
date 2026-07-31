@@ -60,3 +60,17 @@
 .login-sub { color: var(--text-muted); font-size: 12.5px; margin: 4px 0 18px 0; }
 
 .section-title .btn { min-height: 30px; }
+
+/* -------------------------------------------------------- Settings menu - */
+.settings-menu-backdrop { display: none; position: fixed; inset: 0; z-index: 35; }
+.settings-menu-backdrop.open { display: block; }
+.settings-menu {
+  display: none; position: fixed; top: 52px; right: 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+  min-width: 180px; z-index: 36; padding: 6px 0;
+}
+.settings-menu.open { display: block; }
+.settings-menu-item { padding: 9px 14px; font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer; }
+.settings-menu-item:hover { background: var(--bg); }
+.settings-menu-divider { height: 1px; background: var(--border); margin: 6px 0; }
+@media (max-width: 899px) { .settings-menu { right: 8px; } }

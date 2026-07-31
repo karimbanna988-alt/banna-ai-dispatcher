@@ -30,18 +30,24 @@
   </div>
   <div class="header-actions">
     <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>
-    <button class="icon-btn" id="logoutBtn" title="Log out">&#9211;</button>
+    <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
   </div>
 </header>
+
+<div class="settings-menu-backdrop" id="settingsMenuBackdrop"></div>
+<div class="settings-menu" id="settingsMenu">
+  <div class="settings-menu-item" data-screen="technicians">Technicians</div>
+  <div class="settings-menu-item" data-screen="learning">Learning Review</div>
+  <div class="settings-menu-divider"></div>
+  <div class="settings-menu-item" id="settingsLogoutItem">Log out</div>
+</div>
 
 <div class="app-body">
   <nav class="desktop-sidebar" id="desktopSidebar">
     <div class="nav-item" data-screen="jobs">Jobs</div>
     <div class="nav-item" data-screen="active">Active</div>
     <div class="nav-item" data-screen="closings">Closings</div>
-    <div class="nav-item" data-screen="history">History</div>
-    <div class="nav-item" data-screen="reports">Reports</div>
-    <div class="nav-item" data-screen="technicians">Technicians</div>
+    <div class="nav-item" data-screen="history">Completed</div>
   </nav>
 
   <main class="main-content">
@@ -63,7 +69,17 @@
             <tbody id="jobsTableBody"></tbody>
           </table>
           <div class="mobile-row-list" id="jobsMobileList"></div>
-          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new live jobs need attention.</div>
+          <div id="jobsEmptyState" class="empty-state" style="display:none;">No live jobs received in the last 60 minutes.</div>
+
+          <div id="recentJobsSection" style="display:none;">
+            <div class="subsection-label">Recent unresolved jobs</div>
+            <table class="data-table" id="recentJobsTable">
+              <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
+              <tbody id="recentJobsTableBody"></tbody>
+            </table>
+            <div class="mobile-row-list" id="recentJobsMobileList"></div>
+          </div>
+
           <details class="disclosure" id="olderJobsDetails" style="margin-top:14px; display:none;">
             <summary id="olderJobsSummary">Older unresolved jobs</summary>
             <table class="data-table" id="olderJobsTable">
@@ -80,6 +96,11 @@
     <!-- ========================================================== ACTIVE -->
     <section class="screen" id="screen-active">
       <div class="section-title">Active <span class="count" id="activeCount"></span></div>
+      <div id="whatsappBridgeBanner" class="scope-note"></div>
+      <div id="whatsappPendingSection" style="display:none;">
+        <div class="subsection-label">Incoming WhatsApp update</div>
+        <div id="whatsappPendingList"></div>
+      </div>
       <div class="split">
         <div class="list-pane">
           <table class="data-table" id="activeTable">
@@ -111,9 +132,9 @@
       </div>
     </section>
 
-    <!-- ========================================================= HISTORY -->
+    <!-- ======================================================== COMPLETED -->
     <section class="screen" id="screen-history">
-      <div class="section-title">History <span class="count" id="historyCount"></span></div>
+      <div class="section-title">Completed <span class="count" id="historyCount"></span></div>
       <div class="toolbar">
         <input type="text" id="historySearch" placeholder="Search ticket / PDL">
         <select id="historySourceFilter"><option value="All">All sources</option></select>
@@ -136,6 +157,9 @@
     </section>
 
     <!-- ========================================================= REPORTS -->
+    <!-- Hidden from navigation until real settlement fields/rules exist --
+         see docs/technician_reports_requirements.md. Code intentionally
+         kept, not deleted. -->
     <section class="screen" id="screen-reports">
       <div class="section-title">Reports</div>
       <div class="scope-note">Read-only. Only fields recorded in the database are shown -- nothing here is calculated or estimated.</div>
@@ -161,6 +185,23 @@
       <div class="mobile-row-list" id="techMobileList"></div>
     </section>
 
+    <!-- ================================================== LEARNING REVIEW -->
+    <section class="screen" id="screen-learning">
+      <div class="section-title">Learning Review</div>
+      <div class="scope-note">Real Shadow episodes only. Shadow Mode is passive -- it observes and records; it never sends anything and never retrains itself automatically.</div>
+      <div id="learningCount" class="info-banner"></div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="learningTable">
+            <thead><tr><th>Job</th><th>Source</th><th>Intent</th><th>Review status</th></tr></thead>
+            <tbody id="learningTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="learningMobileList"></div>
+        </div>
+        <div class="detail-pane" id="learningDetailPane"></div>
+      </div>
+    </section>
+
   </main>
 </div>
 
@@ -168,9 +209,8 @@
   <div class="nav-item" data-screen="jobs"><span class="nav-icon">&#128203;</span>Jobs</div>
   <div class="nav-item" data-screen="active"><span class="nav-icon">&#9889;</span>Active</div>
   <div class="nav-item" data-screen="closings"><span class="nav-icon">&#9989;</span>Close</div>
-  <div class="nav-item" data-screen="history"><span class="nav-icon">&#128220;</span>History</div>
-  <div class="nav-item" data-screen="reports"><span class="nav-icon">&#128202;</span>Reports</div>
-  <div class="nav-item" data-screen="technicians"><span class="nav-icon">&#128101;</span>Techs</div>
+  <div class="nav-item" data-screen="history"><span class="nav-icon">&#128220;</span>Done</div>
+  <div class="nav-item" id="mobileMoreNavItem"><span class="nav-icon">&#9776;</span>More</div>
 </nav>
 
 <div class="sheet-backdrop" id="sheetBackdrop"></div>

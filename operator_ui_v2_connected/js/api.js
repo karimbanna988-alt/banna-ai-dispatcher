@@ -84,4 +84,18 @@ const Api = {
   getHistoryDetail(id) { return this._call("GET", `/api/history/${id}`); },
 
   getReports() { return this._call("GET", "/api/reports"); },
+
+  getLearningReview() { return this._call("GET", "/api/learning_review"); },
+  setLearningReviewStatus(episodeId, reviewStatus) {
+    return this._call("POST", `/api/learning_review/${encodeURIComponent(episodeId)}/status`, { review_status: reviewStatus });
+  },
+
+  getWhatsappPending() { return this._call("GET", "/api/whatsapp_pending"); },
+  getWhatsappBridgeStatus() { return this._call("GET", "/api/whatsapp_bridge_status"); },
+  attachWhatsappObservation(messageId, jobId) {
+    return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/attach`, { job_id: jobId });
+  },
+  ignoreWhatsappObservation(messageId) {
+    return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/ignore`, {});
+  },
 };

@@ -18,6 +18,7 @@ const state = {
   activePreview: {},       // job_id -> last commercial preview/save result (client-side draft)
   activeRawText: {},       // job_id -> last pasted text, preserved verbatim across re-renders
   closingDraft: {},        // job_id -> in-progress technician-closing form values
+  learningSelected: null,
 };
 
 let newJobsLive = [];
@@ -26,6 +27,7 @@ let activeJobs = [];
 let closingsEntries = [];
 let historyEntries = [];
 let technicians = [];
+let learningEpisodes = [];
 
 function esc(s) { return (s ?? "").toString().replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 function notRecorded(v) { return (v === null || v === undefined || v === "") ? "Not recorded" : esc(v); }
@@ -104,14 +106,16 @@ function showApp() {
 function clearAllLocalData() {
   /* No PII stays behind after logout / session expiry -- every
      in-memory array and rendered pane is wiped, not just hidden. */
-  newJobsLive = []; newJobsOlder = []; activeJobs = []; closingsEntries = []; historyEntries = []; technicians = [];
-  state.jobsSelected = null; state.activeSelected = null; state.closingsSelected = null; state.historySelected = null;
+  newJobsLive = []; newJobsOlder = []; activeJobs = []; closingsEntries = []; historyEntries = []; technicians = []; learningEpisodes = []; whatsappPending = [];
+  state.jobsSelected = null; state.activeSelected = null; state.closingsSelected = null; state.historySelected = null; state.learningSelected = null;
   state.kRevealed = {}; state.activePreview = {}; state.activeRawText = {}; state.closingDraft = {};
-  ["jobsTableBody", "jobsMobileList", "olderJobsTableBody", "olderJobsMobileList", "jobsDetailPane",
+  ["jobsTableBody", "jobsMobileList", "recentJobsTableBody", "recentJobsMobileList", "olderJobsTableBody", "olderJobsMobileList", "jobsDetailPane",
    "activeTableBody", "activeMobileList", "activeDetailPane",
    "closingsTableBody", "closingsMobileList", "closingsDetailPane",
    "historyTableBody", "historyMobileList", "historyDetailPane",
-   "reportTableBody", "reportMobileList", "techTableBody", "techMobileList"].forEach(id => {
+   "reportTableBody", "reportMobileList", "techTableBody", "techMobileList",
+   "learningTableBody", "learningMobileList", "learningDetailPane",
+   "whatsappPendingList", "whatsappBridgeBanner"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
   });
@@ -134,7 +138,7 @@ async function attemptLogout() {
   try { await Api.logout(); } catch (e) { /* already expired/logged out -- fine, still show login */ }
   showLogin();
 }
-document.getElementById("logoutBtn").addEventListener("click", attemptLogout);
+document.getElementById("settingsLogoutItem").addEventListener("click", () => { closeSettingsMenu(); attemptLogout(); });
 
 (async function boot() {
   try {
@@ -153,16 +157,37 @@ document.getElementById("logoutBtn").addEventListener("click", attemptLogout);
 function setScreen(name) {
   state.screen = name;
   document.querySelectorAll(".screen").forEach(el => el.classList.toggle("active", el.id === "screen-" + name));
-  document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item").forEach(el => {
+  document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item[data-screen]").forEach(el => {
     el.classList.toggle("active", el.dataset.screen === name);
   });
   closeSheet();
+  closeSettingsMenu();
   refreshAll();
 }
-document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item").forEach(el => {
+document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item[data-screen]").forEach(el => {
   el.addEventListener("click", () => setScreen(el.dataset.screen));
 });
 document.getElementById("refreshBtn").addEventListener("click", () => refreshAll());
+
+/* ------------------------------------------------------- Settings menu -- */
+function openSettingsMenu() {
+  document.getElementById("settingsMenu").classList.add("open");
+  document.getElementById("settingsMenuBackdrop").classList.add("open");
+}
+function closeSettingsMenu() {
+  document.getElementById("settingsMenu").classList.remove("open");
+  document.getElementById("settingsMenuBackdrop").classList.remove("open");
+}
+function toggleSettingsMenu() {
+  const menu = document.getElementById("settingsMenu");
+  if (menu.classList.contains("open")) closeSettingsMenu(); else openSettingsMenu();
+}
+document.getElementById("settingsBtn").addEventListener("click", toggleSettingsMenu);
+document.getElementById("mobileMoreNavItem").addEventListener("click", toggleSettingsMenu);
+document.getElementById("settingsMenuBackdrop").addEventListener("click", closeSettingsMenu);
+document.querySelectorAll(".settings-menu-item[data-screen]").forEach(el => {
+  el.addEventListener("click", () => setScreen(el.dataset.screen));
+});
 
 /* ============================================================ SHEET/MODAL */
 function openSheet(html) {
@@ -192,6 +217,7 @@ async function refreshAll() {
   else if (state.screen === "history") await loadHistory();
   else if (state.screen === "reports") await loadReports();
   else if (state.screen === "technicians") await loadTechnicians();
+  else if (state.screen === "learning") await loadLearningReview();
 }
 
 async function loadJobs() {
@@ -216,6 +242,8 @@ document.getElementById("syncBtn").addEventListener("click", async () => {
   }
 });
 
+const RECENT_WINDOW_MINUTES = 24 * 60;
+
 function renderJobsScreen() {
   const allSelectable = newJobsLive.concat(newJobsOlder);
   document.getElementById("jobsCount").textContent = `(${allSelectable.length})`;
@@ -234,20 +262,44 @@ function renderJobsScreen() {
   }
   wireJobRowClicks(tbody, mobileList);
 
+  // "Recent unresolved jobs" only appears as a helpful fallback when
+  // there is nothing live to act on -- newest 3 unresolved jobs from
+  // the last 24 hours, always visible (not collapsed).
+  const recentSection = document.getElementById("recentJobsSection");
+  let recent = [];
+  let olderForCollapsed = newJobsOlder;
+  if (!newJobsLive.length) {
+    recent = newJobsOlder.filter(j => j.age_minutes <= RECENT_WINDOW_MINUTES).slice(0, 3);
+    const recentIds = new Set(recent.map(j => j.message_id));
+    olderForCollapsed = newJobsOlder.filter(j => !recentIds.has(j.message_id));
+  }
+  if (recent.length) {
+    recentSection.style.display = "block";
+    const recentBody = document.getElementById("recentJobsTableBody");
+    const recentMobile = document.getElementById("recentJobsMobileList");
+    recentBody.innerHTML = recent.map(j => jobRowHtml(j, "recentJobsTableBody")).join("");
+    recentMobile.innerHTML = recent.map(j => jobMobileRowHtml(j)).join("");
+    wireJobRowClicks(recentBody, recentMobile);
+  } else {
+    recentSection.style.display = "none";
+  }
+
   const olderDetails = document.getElementById("olderJobsDetails");
-  if (newJobsOlder.length) {
+  if (olderForCollapsed.length) {
     olderDetails.style.display = "block";
-    document.getElementById("olderJobsSummary").textContent = `Older unresolved jobs (${newJobsOlder.length})`;
+    document.getElementById("olderJobsSummary").textContent = `Older unresolved jobs (${olderForCollapsed.length})`;
     const olderBody = document.getElementById("olderJobsTableBody");
     const olderMobile = document.getElementById("olderJobsMobileList");
-    olderBody.innerHTML = newJobsOlder.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
-    olderMobile.innerHTML = newJobsOlder.map(j => jobMobileRowHtml(j)).join("");
+    olderBody.innerHTML = olderForCollapsed.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
+    olderMobile.innerHTML = olderForCollapsed.map(j => jobMobileRowHtml(j)).join("");
     wireJobRowClicks(olderBody, olderMobile);
   } else {
     olderDetails.style.display = "none";
   }
 
-  // Never auto-select an older job while a live job exists.
+  // Never auto-select an older/recent job while a live job exists; if no
+  // live job exists, the dispatcher may still deliberately pick a recent
+  // or older one, but nothing is auto-selected on their behalf here.
   if (!allSelectable.find(j => j.message_id === state.jobsSelected)) {
     state.jobsSelected = newJobsLive.length ? newJobsLive[0].message_id : null;
   }
@@ -464,11 +516,73 @@ function renderJobDetail(mid, allSelectable) {
 }
 
 /* =============================================================== ACTIVE */
+let whatsappPending = [];
+
 async function loadActive() {
   const data = await callOrHandleAuth(() => Api.getActive());
   if (!data) return;
   activeJobs = data.entries;
   renderActiveScreen();
+  loadWhatsappBridgeStatus();
+  loadWhatsappPending();
+}
+
+async function loadWhatsappBridgeStatus() {
+  try {
+    const status = await callOrHandleAuth(() => Api.getWhatsappBridgeStatus());
+    if (!status) return;
+    document.getElementById("whatsappBridgeBanner").textContent = status.status;
+  } catch (e) { /* non-critical -- Active screen still works without it */ }
+}
+
+async function loadWhatsappPending() {
+  try {
+    const data = await callOrHandleAuth(() => Api.getWhatsappPending());
+    if (!data) return;
+    whatsappPending = data.pending;
+    renderWhatsappPending();
+  } catch (e) { /* bridge/adapter unreachable -- CRM keeps working normally */ }
+}
+
+function renderWhatsappPending() {
+  const section = document.getElementById("whatsappPendingSection");
+  const list = document.getElementById("whatsappPendingList");
+  if (!whatsappPending.length) { section.style.display = "none"; list.innerHTML = ""; return; }
+  section.style.display = "block";
+  list.innerHTML = whatsappPending.map(o => `
+    <div class="mobile-row" data-mid="${esc(o.message_id)}">
+      <div class="row-top"><strong>${esc(o.group_name)}</strong> <span class="age">${esc(o.extracted_ticket || "no ticket guess")}</span></div>
+      <div class="row-bottom">${esc(o.text)}</div>
+      <div class="action-secondary-row" style="margin-top:6px;">
+        <button class="btn btn-primary" data-whatsappaction="attach" data-mid="${esc(o.message_id)}">Attach to selected job</button>
+        <button class="btn btn-secondary" data-whatsappaction="ignore" data-mid="${esc(o.message_id)}">Ignore</button>
+      </div>
+    </div>`).join("");
+  list.querySelectorAll("[data-whatsappaction]").forEach(el => {
+    el.addEventListener("click", () => handleWhatsappPendingAction(el.dataset.whatsappaction, el.dataset.mid));
+  });
+}
+
+async function handleWhatsappPendingAction(action, messageId) {
+  try {
+    if (action === "ignore") {
+      const r = await callOrHandleAuth(() => Api.ignoreWhatsappObservation(messageId)); if (!r) return;
+      await loadWhatsappPending();
+    } else if (action === "attach") {
+      if (!state.activeSelected) { showTransientError("Select an Active job first, then Attach."); return; }
+      const r = await callOrHandleAuth(() => Api.attachWhatsappObservation(messageId, state.activeSelected)); if (!r) return;
+      // Pre-fill the existing, already-audited paste flow -- attaching
+      // never itself calls DispatcherService; only the dispatcher's own
+      // subsequent "Save verified update" tap does that, exactly like a
+      // manual paste.
+      state.activeRawText[state.activeSelected] = r.text;
+      delete state.activePreview[state.activeSelected];
+      await loadWhatsappPending();
+      rerenderActiveDetail(state.activeSelected);
+    }
+  } catch (e) {
+    showTransientError(e.message);
+  }
 }
 
 function renderActiveScreen() {
@@ -883,6 +997,103 @@ function renderReportsScreen(entries) {
       <div class="rrm-top"><span>${esc(r.job || "No ref")} · ${esc(r.company)}</span><span>${notRecorded(r.final_amount)}</span></div>
       <div class="rrm-bottom">${esc(r.date ? r.date.slice(0, 10) : "Not recorded")} · ${esc(r.technician || "Unassigned")} · ${esc(r.area || "Not recorded")}</div>
     </div>`).join("");
+}
+
+/* ======================================================= LEARNING REVIEW */
+const REVIEW_STATUSES = ["VERIFIED", "CORRECTED", "EXCLUDE", "SENSITIVE", "INCOMPLETE"];
+
+async function loadLearningReview() {
+  const data = await callOrHandleAuth(() => Api.getLearningReview());
+  if (!data) return;
+  learningEpisodes = data.episodes;
+  renderLearningReviewScreen(data.reviewed_count);
+}
+
+function renderLearningReviewScreen(reviewedCount) {
+  const countEl = document.getElementById("learningCount");
+  countEl.textContent = reviewedCount > 0
+    ? `Reviewed examples: ${reviewedCount}`
+    : "No real reviewed examples yet. Complete a supervised job to begin.";
+
+  const tbody = document.getElementById("learningTableBody");
+  tbody.innerHTML = learningEpisodes.length ? learningEpisodes.map(e => `
+    <tr data-id="${esc(e.episode_id)}" class="${state.learningSelected === e.episode_id ? "selected" : ""}">
+      <td><strong>${esc(e.ticket_or_pdl || "No ref")}</strong></td>
+      <td>${e.source ? sourceChip(e.source) : "—"}</td>
+      <td>${esc(e.normalized_intent || "—")}</td>
+      <td>${esc(e.review_status)}</td>
+    </tr>`).join("") : `<tr><td colspan="4"><div class="empty-state">No real Shadow episodes yet.</div></td></tr>`;
+  tbody.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => selectLearning(tr.dataset.id)));
+
+  const mobileList = document.getElementById("learningMobileList");
+  mobileList.innerHTML = learningEpisodes.length ? learningEpisodes.map(e => `
+    <div class="mobile-row" data-id="${esc(e.episode_id)}">
+      <div class="row-top">${e.source ? sourceChip(e.source) : ""} <strong>${esc(e.ticket_or_pdl || "No ref")}</strong></div>
+      <div class="row-bottom">${esc(e.normalized_intent || "—")} · ${esc(e.review_status)}</div>
+    </div>`).join("") : `<div class="empty-state">No real Shadow episodes yet.</div>`;
+  mobileList.querySelectorAll(".mobile-row").forEach(row => row.addEventListener("click", () => selectLearning(row.dataset.id)));
+
+  if (!learningEpisodes.find(e => e.episode_id === state.learningSelected)) {
+    state.learningSelected = learningEpisodes.length ? learningEpisodes[0].episode_id : null;
+  }
+  if (state.learningSelected) renderLearningDetail(state.learningSelected);
+  else { document.getElementById("learningDetailPane").classList.remove("open"); document.getElementById("learningDetailPane").innerHTML = ""; }
+}
+
+function selectLearning(episodeId) {
+  state.learningSelected = episodeId;
+  renderLearningReviewScreen(learningEpisodes.filter(e => e.review_status !== "UNREVIEWED").length);
+  if (isMobile()) {
+    const e = learningEpisodes.find(x => x.episode_id === episodeId);
+    if (e) { openSheet(learningDetailHtml(e)); wireLearningDetailActions(e); }
+  }
+}
+
+function learningDetailHtml(e) {
+  const actions = REVIEW_STATUSES.map(s =>
+    `<button class="btn ${e.review_status === s ? "btn-primary" : "btn-secondary"}" data-learningaction="${s}" data-id="${esc(e.episode_id)}" style="margin:3px;">${s.charAt(0) + s.slice(1).toLowerCase()}</button>`
+  ).join("");
+  return `
+    <div class="detail-header">${e.source ? sourceChip(e.source) : ""}<span class="detail-ticket">${esc(e.ticket_or_pdl || "No ref")}</span></div>
+    <div class="detail-meta">Intent: ${esc(e.normalized_intent || "—")}</div>
+    <div class="detail-section">
+      <div class="subsection-label">Original observation</div>
+      <pre class="msg-block">${esc(e.original_observation || "—")}</pre>
+      <div class="subsection-label">System suggestion</div>
+      <pre class="msg-block">${esc(e.shadow_suggested_reply || "—")}</pre>
+      <div class="subsection-label">Dispatcher correction / confirmed response</div>
+      <pre class="msg-block">${esc(e.dispatcher_actual_reply || "—")}</pre>
+      <div class="detail-meta">Later outcome: ${esc(e.final_job_outcome || e.negotiation_outcome || "Not yet known")}</div>
+      ${e.human_review_required ? `<div class="review-banner">Please review before continuing.</div>` : ""}
+    </div>
+    <div class="detail-section">
+      <div class="subsection-label">Review status: ${esc(e.review_status)}</div>
+      ${actions}
+    </div>`;
+}
+
+function wireLearningDetailActions(e) {
+  const root = isMobile() ? document.getElementById("bottomSheetContent") : document.getElementById("learningDetailPane");
+  root.querySelectorAll("[data-learningaction]").forEach(el => {
+    el.addEventListener("click", async () => {
+      try {
+        const r = await callOrHandleAuth(() => Api.setLearningReviewStatus(el.dataset.id, el.dataset.learningaction));
+        if (!r) return;
+        await loadLearningReview();
+      } catch (err) {
+        showTransientError(err.message);
+      }
+    });
+  });
+}
+
+function renderLearningDetail(episodeId) {
+  const e = learningEpisodes.find(x => x.episode_id === episodeId);
+  const pane = document.getElementById("learningDetailPane");
+  if (!e) { pane.classList.remove("open"); pane.innerHTML = ""; return; }
+  pane.classList.add("open");
+  pane.innerHTML = learningDetailHtml(e);
+  wireLearningDetailActions(e);
 }
 
 /* =========================================================== TECHNICIANS */
