@@ -285,6 +285,54 @@ def fetch_pending_messages(_conn: sqlite3.Connection, group_label: Optional[str]
     return [dict(zip(columns, row)) for row in rows]
 
 
+MAX_ARCHIVE_PAGE_SIZE = 50
+
+
+def _archive_where_clause(search: Optional[str], unmatched_only: bool) -> tuple[str, list]:
+    clauses = ["status IN ('pending', 'loaded')"]
+    params: list = []
+    if search:
+        clauses.append("(raw_text LIKE ? OR group_label LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like])
+    if unmatched_only:
+        clauses.append(
+            "message_id NOT IN (SELECT message_id FROM dispatch_tracking WHERE dispatched_manually_at IS NOT NULL)"
+        )
+    return " AND ".join(clauses), params
+
+
+def paginated_pending_messages(
+    conn: sqlite3.Connection, page: int = 1, page_size: int = 25,
+    search: Optional[str] = None, unmatched_only: bool = False,
+) -> tuple[list[dict], int]:
+    """Real, honest pagination over quo_pending_messages for Archive /
+    Inbox Review -- newest first, capped page size, a real COUNT(*) of
+    the matching set returned alongside the page (never just the size of
+    the page actually fetched). Deliberately does NOT run these rows
+    through get_live_dispatch_queue()'s correlation/dedup/
+    shows_job_transformation gate -- that gate exists to decide what's
+    actionable *right now* on the Jobs screen, and would silently hide
+    exactly the "unmatched" messages this screen exists to surface.
+    "unmatched_only" is a real, cheap SQL filter (no
+    dispatch_tracking.dispatched_manually_at row), not a fabricated
+    classification. Text is caller's responsibility to mask (see
+    mask_sensitive) before ever reaching an HTTP response."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_ARCHIVE_PAGE_SIZE))
+    where, params = _archive_where_clause(search, unmatched_only)
+    total = conn.execute(f"SELECT COUNT(*) FROM quo_pending_messages WHERE {where}", params).fetchone()[0]
+    offset = (page - 1) * page_size
+    rows = conn.execute(
+        f"SELECT message_id, group_label, raw_text, received_at, fetched_at, status "
+        f"FROM quo_pending_messages WHERE {where} "
+        f"ORDER BY COALESCE(received_at, fetched_at) DESC LIMIT ? OFFSET ?",
+        [*params, page_size, offset],
+    ).fetchall()
+    columns = ["message_id", "group_label", "raw_text", "received_at", "fetched_at", "status"]
+    return [dict(zip(columns, row)) for row in rows], total
+
+
 def count_pending_messages(conn: sqlite3.Connection, group_label: Optional[str] = None) -> int:
     """The real, uncapped total of not-yet-actioned quo_pending_messages
     rows -- fetch_pending_messages() above caps its result at `limit`

@@ -388,6 +388,58 @@ def route_new_jobs(handler: "Handler", match: dict, body: dict) -> dict:
         conn.close()
 
 
+_INBOX_REVIEW_DEFAULT_PAGE_SIZE = 25
+
+
+def route_inbox_review(handler: "Handler", match: dict, body: dict) -> dict:
+    """Archive / Inbox Review: real, honest pagination over
+    quo_pending_messages -- historical inbound messages and messages
+    awaiting review, NEVER labeled as jobs. Unlike route_new_jobs (which
+    feeds the Jobs screen's actionable-now triage queue via
+    get_live_dispatch_queue's correlation/dedup gate), this route shows
+    every raw message including ones that never correlate to a job --
+    surfacing "unmatched messages" is the whole point of this screen.
+    Never loads the whole backlog into the browser: page_size is capped
+    server-side (luxor_ops_shared.MAX_ARCHIVE_PAGE_SIZE), and the total
+    count returned is a real COUNT(*) of the matching set, not the size
+    of the page fetched."""
+    try:
+        page = int(body.get("page") or 1)
+    except (TypeError, ValueError):
+        raise ApiError(400, "page must be an integer.")
+    try:
+        page_size = int(body.get("page_size") or _INBOX_REVIEW_DEFAULT_PAGE_SIZE)
+    except (TypeError, ValueError):
+        raise ApiError(400, "page_size must be an integer.")
+    search = (body.get("search") or "").strip() or None
+    unmatched_only = str(body.get("unmatched_only") or "").lower() in ("1", "true", "yes")
+
+    conn = get_conn()
+    try:
+        rows, total = shared.paginated_pending_messages(
+            conn, page=page, page_size=page_size, search=search, unmatched_only=unmatched_only,
+        )
+        messages = [
+            {
+                "message_id": r["message_id"],
+                "source": r["group_label"],
+                "text_preview": shared.mask_sensitive(r["raw_text"])[:280],
+                "received_at": r["received_at"] or r["fetched_at"],
+                "status": r["status"],
+            }
+            for r in rows
+        ]
+        return {
+            "messages": messages,
+            "page": page,
+            "page_size": min(max(page_size, 1), shared.MAX_ARCHIVE_PAGE_SIZE),
+            "total": total,
+            "label": "Historical inbound messages -- not confirmed jobs.",
+        }
+    finally:
+        conn.close()
+
+
 def route_sync(handler: "Handler", match: dict, body: dict) -> dict:
     """Explicit manual ingestion -- the same dispatcher.quo_ingest.poll_for_new_messages()
     the Streamlit New Jobs "Sync" button already calls; nothing here
@@ -1090,6 +1142,7 @@ ROUTES = [
     ("POST", r"^/api/logout$", route_logout, {}),
     ("GET", r"^/api/me$", route_me, {}),
     ("GET", r"^/api/command_center$", route_command_center, {}),
+    ("GET", r"^/api/inbox_review$", route_inbox_review, {}),
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
     ("POST", r"^/api/sync$", route_sync, {}),
     ("GET", r"^/api/active$", route_active, {}),
