@@ -378,7 +378,12 @@ def route_new_jobs(handler: "Handler", match: dict, body: dict) -> dict:
             (d for d in dtos if d["age_minutes"] > LIVE_WINDOW_MINUTES),
             key=lambda d: d["age_minutes"],
         )
-        return {"live": live_window, "older": older_unresolved, "live_window_minutes": LIVE_WINDOW_MINUTES}
+        return {
+            "live": live_window,
+            "older": older_unresolved,
+            "live_window_minutes": LIVE_WINDOW_MINUTES,
+            "total_pending_messages": shared.count_pending_messages(conn),
+        }
     finally:
         conn.close()
 
@@ -945,6 +950,42 @@ def route_performance(handler: "Handler", match: dict, body: dict) -> dict:
         conn.close()
 
 
+# ========================================================= COMMAND CENTER
+def route_command_center(handler: "Handler", match: dict, body: dict) -> dict:
+    """Read-only composed dashboard for the Command Center landing
+    screen. Every figure comes from kpi_read_model.get_command_center(),
+    which only calls existing kpi_read_model functions (or small new
+    ones defined alongside them) -- this route never writes anything,
+    never duplicates a KPI calculation, and never exposes phone numbers,
+    addresses, or raw message bodies. See docs/command_center.md.
+
+    The one thing kpi_read_model.py deliberately can't include (it only
+    ever reads jobs/events/shadow_episodes SQL, per its own module
+    docstring) is a real WhatsApp observation waiting for review -- that
+    lives in whatsapp_bridge_adapter's in-memory queue, the same source
+    route_whatsapp_pending already reads. Merged in here, capped at 5
+    total attention items, never a second WhatsApp queue invented."""
+    conn = get_conn()
+    try:
+        dashboard = kpi_read_model.get_command_center(conn)
+        remaining = 5 - len(dashboard["attention_now"])
+        if remaining > 0:
+            for observation in whatsapp_bridge_adapter.list_pending()[:remaining]:
+                dashboard["attention_now"].append({
+                    "type": "whatsapp_observation_pending",
+                    "job_id": None,
+                    "ticket": None,
+                    "source": "WhatsApp",
+                    "age_minutes": None,
+                    "primary_action": "Review in Active",
+                    "message_id": observation["message_id"],
+                    "group_name": observation["group_name"],
+                })
+        return dashboard
+    finally:
+        conn.close()
+
+
 # =========================================================== LEARNING REVIEW
 _REVIEW_STATUSES = ("VERIFIED", "CORRECTED", "EXCLUDE", "SENSITIVE", "INCOMPLETE")
 
@@ -1048,6 +1089,7 @@ ROUTES = [
     ("POST", r"^/api/login$", route_login, {"public": True, "skip_csrf": True}),
     ("POST", r"^/api/logout$", route_logout, {}),
     ("GET", r"^/api/me$", route_me, {}),
+    ("GET", r"^/api/command_center$", route_command_center, {}),
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
     ("POST", r"^/api/sync$", route_sync, {}),
     ("GET", r"^/api/active$", route_active, {}),

@@ -502,6 +502,178 @@ def attention_now(conn: sqlite3.Connection, now: datetime, targets: dict) -> lis
 
 
 # ============================================================== DASHBOARD
+def _parse_numeric_amount(raw: Optional[str]) -> Optional[float]:
+    """Strips $ and commas and parses as a plain number -- the same rule
+    documented for average_closed_amount/closing_submission_completeness
+    above. Returns None (never 0) for missing or non-numeric text."""
+    if not raw:
+        return None
+    cleaned = raw.strip().replace("$", "").replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def new_jobs_recent(conn: sqlite3.Connection, now: datetime, window_minutes: int = 60, source=None, area=None) -> dict:
+    """Current snapshot: status='New' jobs received within the last
+    window_minutes. Distinct from jobs_received(), which counts every
+    status created in a period -- this is the Command Center's RECENT
+    NEW definition (see docs/command_center.md)."""
+    where, params = _build_job_filters(source, area, status_in=["New"])
+    rows = conn.execute(f"SELECT created_at FROM jobs j WHERE 1=1{where}", params).fetchall()
+    n = 0
+    for (created_at,) in rows:
+        created = _parse_ts(created_at)
+        if created and (now - created).total_seconds() / 60.0 <= window_minutes:
+            n += 1
+    return _kpi(n, n, len(rows), len(rows), DQ_OK if rows else DQ_ZERO, f"{n} new job(s) received in the last {window_minutes} minutes.")
+
+
+def active_with_technician_count(conn: sqlite3.Connection, source=None, area=None) -> dict:
+    """Current snapshot: dispatched jobs (Approved/In Progress) that have
+    a real assigned technician -- the Command Center's ACTIVE definition.
+    Distinct from active_jobs_count() (Performance screen), which also
+    includes not-yet-dispatched New jobs and does not require a
+    technician assignment -- that is a different, already-relied-upon
+    question and is left unchanged."""
+    where, params = _build_job_filters(source, area, status_in=["Approved", "In Progress"])
+    sql = f"SELECT COUNT(*) FROM jobs j WHERE j.assigned_technician_id IS NOT NULL{where}"
+    n = conn.execute(sql, params).fetchone()[0]
+    return _kpi(n, n, n, n, DQ_OK if n > 0 else DQ_ZERO, f"{n} active job(s) with a technician assigned.")
+
+
+def en_route_count(conn: sqlite3.Connection) -> dict:
+    """No update_type value in the real schema reliably distinguishes
+    'en route' from any other technician status update yet -- same
+    needs_business_definition posture as technician_summary()'s
+    no_answer_no_show_counts. Never fabricated as a guessed subset of
+    active jobs."""
+    return _kpi(None, None, None, None, DQ_NEEDS_DEFINITION, "No reliable 'en route' signal exists in the real data yet -- needs a dedicated technician update_type value.")
+
+
+def verified_closed_amount(conn: sqlite3.Connection, start: datetime, end: datetime, source=None, area=None) -> dict:
+    """Sum of closing_amount values that parse as a plain number, for
+    jobs that closed in this period. Only jobs with a reliable numeric
+    amount are summed; jobs missing one are counted (denominator) but
+    excluded from the total, never coerced to 0 -- same parsing
+    convention as the technician 'average closed amount' KPI above."""
+    where, params = _build_job_filters(source, area, status_in=["Closed"])
+    sql = f"SELECT j.id FROM jobs j WHERE j.updated_at >= ? AND j.updated_at < ?{where}"
+    job_ids = [r[0] for r in conn.execute(sql, [_iso_z(start), _iso_z(end), *params]).fetchall()]
+    if not job_ids:
+        return _kpi(0.0, 0, 0, 0, DQ_ZERO, "No jobs closed in this period.")
+    total = 0.0
+    reliable = 0
+    for job_id in job_ids:
+        row = conn.execute(
+            "SELECT closing_amount FROM events WHERE job_id = ? AND closing_amount IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [job_id],
+        ).fetchone()
+        amount = _parse_numeric_amount(row[0]) if row else None
+        if amount is not None:
+            total += amount
+            reliable += 1
+    if reliable < len(job_ids):
+        return _kpi(round(total, 2), reliable, len(job_ids), len(job_ids), DQ_INSUFFICIENT, "Closing data incomplete -- some closed jobs have no reliable numeric amount.")
+    return _kpi(round(total, 2), reliable, len(job_ids), len(job_ids), DQ_OK, f"${total:,.2f} verified across {reliable} closed job(s).")
+
+
+def job_pipeline_counts(conn: sqlite3.Connection, today_start: datetime, today_end: datetime, now: datetime, targets: dict, source=None, area=None) -> dict:
+    """Mutually-exclusive pipeline-stage snapshot for the Command
+    Center's pipeline chart. New/Waiting/Assigned/Closing Due are
+    current-state snapshots (a job that's still open isn't naturally
+    'today'-bound, matching jobs_waiting_over_target/closings_due_count's
+    own snapshot semantics); Completed/Cancelled are scoped to today so
+    the chart doesn't accumulate all-time history. No fabricated 'En
+    route' bucket -- see en_route_count()."""
+    dispatch_target = targets["dispatch_target_minutes"]
+    where, params = _build_job_filters(source, area, status_in=["New", "Needs Review"])
+    rows = conn.execute(f"SELECT created_at FROM jobs j WHERE 1=1{where}", params).fetchall()
+    new_count = 0
+    waiting_count = 0
+    for (created_at,) in rows:
+        created = _parse_ts(created_at)
+        if created and (now - created).total_seconds() / 60.0 > dispatch_target:
+            waiting_count += 1
+        else:
+            new_count += 1
+
+    assigned_where, assigned_params = _build_job_filters(source, area, status_in=["Approved"])
+    assigned_count = conn.execute(f"SELECT COUNT(*) FROM jobs j WHERE 1=1{assigned_where}", assigned_params).fetchone()[0]
+
+    closing_due = closings_due_count(conn, source, area)["value"]
+    completed_today = completed_jobs(conn, today_start, today_end, source, area)["value"]
+
+    cancelled_where, cancelled_params = _build_job_filters(source, area, status_in=["Cancelled"])
+    cancelled_sql = f"SELECT COUNT(*) FROM jobs j WHERE j.created_at >= ? AND j.created_at < ?{cancelled_where}"
+    cancelled_today = conn.execute(cancelled_sql, [_iso_z(today_start), _iso_z(today_end), *cancelled_params]).fetchone()[0]
+
+    return {
+        "New": new_count,
+        "Waiting": waiting_count,
+        "Assigned": assigned_count,
+        "Closing Due": closing_due,
+        "Completed": completed_today,
+        "Cancelled": cancelled_today,
+    }
+
+
+def _attention_now_with_age(conn: sqlite3.Connection, now: datetime, targets: dict) -> list:
+    """attention_now(), capped to 5 and enriched with age_minutes for the
+    Command Center's display -- a small additive lookup local to this
+    function only, so attention_now()'s own return shape (and the
+    Performance screen/tests that already depend on it) stays unchanged."""
+    items = attention_now(conn, now, targets)[:5]
+    for item in items:
+        row = conn.execute("SELECT created_at, last_event_at, updated_at FROM jobs WHERE id = ?", [item["job_id"]]).fetchone()
+        age_minutes = None
+        if row:
+            created_at, last_event_at, updated_at = row
+            reference = _parse_ts(last_event_at) or _parse_ts(updated_at) or _parse_ts(created_at)
+            if reference:
+                age_minutes = max(0, int((now - reference).total_seconds() // 60))
+        item["age_minutes"] = age_minutes
+    return items
+
+
+def get_command_center(conn: sqlite3.Connection, now: Optional[datetime] = None, source: Optional[str] = None, area: Optional[str] = None) -> dict:
+    """Single orchestrator for the boss-facing Command Center screen.
+    Every metric below is either an existing function from this module
+    called as-is, or a small new function defined immediately above --
+    nothing here re-implements SQL or business logic that already exists
+    elsewhere in this file. See docs/command_center.md for the exact
+    definition behind every field."""
+    targets = load_targets()
+    now = now or datetime.now(timezone.utc)
+    today_start, today_end = resolve_period("shift", now, targets)
+    min_sample = targets["min_sample_size"]
+
+    return {
+        "generated_at": _iso_z(now),
+        "period": {"today_start": today_start.isoformat(), "today_end": today_end.isoformat()},
+        "targets": targets,
+        "kpis": {
+            "new_last_60_minutes": new_jobs_recent(conn, now, window_minutes=60, source=source, area=area),
+            "waiting_for_assignment": jobs_waiting_over_target(conn, now, targets, source, area),
+            "active_with_technician": active_with_technician_count(conn, source, area),
+            "en_route": en_route_count(conn),
+            "closings_due": closings_due_count(conn, source, area),
+            "completed_today": completed_jobs(conn, today_start, today_end, source, area),
+        },
+        "verified_closed_amount_today": verified_closed_amount(conn, today_start, today_end, source, area),
+        "attention_now": _attention_now_with_age(conn, now, targets),
+        "charts": {
+            "job_source_mix_today": new_jobs_by_source(conn, today_start, today_end, area),
+            "job_pipeline_today": job_pipeline_counts(conn, today_start, today_end, now, targets, source, area),
+            "technician_activity_today": [
+                t for t in technicians_summary(conn, today_start, today_end, min_sample) if t["jobs_assigned"] > 0
+            ],
+            "verified_closings_today": verified_closed_amount(conn, today_start, today_end, source, area),
+        },
+    }
+
+
 def get_dashboard(conn: sqlite3.Connection, period: str, now: Optional[datetime] = None, source: Optional[str] = None, area: Optional[str] = None, custom_start=None, custom_end=None) -> dict:
     """Single orchestrator the API route calls. Combines every section
     above for the mobile Performance screen."""
