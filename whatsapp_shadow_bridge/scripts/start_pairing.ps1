@@ -26,4 +26,5 @@ Write-Host "  WhatsApp app -> Settings -> Linked Devices -> Link a Device" -Fore
 Write-Host ""
 
 $env:WHATSAPP_SHADOW_ENABLED = "true"
-node src/index.js --pair
+# See start_normal.ps1 for why --env-file-if-exists is required here too.
+node --env-file-if-exists=.env src/index.js --pair

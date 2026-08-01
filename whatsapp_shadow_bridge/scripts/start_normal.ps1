@@ -28,4 +28,10 @@ if (-not (Test-Path $sessionDir)) {
 
 Write-Host "Starting WhatsApp Shadow Bridge in normal receive-only mode (reusing existing paired session)." -ForegroundColor Cyan
 $env:WHATSAPP_SHADOW_ENABLED = "true"
-node src/index.js --pair
+# --env-file-if-exists loads whatsapp_shadow_bridge/.env (WHATSAPP_SHADOW_ADAPTER_SECRET,
+# etc.) into this process -- without it, config.js only ever sees whatever
+# happens to already be in the shell's environment, which is normally
+# nothing, so the adapter secret silently defaulted to "" and never matched
+# the Python side's real secret. Tolerates a missing .env (first run before
+# setup) so this stays safe-by-default either way.
+node --env-file-if-exists=.env src/index.js --pair

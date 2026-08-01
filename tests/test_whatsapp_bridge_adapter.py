@@ -208,3 +208,82 @@ def test_adapter_module_owns_no_dispatcher_database_sql():
     source = pathlib.Path("whatsapp_bridge_adapter.py").read_text(encoding="utf-8")
     for forbidden in ("import sqlite3", "INSERT INTO", "storage.connect", "dispatcher.storage"):
         assert forbidden not in source
+
+
+# ============================================= SECRET LOADING / NO ROTATION
+# Regression coverage for the live-pilot bridge/adapter secret mismatch:
+# the Node bridge never actually loaded whatsapp_shadow_bridge/.env into
+# its process (see whatsapp_shadow_bridge/test/envFileLoading.test.js for
+# that half of the fix). On the Python side, _get_or_create_adapter_secret()
+# only ever trusts os.environ -- it never parses the .env file itself --
+# so its restart-safety depends entirely on operator_api.py's own
+# load_dotenv(REPO_ROOT / ".env") call running before it, every time.
+# These tests prove that chain: an already-persisted secret is reused
+# verbatim across repeated "restarts" (never regenerated, never
+# duplicated in the file, unrelated entries left alone).
+def test_get_or_create_adapter_secret_does_not_rotate_across_simulated_restarts(tmp_path, monkeypatch):
+    from dotenv import load_dotenv
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SOME_OTHER_VAR=unrelated\n", encoding="utf-8")
+    monkeypatch.delenv(adapter.ADAPTER_SECRET_ENV_VAR, raising=False)
+
+    # "First startup": no secret yet anywhere -- generates and persists one.
+    load_dotenv(env_path)
+    first = adapter._get_or_create_adapter_secret(env_path)
+    assert "SOME_OTHER_VAR=unrelated" in env_path.read_text(encoding="utf-8")
+
+    # "Second startup": a fresh process wouldn't carry the env var forward
+    # on its own -- only load_dotenv() re-reading the persisted file does.
+    monkeypatch.delenv(adapter.ADAPTER_SECRET_ENV_VAR, raising=False)
+    load_dotenv(env_path)
+    second = adapter._get_or_create_adapter_secret(env_path)
+
+    assert first == second
+    contents = env_path.read_text(encoding="utf-8")
+    assert contents.count(f"{adapter.ADAPTER_SECRET_ENV_VAR}=") == 1  # never re-appended
+    assert "SOME_OTHER_VAR=unrelated" in contents  # unrelated entries untouched
+
+
+def test_get_or_create_adapter_secret_generates_only_when_truly_absent(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.delenv(adapter.ADAPTER_SECRET_ENV_VAR, raising=False)
+
+    generated = adapter._get_or_create_adapter_secret(env_path)
+    assert len(generated) > 0
+    assert env_path.read_text(encoding="utf-8").count(f"{adapter.ADAPTER_SECRET_ENV_VAR}=") == 1
+
+
+def test_wrong_secret_response_and_server_logs_never_contain_the_real_secret_value(bridge_server, capsys):
+    port = bridge_server.server_address[1]
+    status, body = _http(port, "POST", "/observation", valid_payload(), headers={"X-Bridge-Secret": "a-wrong-guess"})
+    assert status == 401
+    assert "test-bridge-secret" not in json.dumps(body)
+    captured = capsys.readouterr()
+    assert "test-bridge-secret" not in (captured.out + captured.err)
+
+
+def test_node_and_python_agree_on_the_bridge_secret_header_name():
+    import pathlib
+
+    node_source = pathlib.Path("whatsapp_shadow_bridge/src/adapterClient.js").read_text(encoding="utf-8")
+    python_source = pathlib.Path("whatsapp_bridge_adapter.py").read_text(encoding="utf-8")
+    assert "X-Bridge-Secret" in node_source
+    assert "X-Bridge-Secret" in python_source
+
+
+def test_bridge_launch_scripts_load_the_env_file_before_starting_node():
+    """Regression guard: whatsapp_shadow_bridge/scripts/start_pairing.ps1
+    and start_normal.ps1 must load whatsapp_shadow_bridge/.env into the
+    Node process before it starts, or WHATSAPP_SHADOW_ADAPTER_SECRET
+    silently falls back to "" and every /observation POST 401s -- exactly
+    the defect this test suite is guarding against."""
+    import pathlib
+    import re
+
+    scripts_dir = pathlib.Path("whatsapp_shadow_bridge/scripts")
+    pattern = re.compile(r"node\s+--env-file(-if-exists)?=\.env\s+src[\\/]index\.js")
+    for name in ("start_pairing.ps1", "start_normal.ps1"):
+        source = (scripts_dir / name).read_text(encoding="utf-8")
+        assert pattern.search(source), f"{name} must load whatsapp_shadow_bridge/.env before starting the bridge"
