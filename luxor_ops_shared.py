@@ -285,6 +285,23 @@ def fetch_pending_messages(_conn: sqlite3.Connection, group_label: Optional[str]
     return [dict(zip(columns, row)) for row in rows]
 
 
+def count_pending_messages(conn: sqlite3.Connection, group_label: Optional[str] = None) -> int:
+    """The real, uncapped total of not-yet-actioned quo_pending_messages
+    rows -- fetch_pending_messages() above caps its result at `limit`
+    (default 100) for performance, which silently hides how large the
+    real backlog is from anything that only reads its return value. This
+    exists so the UI can be honest about that (e.g. "showing newest 100
+    of 858") instead of implying the fetched page is the whole backlog."""
+    if group_label:
+        return conn.execute(
+            "SELECT COUNT(*) FROM quo_pending_messages WHERE status IN ('pending', 'loaded') AND group_label = ?",
+            (group_label,),
+        ).fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM quo_pending_messages WHERE status IN ('pending', 'loaded')"
+    ).fetchone()[0]
+
+
 @st.cache_data(show_spinner=False, ttl=5)
 def fetch_last_refresh(_conn: sqlite3.Connection) -> Optional[str]:
     try:

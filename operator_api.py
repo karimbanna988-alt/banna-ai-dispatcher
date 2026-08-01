@@ -353,6 +353,18 @@ def route_me(handler: "Handler", match: dict, body: dict) -> dict:
 
 # --------------------------------------------------------- Route handlers -
 def route_new_jobs(handler: "Handler", match: dict, body: dict) -> dict:
+    """Returns incoming Quo/WhatsApp messages that have not yet been
+    turned into a real job, split into a recent window and an archive
+    bucket. These are raw messages pending triage, NOT a count of real
+    unresolved jobs (see docs/command_center.md's audit section) -- the
+    frontend must never present "older"/"archive" as "N unresolved
+    jobs". total_pending_messages is the real, uncapped backlog size
+    (quo_pending_messages, status pending/loaded); "live" and "older"
+    are drawn only from the newest-100-messages page
+    get_live_dispatch_queue() operates on (see
+    luxor_ops_shared.fetch_pending_messages's own docstring for why that
+    cap exists) -- when total_pending_messages exceeds what "older"
+    contains, the UI must say so rather than imply completeness."""
     conn = get_conn()
     try:
         live, _backlog, _other = rm.get_live_dispatch_queue(conn)
