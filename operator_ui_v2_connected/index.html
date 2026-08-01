@@ -12,12 +12,14 @@
 <div id="loginScreen" class="login-screen">
   <div class="login-card">
     <div class="login-brand">LUXOR</div>
-    <div class="login-sub">Operator UI V2 -- dispatcher login</div>
+    <div class="login-sub">Dispatch Command Center</div>
     <div class="form-field">
       <label>Password</label>
       <input type="password" id="loginPassword" autocomplete="current-password">
     </div>
-    <button class="btn btn-primary btn-block" id="loginSubmitBtn">Log in</button>
+    <button class="btn btn-primary btn-block" id="loginSubmitBtn">
+      <span id="loginSubmitLabel">Log in</span>
+    </button>
     <div class="detail-warning" id="loginError" style="display:none; margin-top:10px;"></div>
   </div>
 </div>
@@ -36,15 +38,17 @@
 
 <div class="settings-menu-backdrop" id="settingsMenuBackdrop"></div>
 <div class="settings-menu" id="settingsMenu">
+  <div class="settings-menu-item" data-screen="history" id="settingsCompletedItem">Completed</div>
+  <div class="settings-menu-item" data-screen="performance">Performance</div>
   <div class="settings-menu-item" data-screen="technicians">Technicians</div>
   <div class="settings-menu-item" data-screen="learning">Learning Review</div>
-  <div class="settings-menu-item" data-screen="performance">Performance</div>
   <div class="settings-menu-divider"></div>
   <div class="settings-menu-item" id="settingsLogoutItem">Log out</div>
 </div>
 
 <div class="app-body">
   <nav class="desktop-sidebar" id="desktopSidebar">
+    <div class="nav-item" data-screen="commandcenter">Command Center</div>
     <div class="nav-item" data-screen="jobs">Jobs</div>
     <div class="nav-item" data-screen="active">Active</div>
     <div class="nav-item" data-screen="closings">Closings</div>
@@ -52,6 +56,56 @@
   </nav>
 
   <main class="main-content">
+
+    <!-- =================================================== COMMAND CENTER -->
+    <section class="screen" id="screen-commandcenter">
+      <div class="section-title">Command Center</div>
+      <div class="cc-generated-at" id="ccGeneratedAt"></div>
+
+      <div class="cc-kpi-grid" id="ccKpiGrid"></div>
+      <div class="cc-closed-amount" id="ccClosedAmount"></div>
+
+      <div id="ccAttentionSection">
+        <div class="cc-section-header">
+          <div class="subsection-label">Attention now</div>
+          <span id="ccAttentionViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="jobs">View all</button></span>
+        </div>
+        <div id="ccAttentionList"></div>
+        <div id="ccAttentionEmpty" class="empty-state" style="display:none;">Nothing needs attention right now.</div>
+      </div>
+
+      <div class="cc-section-header">
+        <div class="subsection-label">Active jobs</div>
+        <span id="ccActiveViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="active">View all</button></span>
+      </div>
+      <table class="data-table" id="ccActiveTable">
+        <thead>
+          <tr><th>Job</th><th>Source</th><th>City</th><th>Technician</th><th>Stage</th><th>Last update</th><th>Next action</th><th></th></tr>
+        </thead>
+        <tbody id="ccActiveTableBody"></tbody>
+      </table>
+      <div class="mobile-row-list" id="ccActiveMobileList"></div>
+      <div id="ccActiveEmpty" class="empty-state" style="display:none;">No active jobs with a technician right now.</div>
+
+      <div class="cc-charts-grid">
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Job source mix -- today</div>
+          <div id="ccSourceMixChart"></div>
+        </div>
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Job pipeline -- today</div>
+          <div id="ccPipelineChart"></div>
+        </div>
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Technician activity -- today</div>
+          <div id="ccTechActivityChart"></div>
+        </div>
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Verified closings -- today</div>
+          <div id="ccClosingsChart"></div>
+        </div>
+      </div>
+    </section>
 
     <!-- ============================================================ JOBS -->
     <section class="screen" id="screen-jobs">
@@ -62,7 +116,7 @@
       <div id="jobsSyncMsg" class="info-banner" style="display:none;"></div>
       <div class="split">
         <div class="list-pane">
-          <div class="subsection-label">Live jobs (last 60 minutes)</div>
+          <div class="subsection-label">New jobs (last 60 minutes)</div>
           <table class="data-table" id="jobsTable">
             <thead>
               <tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr>
@@ -76,7 +130,7 @@
           <div id="jobsEmptyState" class="empty-state" style="display:none;">No new jobs received in the last 60 minutes.</div>
 
           <div id="recentJobsSection" style="display:none;">
-            <div class="subsection-label">Recent unresolved jobs</div>
+            <div class="subsection-label">Needs review (received over an hour ago)</div>
             <table class="data-table" id="recentJobsTable">
               <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
               <tbody id="recentJobsTableBody"></tbody>
@@ -85,7 +139,8 @@
           </div>
 
           <details class="disclosure" id="olderJobsDetails" style="margin-top:14px; display:none;">
-            <summary id="olderJobsSummary">Older unresolved jobs</summary>
+            <summary id="olderJobsSummary">Archive / Needs Review</summary>
+            <div class="scope-note" id="olderJobsScopeNote" style="margin-top:6px;"></div>
             <div class="toolbar" style="margin-top:8px;">
               <input type="text" id="olderJobsSearch" placeholder="Search ticket, company, city...">
             </div>
@@ -252,10 +307,10 @@
 </div>
 
 <nav class="mobile-bottom-nav" id="mobileBottomNav">
+  <div class="nav-item" data-screen="commandcenter"><span class="nav-icon">&#127968;</span>Today</div>
   <div class="nav-item" data-screen="jobs"><span class="nav-icon">&#128203;</span>Jobs</div>
   <div class="nav-item" data-screen="active"><span class="nav-icon">&#9889;</span>Active</div>
-  <div class="nav-item" data-screen="closings"><span class="nav-icon">&#9989;</span>Close</div>
-  <div class="nav-item" data-screen="history"><span class="nav-icon">&#128220;</span>Done</div>
+  <div class="nav-item" data-screen="closings"><span class="nav-icon">&#9989;</span>Closings</div>
   <div class="nav-item" id="mobileMoreNavItem"><span class="nav-icon">&#9776;</span>More</div>
 </nav>
 

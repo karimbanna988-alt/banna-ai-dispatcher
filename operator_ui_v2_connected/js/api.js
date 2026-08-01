@@ -44,6 +44,8 @@ const Api = {
   },
   checkSession() { return this._call("GET", "/api/me"); },
 
+  getCommandCenter() { return this._call("GET", "/api/command_center"); },
+
   getNewJobs() { return this._call("GET", "/api/new_jobs"); },
   sync() { return this._call("POST", "/api/sync", {}); },
   getActive() { return this._call("GET", "/api/active"); },

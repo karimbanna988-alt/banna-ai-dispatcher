@@ -9,7 +9,7 @@
    automation. */
 
 const state = {
-  screen: "jobs",
+  screen: "commandcenter",
   jobsSelected: null,
   activeSelected: null,
   closingsSelected: null,
@@ -102,7 +102,7 @@ function showLogin(message) {
 function showApp() {
   document.getElementById("loginScreen").style.display = "none";
   document.getElementById("appShell").style.display = "block";
-  setScreen("jobs");
+  setScreen("commandcenter");
 }
 
 function clearAllLocalData() {
@@ -118,7 +118,9 @@ function clearAllLocalData() {
    "historyTableBody", "historyMobileList", "historyDetailPane",
    "reportTableBody", "reportMobileList", "techTableBody", "techMobileList",
    "learningTableBody", "learningMobileList", "learningDetailPane",
-   "whatsappPendingList", "whatsappBridgeBanner"].forEach(id => {
+   "whatsappPendingList", "whatsappBridgeBanner",
+   "ccKpiGrid", "ccClosedAmount", "ccAttentionList", "ccActiveTableBody", "ccActiveMobileList",
+   "ccSourceMixChart", "ccPipelineChart", "ccTechActivityChart", "ccClosingsChart", "ccGeneratedAt"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
   });
@@ -127,11 +129,18 @@ function clearAllLocalData() {
 async function attemptLogin() {
   const password = document.getElementById("loginPassword").value;
   if (!password) { showLogin("Enter the password."); return; }
+  const btn = document.getElementById("loginSubmitBtn");
+  const label = document.getElementById("loginSubmitLabel");
+  btn.disabled = true;
+  label.textContent = "Logging in...";
   try {
     await Api.login(password);
     showApp();
   } catch (e) {
     showLogin(e.message || "Login failed.");
+  } finally {
+    btn.disabled = false;
+    label.textContent = "Log in";
   }
 }
 document.getElementById("loginSubmitBtn").addEventListener("click", attemptLogin);
@@ -214,7 +223,8 @@ function hideConfirmModal() {
 
 /* ================================================================= JOBS */
 async function refreshAll() {
-  if (state.screen === "jobs") await loadJobs();
+  if (state.screen === "commandcenter") await loadCommandCenter();
+  else if (state.screen === "jobs") await loadJobs();
   else if (state.screen === "active") await loadActive();
   else if (state.screen === "closings") await loadClosings();
   else if (state.screen === "history") await loadHistory();
@@ -224,12 +234,19 @@ async function refreshAll() {
   else if (state.screen === "performance") await loadPerformance();
 }
 
+let newJobsTotalPending = 0;
+
 async function loadJobs() {
   const data = await callOrHandleAuth(() => Api.getNewJobs());
   if (!data) return;
   newJobsLive = data.live;
   newJobsOlder = data.older;
+  newJobsTotalPending = data.total_pending_messages || 0;
   renderJobsScreen();
+}
+
+function nowTimeLabel() {
+  return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
 document.getElementById("syncBtn").addEventListener("click", async () => {
@@ -239,7 +256,8 @@ document.getElementById("syncBtn").addEventListener("click", async () => {
   try {
     const result = await callOrHandleAuth(() => Api.sync());
     if (!result) return;
-    msgEl.textContent = `Synced -- ${result.queued} new message(s).`;
+    const label = result.queued === 1 ? "1 new job message" : `${result.queued} new job messages`;
+    msgEl.textContent = `Last Quo sync: ${nowTimeLabel()} · ${label}`;
     await loadJobs();
   } catch (e) {
     msgEl.textContent = e.message;
@@ -310,9 +328,10 @@ function renderJobsScreen() {
     }
   }
 
-  // "Recent unresolved jobs" only appears as a helpful fallback when
-  // there is nothing live to act on -- newest 3 unresolved jobs from
-  // the last 24 hours, always visible (not collapsed).
+  // "Needs review" only appears as a helpful fallback when there is
+  // nothing live to act on -- newest 3 incoming messages (still pending
+  // triage, not confirmed jobs) from the last 24 hours, always visible
+  // (not collapsed) so the landing list isn't empty for no reason.
   const recentSection = document.getElementById("recentJobsSection");
   let recent = [];
   let olderForCollapsed = newJobsOlder;
@@ -363,8 +382,17 @@ function renderOlderJobsSection() {
   const q = state.olderJobsSearch.trim().toLowerCase();
   const filtered = q ? _olderJobsFull.filter(j => olderJobMatches(j, q)) : _olderJobsFull;
   document.getElementById("olderJobsSummary").textContent = q
-    ? `Older unresolved jobs (${filtered.length} of ${_olderJobsFull.length})`
-    : `Older unresolved jobs (${_olderJobsFull.length})`;
+    ? `Archive / Needs Review (${filtered.length} of ${_olderJobsFull.length} shown)`
+    : `Archive / Needs Review (${_olderJobsFull.length} shown)`;
+  // Honest about the cap: these are raw incoming messages pending triage,
+  // not a count of real unresolved jobs -- and only the newest 100 total
+  // pending messages are ever loaded here (see route_new_jobs's docstring).
+  const scopeNote = document.getElementById("olderJobsScopeNote");
+  if (scopeNote) {
+    scopeNote.textContent = newJobsTotalPending > _olderJobsFull.length + newJobsLive.length
+      ? `Showing the newest ${_olderJobsFull.length + newJobsLive.length} of ${newJobsTotalPending} total incoming messages pending triage. These are raw messages, not confirmed jobs.`
+      : `Incoming messages older than 60 minutes, pending triage. These are raw messages, not confirmed jobs.`;
+  }
   const olderBody = document.getElementById("olderJobsTableBody");
   const olderMobile = document.getElementById("olderJobsMobileList");
   olderBody.innerHTML = filtered.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
@@ -591,6 +619,255 @@ function renderJobDetail(mid, allSelectable) {
   pane.classList.add("open");
   pane.innerHTML = jobDetailHtml(j);
   wireJobDetailActions(j);
+}
+
+/* ===================================================== COMMAND CENTER === */
+// Every figure here comes straight from /api/command_center
+// (kpi_read_model.get_command_center(), see docs/command_center.md) or
+// /api/active (the exact same data source the Active screen itself
+// uses) -- this file computes zero KPIs of its own, only formats what
+// the backend already decided.
+
+function minutesSince(isoString) {
+  if (!isoString) return null;
+  const then = new Date(isoString).getTime();
+  if (Number.isNaN(then)) return null;
+  return Math.max(0, Math.round((Date.now() - then) / 60000));
+}
+
+function wireScreenLinks(container) {
+  container.querySelectorAll("[data-screen]").forEach(el => {
+    el.addEventListener("click", () => setScreen(el.dataset.screen));
+  });
+}
+
+async function loadCommandCenter() {
+  const dashboard = await callOrHandleAuth(() => Api.getCommandCenter());
+  if (!dashboard) return;
+  const activeData = await callOrHandleAuth(() => Api.getActive());
+  renderCommandCenterScreen(dashboard, activeData ? activeData.entries : []);
+}
+
+function fmtKpiValue(kpi) {
+  if (!kpi) return "--";
+  if (kpi.data_quality === "needs_business_definition") return "N/A";
+  if (kpi.value === null || kpi.value === undefined) return "--";
+  return kpi.value;
+}
+
+function ccKpiCardHtml(title, kpi, screenLink) {
+  const value = fmtKpiValue(kpi);
+  const note = kpi.data_quality === "needs_business_definition" ? "Not trackable yet" : "";
+  return `
+    <div class="cc-kpi-card" data-screen="${screenLink}" title="${esc(kpi.explanation || "")}">
+      <div class="cc-kpi-value">${esc(value)}</div>
+      <div class="cc-kpi-label">${esc(title)}</div>
+      ${note ? `<div class="cc-kpi-note">${esc(note)}</div>` : ""}
+    </div>`;
+}
+
+function ccClosedAmountHtml(kpi) {
+  if (kpi.data_quality === "ok") {
+    return `<div class="cc-closed-amount-card cc-closed-amount-ok">
+      <div class="cc-closed-amount-value">$${Number(kpi.value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+      <div class="cc-closed-amount-label">Verified closed amount today</div>
+    </div>`;
+  }
+  if (kpi.data_quality === "zero") {
+    return `<div class="cc-closed-amount-card">
+      <div class="cc-closed-amount-value">$0.00</div>
+      <div class="cc-closed-amount-label">Verified closed amount today</div>
+    </div>`;
+  }
+  return `<div class="cc-closed-amount-card cc-closed-amount-incomplete">
+    <div class="cc-closed-amount-value">Closing data incomplete</div>
+    <div class="cc-closed-amount-label">Verified closed amount today -- ${kpi.numerator} of ${kpi.denominator} closed job(s) have a reliable numeric amount</div>
+  </div>`;
+}
+
+function ccAttentionItemHtml(item) {
+  const reasonLabels = {
+    not_dispatched_within_target: "Waiting beyond the review/assignment target",
+    stale_active_job: "No update in over the stale-job target",
+    whatsapp_observation_pending: "Real WhatsApp update waiting for review",
+  };
+  const reason = reasonLabels[item.type] || item.type;
+  const label = item.ticket ? `#${esc(item.ticket)}` : (item.group_name ? esc(item.group_name) : "WhatsApp update");
+  const age = item.age_minutes !== null && item.age_minutes !== undefined ? ageText(item.age_minutes) : "";
+  const targetScreen = item.type === "whatsapp_observation_pending" ? "active" : "jobs";
+  return `
+    <div class="cc-attention-row">
+      <div class="cc-attention-main">
+        <span class="cc-attention-ticket">${label}</span>
+        <span class="cc-attention-source">${esc(item.source || "")}</span>
+        ${age ? `<span class="cc-attention-age">${esc(age)}</span>` : ""}
+      </div>
+      <div class="cc-attention-reason">${esc(reason)}</div>
+      <button class="btn btn-secondary cc-small-btn" data-screen="${targetScreen}">${esc(item.primary_action || "Review")}</button>
+    </div>`;
+}
+
+function ccStageBadge(nextAction) {
+  if (nextAction === "Awaiting technician") return { label: "Waiting for technician", cls: "chip-waiting" };
+  if (nextAction === "Record closing") return { label: "Closing needed", cls: "chip-needs-action" };
+  return { label: "Assigned", cls: "chip-settled" };
+}
+
+function ccActiveRowHtml(j) {
+  const stage = ccStageBadge(j.next_action);
+  const ageMin = minutesSince(j.waiting_since);
+  return `
+    <tr>
+      <td><strong>${esc(j.ticket || "No ref")}</strong></td>
+      <td>${sourceChip(j.source)}</td>
+      <td>${esc(j.city || "")}</td>
+      <td>${notRecorded(j.technician_name)}</td>
+      <td><span class="chip ${stage.cls}">${stage.label}</span></td>
+      <td>${ageMin === null ? "--" : ageText(ageMin)}</td>
+      <td>${esc(j.next_action)}</td>
+      <td><button class="btn btn-secondary cc-small-btn" data-screen="active">Open</button></td>
+    </tr>`;
+}
+
+function ccActiveMobileCardHtml(j) {
+  const stage = ccStageBadge(j.next_action);
+  const ageMin = minutesSince(j.waiting_since);
+  return `
+    <div class="mobile-row job-card" data-screen="active">
+      <div class="row-top">${esc(j.ticket || "No ref")} ${sourceChip(j.source)} <span class="age">${ageMin === null ? "" : ageText(ageMin)}</span></div>
+      <div class="row-bottom">${esc(j.city || "")} · ${notRecorded(j.technician_name)}</div>
+      <div class="row-status"><span class="chip ${stage.cls}">${stage.label}</span></div>
+      <div class="row-next-action">${esc(j.next_action)}</div>
+    </div>`;
+}
+
+/* ------------------------------------------------------------- Charts -- */
+// Native SVG/CSS only -- no chart library dependency. Each function takes
+// only what the API already returned and renders it; none compute a KPI.
+
+const CC_CHART_COLORS = ["#2955d8", "#1f7d6f", "#9a5a12", "#c8323a", "#6b4fa0", "#0f2a4a"];
+
+function ccDonutChartSvg(counts) {
+  const entries = Object.entries(counts).filter(([, n]) => n > 0);
+  const total = entries.reduce((sum, [, n]) => sum + n, 0);
+  if (!total) return `<div class="empty-state">No jobs received yet today.</div>`;
+  const r = 54, cx = 60, cy = 60, circumference = 2 * Math.PI * r;
+  let offset = 0;
+  const arcs = entries.map(([label, n], i) => {
+    const frac = n / total;
+    const dash = frac * circumference;
+    const el = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${CC_CHART_COLORS[i % CC_CHART_COLORS.length]}" stroke-width="16" stroke-dasharray="${dash} ${circumference - dash}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})"></circle>`;
+    offset += dash;
+    return el;
+  }).join("");
+  const legend = entries.map(([label, n], i) => `
+    <div class="cc-legend-row"><span class="cc-legend-dot" style="background:${CC_CHART_COLORS[i % CC_CHART_COLORS.length]}"></span>${esc(label)} <strong>${n}</strong></div>
+  `).join("");
+  return `
+    <div class="cc-donut-wrap">
+      <svg viewBox="0 0 120 120" width="120" height="120">${arcs}</svg>
+      <div class="cc-legend">${legend}</div>
+    </div>`;
+}
+
+function ccPipelineBarsHtml(counts) {
+  const order = ["New", "Waiting", "Assigned", "Closing Due", "Completed", "Cancelled"];
+  const max = Math.max(1, ...order.map(k => counts[k] || 0));
+  return `<div class="cc-pipeline">` + order.map(label => {
+    const n = counts[label] || 0;
+    const pct = Math.round((n / max) * 100);
+    return `
+      <div class="cc-pipeline-row">
+        <div class="cc-pipeline-label">${esc(label)}</div>
+        <div class="cc-pipeline-track"><div class="cc-pipeline-fill" style="width:${pct}%"></div></div>
+        <div class="cc-pipeline-count">${n}</div>
+      </div>`;
+  }).join("") + `</div>
+  <div class="cc-chart-footnote">"En route" has no reliable signal in the real data yet -- those jobs currently show as Assigned.</div>`;
+}
+
+function ccTechActivityHtml(rows) {
+  if (!rows.length) return `<div class="empty-state">No technician activity recorded yet today.</div>`;
+  const max = Math.max(1, ...rows.map(t => t.jobs_assigned));
+  // Alphabetical, not ranked by volume -- this is an activity view, not a leaderboard.
+  const sorted = [...rows].sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="cc-pipeline">` + sorted.map(t => {
+    const pct = Math.round((t.jobs_assigned / max) * 100);
+    return `
+      <div class="cc-pipeline-row">
+        <div class="cc-pipeline-label">${esc(t.name)}</div>
+        <div class="cc-pipeline-track"><div class="cc-pipeline-fill" style="width:${pct}%"></div></div>
+        <div class="cc-pipeline-count">${t.jobs_assigned} assigned · ${t.jobs_completed} done</div>
+      </div>`;
+  }).join("") + `</div>`;
+}
+
+function ccClosingsChartHtml(kpi) {
+  if (kpi.data_quality === "ok") {
+    return `<div class="cc-closed-amount-card cc-closed-amount-ok" style="margin:0;">
+      <div class="cc-closed-amount-value">$${Number(kpi.value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+      <div class="cc-closed-amount-label">${kpi.numerator} verified closing(s) today</div>
+    </div>`;
+  }
+  if (kpi.data_quality === "zero") {
+    return `<div class="empty-state">No jobs closed yet today.</div>`;
+  }
+  return `<div class="empty-state">Closing data incomplete -- ${kpi.numerator} of ${kpi.denominator} closed job(s) have a reliable numeric amount. Not shown as a chart to avoid implying more confidence than the data supports.</div>`;
+}
+
+function renderCommandCenterScreen(dashboard, activeEntries) {
+  const k = dashboard.kpis;
+  document.getElementById("ccGeneratedAt").textContent = "As of " + new Date(dashboard.generated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+  const grid = document.getElementById("ccKpiGrid");
+  grid.innerHTML = [
+    ccKpiCardHtml("New jobs -- last 60 min", k.new_last_60_minutes, "jobs"),
+    ccKpiCardHtml("Waiting for assignment", k.waiting_for_assignment, "jobs"),
+    ccKpiCardHtml("Active with technician", k.active_with_technician, "active"),
+    ccKpiCardHtml("En route", k.en_route, "active"),
+    ccKpiCardHtml("Closings due", k.closings_due, "closings"),
+    ccKpiCardHtml("Completed today", k.completed_today, "history"),
+  ].join("");
+  wireScreenLinks(grid);
+
+  const closedAmountEl = document.getElementById("ccClosedAmount");
+  closedAmountEl.innerHTML = ccClosedAmountHtml(dashboard.verified_closed_amount_today);
+
+  const attentionList = document.getElementById("ccAttentionList");
+  const attentionEmpty = document.getElementById("ccAttentionEmpty");
+  if (dashboard.attention_now.length) {
+    attentionEmpty.style.display = "none";
+    attentionList.innerHTML = dashboard.attention_now.map(ccAttentionItemHtml).join("");
+    wireScreenLinks(attentionList);
+  } else {
+    attentionEmpty.style.display = "block";
+    attentionList.innerHTML = "";
+  }
+
+  const activeForBoard = activeEntries.filter(j => j.technician_name).slice(0, 8);
+  const activeTbody = document.getElementById("ccActiveTableBody");
+  const activeMobile = document.getElementById("ccActiveMobileList");
+  const activeEmpty = document.getElementById("ccActiveEmpty");
+  const activeViewAllWrap = document.getElementById("ccActiveViewAllWrap");
+  if (activeForBoard.length) {
+    activeEmpty.style.display = "none";
+    activeTbody.innerHTML = activeForBoard.map(ccActiveRowHtml).join("");
+    activeMobile.innerHTML = activeForBoard.map(ccActiveMobileCardHtml).join("");
+    wireScreenLinks(activeTbody);
+    wireScreenLinks(activeMobile);
+  } else {
+    activeEmpty.style.display = "block";
+    activeTbody.innerHTML = "";
+    activeMobile.innerHTML = "";
+  }
+  activeViewAllWrap.style.display = activeEntries.filter(j => j.technician_name).length > activeForBoard.length ? "inline" : "none";
+  wireScreenLinks(document.getElementById("ccActiveViewAllWrap"));
+  wireScreenLinks(document.getElementById("ccAttentionViewAllWrap"));
+
+  document.getElementById("ccSourceMixChart").innerHTML = ccDonutChartSvg(dashboard.charts.job_source_mix_today);
+  document.getElementById("ccPipelineChart").innerHTML = ccPipelineBarsHtml(dashboard.charts.job_pipeline_today);
+  document.getElementById("ccTechActivityChart").innerHTML = ccTechActivityHtml(dashboard.charts.technician_activity_today);
+  document.getElementById("ccClosingsChart").innerHTML = ccClosingsChartHtml(dashboard.charts.verified_closings_today);
 }
 
 /* =============================================================== ACTIVE */
