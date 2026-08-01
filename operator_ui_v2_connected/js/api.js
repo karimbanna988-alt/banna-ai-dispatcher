@@ -46,6 +46,12 @@ const Api = {
 
   getCommandCenter() { return this._call("GET", "/api/command_center"); },
 
+  getInboxReview(params) {
+    const q = new URLSearchParams(Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== null && v !== ""));
+    const qs = q.toString();
+    return this._call("GET", `/api/inbox_review${qs ? "?" + qs : ""}`);
+  },
+
   getNewJobs() { return this._call("GET", "/api/new_jobs"); },
   sync() { return this._call("POST", "/api/sync", {}); },
   getActive() { return this._call("GET", "/api/active"); },

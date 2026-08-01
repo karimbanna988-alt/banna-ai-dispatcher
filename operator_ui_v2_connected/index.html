@@ -127,31 +127,41 @@
           <div id="jobsShowMoreWrap" style="display:none; margin-top:8px;">
             <button class="btn btn-secondary btn-block" id="jobsShowMoreBtn"></button>
           </div>
-          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new jobs received in the last 60 minutes.</div>
+          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new actionable jobs received in the last 60 minutes.</div>
 
-          <div id="recentJobsSection" style="display:none;">
-            <div class="subsection-label">Needs review (received over an hour ago)</div>
-            <table class="data-table" id="recentJobsTable">
-              <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
-              <tbody id="recentJobsTableBody"></tbody>
-            </table>
-            <div class="mobile-row-list" id="recentJobsMobileList"></div>
+          <div class="jobs-archive-link-wrap">
+            <button class="btn btn-secondary btn-block" id="jobsArchiveLinkBtn" data-screen="archive">Archive / Inbox Review<span id="jobsArchiveLinkCount" class="jobs-archive-link-count"></span></button>
           </div>
-
-          <details class="disclosure" id="olderJobsDetails" style="margin-top:14px; display:none;">
-            <summary id="olderJobsSummary">Archive / Needs Review</summary>
-            <div class="scope-note" id="olderJobsScopeNote" style="margin-top:6px;"></div>
-            <div class="toolbar" style="margin-top:8px;">
-              <input type="text" id="olderJobsSearch" placeholder="Search ticket, company, city...">
-            </div>
-            <table class="data-table" id="olderJobsTable">
-              <thead><tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr></thead>
-              <tbody id="olderJobsTableBody"></tbody>
-            </table>
-            <div class="mobile-row-list" id="olderJobsMobileList"></div>
-          </details>
         </div>
         <div class="detail-pane" id="jobsDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ============================================== ARCHIVE / INBOX REVIEW -->
+    <!-- Historical inbound Quo/WhatsApp messages -- never labeled "jobs"
+         anywhere on this screen. These are raw messages pending or already
+         reviewed; most will never become a real job. Real, honest
+         server-side pagination -- see route_inbox_review. -->
+    <section class="screen" id="screen-archive">
+      <div class="section-title">
+        Archive / Inbox Review <span class="count" id="archiveCount"></span>
+      </div>
+      <div class="scope-note">Historical inbound messages -- not confirmed jobs. Most of these were never actioned into a real job; some may be duplicates, status chatter, or messages that never matched an existing job.</div>
+      <div class="toolbar">
+        <input type="text" id="archiveSearch" placeholder="Search message text or source...">
+        <label class="archive-filter-label"><input type="checkbox" id="archiveUnmatchedOnly"> Unmatched messages only</label>
+        <button class="btn btn-secondary" id="archiveSearchBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Search</button>
+      </div>
+      <table class="data-table" id="archiveTable">
+        <thead><tr><th>Received</th><th>Source</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody id="archiveTableBody"></tbody>
+      </table>
+      <div class="mobile-row-list" id="archiveMobileList"></div>
+      <div id="archiveEmptyState" class="empty-state" style="display:none;">No historical messages match this search.</div>
+      <div class="archive-pagination">
+        <button class="btn btn-secondary" id="archivePrevBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">&larr; Newer</button>
+        <span id="archivePageLabel" class="archive-page-label"></span>
+        <button class="btn btn-secondary" id="archiveNextBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Older &rarr;</button>
       </div>
     </section>
 

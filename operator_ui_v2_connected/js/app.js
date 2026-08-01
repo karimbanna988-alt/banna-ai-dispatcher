@@ -20,11 +20,9 @@ const state = {
   closingDraft: {},        // job_id -> in-progress technician-closing form values
   learningSelected: null,
   jobsShowAllLive: false,  // "Show N more" toggle for the live-jobs landing list
-  olderJobsSearch: "",     // client-side-only filter text for the Older jobs disclosure
 };
 
 let newJobsLive = [];
-let newJobsOlder = [];
 let activeJobs = [];
 let closingsEntries = [];
 let historyEntries = [];
@@ -108,11 +106,13 @@ function showApp() {
 function clearAllLocalData() {
   /* No PII stays behind after logout / session expiry -- every
      in-memory array and rendered pane is wiped, not just hidden. */
-  newJobsLive = []; newJobsOlder = []; activeJobs = []; closingsEntries = []; historyEntries = []; technicians = []; learningEpisodes = []; whatsappPending = [];
+  newJobsLive = []; newJobsTotalPending = 0; activeJobs = []; closingsEntries = []; historyEntries = []; technicians = []; learningEpisodes = []; whatsappPending = [];
+  archiveState.page = 1; archiveState.search = ""; archiveState.unmatchedOnly = false; archiveState.total = 0;
   state.jobsSelected = null; state.activeSelected = null; state.closingsSelected = null; state.historySelected = null; state.learningSelected = null;
   state.kRevealed = {}; state.activePreview = {}; state.activeRawText = {}; state.closingDraft = {};
-  state.jobsShowAllLive = false; state.olderJobsSearch = "";
-  ["jobsTableBody", "jobsMobileList", "recentJobsTableBody", "recentJobsMobileList", "olderJobsTableBody", "olderJobsMobileList", "jobsDetailPane",
+  state.jobsShowAllLive = false;
+  ["jobsTableBody", "jobsMobileList", "jobsDetailPane",
+   "archiveTableBody", "archiveMobileList",
    "activeTableBody", "activeMobileList", "activeDetailPane",
    "closingsTableBody", "closingsMobileList", "closingsDetailPane",
    "historyTableBody", "historyMobileList", "historyDetailPane",
@@ -225,6 +225,7 @@ function hideConfirmModal() {
 async function refreshAll() {
   if (state.screen === "commandcenter") await loadCommandCenter();
   else if (state.screen === "jobs") await loadJobs();
+  else if (state.screen === "archive") await loadArchive();
   else if (state.screen === "active") await loadActive();
   else if (state.screen === "closings") await loadClosings();
   else if (state.screen === "history") await loadHistory();
@@ -239,8 +240,11 @@ let newJobsTotalPending = 0;
 async function loadJobs() {
   const data = await callOrHandleAuth(() => Api.getNewJobs());
   if (!data) return;
+  // Jobs screen shows ONLY the last-60-minutes actionable window -- no
+  // automatic fallback to older messages. Archive / Inbox Review (a
+  // separate, real, paginated screen -- see loadArchive()) is where
+  // historical messages live now.
   newJobsLive = data.live;
-  newJobsOlder = data.older;
   newJobsTotalPending = data.total_pending_messages || 0;
   renderJobsScreen();
 }
@@ -256,7 +260,9 @@ document.getElementById("syncBtn").addEventListener("click", async () => {
   try {
     const result = await callOrHandleAuth(() => Api.sync());
     if (!result) return;
-    const label = result.queued === 1 ? "1 new job message" : `${result.queued} new job messages`;
+    // Deliberately "inbound messages", never "jobs" -- a synced message
+    // has not been reviewed or turned into a job yet.
+    const label = result.queued === 1 ? "1 new inbound message" : `${result.queued} new inbound messages`;
     msgEl.textContent = `Last Quo sync: ${nowTimeLabel()} · ${label}`;
     await loadJobs();
   } catch (e) {
@@ -264,7 +270,6 @@ document.getElementById("syncBtn").addEventListener("click", async () => {
   }
 });
 
-const RECENT_WINDOW_MINUTES = 24 * 60;
 const LIVE_DISPLAY_CAP = 5;
 
 function ageText(minutes) {
@@ -297,8 +302,15 @@ function jobPrimaryLabel(j) {
 }
 
 function renderJobsScreen() {
-  const allSelectable = newJobsLive.concat(newJobsOlder);
-  document.getElementById("jobsCount").textContent = `(${allSelectable.length})`;
+  // Jobs screen shows only the last-60-minutes actionable window --
+  // newJobsLive is the entire selectable population here, always. No
+  // fallback ever inserts an older message into this screen.
+  document.getElementById("jobsCount").textContent = `(${newJobsLive.length})`;
+
+  const archiveLinkCount = document.getElementById("jobsArchiveLinkCount");
+  if (archiveLinkCount) {
+    archiveLinkCount.textContent = newJobsTotalPending ? ` (${newJobsTotalPending})` : "";
+  }
 
   const tbody = document.getElementById("jobsTableBody");
   const mobileList = document.getElementById("jobsMobileList");
@@ -328,39 +340,13 @@ function renderJobsScreen() {
     }
   }
 
-  // "Needs review" only appears as a helpful fallback when there is
-  // nothing live to act on -- newest 3 incoming messages (still pending
-  // triage, not confirmed jobs) from the last 24 hours, always visible
-  // (not collapsed) so the landing list isn't empty for no reason.
-  const recentSection = document.getElementById("recentJobsSection");
-  let recent = [];
-  let olderForCollapsed = newJobsOlder;
-  if (!newJobsLive.length) {
-    recent = newJobsOlder.filter(j => j.age_minutes <= RECENT_WINDOW_MINUTES).slice(0, 3);
-    const recentIds = new Set(recent.map(j => j.message_id));
-    olderForCollapsed = newJobsOlder.filter(j => !recentIds.has(j.message_id));
-  }
-  if (recent.length) {
-    recentSection.style.display = "block";
-    const recentBody = document.getElementById("recentJobsTableBody");
-    const recentMobile = document.getElementById("recentJobsMobileList");
-    recentBody.innerHTML = recent.map(j => jobRowHtml(j, "recentJobsTableBody")).join("");
-    recentMobile.innerHTML = recent.map(j => jobMobileRowHtml(j)).join("");
-    wireJobRowClicks(recentBody, recentMobile);
-  } else {
-    recentSection.style.display = "none";
-  }
-
-  _olderJobsFull = olderForCollapsed;
-  renderOlderJobsSection();
-
-  // Never auto-select an older/recent job while a live job exists; if no
-  // live job exists, the dispatcher may still deliberately pick a recent
-  // or older one, but nothing is auto-selected on their behalf here.
-  if (!allSelectable.find(j => j.message_id === state.jobsSelected)) {
+  // Never auto-select a job the dispatcher hasn't chosen; if the
+  // previously-selected message fell out of the live window, clear the
+  // detail pane rather than silently substituting an older one.
+  if (!newJobsLive.find(j => j.message_id === state.jobsSelected)) {
     state.jobsSelected = newJobsLive.length ? newJobsLive[0].message_id : null;
   }
-  if (state.jobsSelected) renderJobDetail(state.jobsSelected, allSelectable);
+  if (state.jobsSelected) renderJobDetail(state.jobsSelected, newJobsLive);
   else { document.getElementById("jobsDetailPane").classList.remove("open"); document.getElementById("jobsDetailPane").innerHTML = ""; }
 }
 
@@ -369,46 +355,79 @@ document.getElementById("jobsShowMoreBtn").addEventListener("click", () => {
   renderJobsScreen();
 });
 
-// Older-jobs disclosure: a small client-side-only search filter, never a
-// new API call -- it filters the already-fetched newJobsOlder array.
-let _olderJobsFull = [];
-function renderOlderJobsSection() {
-  const olderDetails = document.getElementById("olderJobsDetails");
-  if (!_olderJobsFull.length) {
-    olderDetails.style.display = "none";
-    return;
-  }
-  olderDetails.style.display = "block";
-  const q = state.olderJobsSearch.trim().toLowerCase();
-  const filtered = q ? _olderJobsFull.filter(j => olderJobMatches(j, q)) : _olderJobsFull;
-  document.getElementById("olderJobsSummary").textContent = q
-    ? `Archive / Needs Review (${filtered.length} of ${_olderJobsFull.length} shown)`
-    : `Archive / Needs Review (${_olderJobsFull.length} shown)`;
-  // Honest about the cap: these are raw incoming messages pending triage,
-  // not a count of real unresolved jobs -- and only the newest 100 total
-  // pending messages are ever loaded here (see route_new_jobs's docstring).
-  const scopeNote = document.getElementById("olderJobsScopeNote");
-  if (scopeNote) {
-    scopeNote.textContent = newJobsTotalPending > _olderJobsFull.length + newJobsLive.length
-      ? `Showing the newest ${_olderJobsFull.length + newJobsLive.length} of ${newJobsTotalPending} total incoming messages pending triage. These are raw messages, not confirmed jobs.`
-      : `Incoming messages older than 60 minutes, pending triage. These are raw messages, not confirmed jobs.`;
-  }
-  const olderBody = document.getElementById("olderJobsTableBody");
-  const olderMobile = document.getElementById("olderJobsMobileList");
-  olderBody.innerHTML = filtered.map(j => jobRowHtml(j, "olderJobsTableBody")).join("");
-  olderMobile.innerHTML = filtered.map(j => jobMobileRowHtml(j)).join("");
-  wireJobRowClicks(olderBody, olderMobile);
+document.getElementById("jobsArchiveLinkBtn").addEventListener("click", () => setScreen("archive"));
+
+/* ==================================================== ARCHIVE / INBOX ==== */
+// Historical inbound messages -- never labeled as jobs anywhere on this
+// screen. Real, honest server-side pagination via /api/inbox_review (route_inbox_review),
+// which is a completely separate query path from the live Jobs triage
+// queue -- it never runs the correlation/dedup gate that would otherwise
+// hide "unmatched" messages, which is the whole point of this screen.
+const archiveState = { page: 1, pageSize: 25, search: "", unmatchedOnly: false, total: 0 };
+
+async function loadArchive() {
+  const data = await callOrHandleAuth(() => Api.getInboxReview({
+    page: archiveState.page, page_size: archiveState.pageSize,
+    search: archiveState.search, unmatched_only: archiveState.unmatchedOnly ? "1" : "",
+  }));
+  if (!data) return;
+  archiveState.total = data.total;
+  renderArchiveScreen(data.messages);
 }
 
-function olderJobMatches(j, q) {
-  return [j.ticket, j.source, j.service, j.city, j.state, j.technician_name]
-    .some(v => (v || "").toString().toLowerCase().includes(q));
+function archiveRowHtml(m) {
+  return `
+    <tr>
+      <td>${esc(ageText(minutesSince(m.received_at)) || "")}</td>
+      <td>${esc(m.source)}</td>
+      <td><span class="chip chip-waiting">${esc(m.status)}</span></td>
+      <td>${esc(m.text_preview)}</td>
+    </tr>`;
 }
 
-const olderJobsSearchInput = document.getElementById("olderJobsSearch");
-olderJobsSearchInput.addEventListener("input", () => {
-  state.olderJobsSearch = olderJobsSearchInput.value;
-  renderOlderJobsSection();
+function archiveMobileCardHtml(m) {
+  return `
+    <div class="mobile-row">
+      <div class="row-top">${esc(m.source)} <span class="chip chip-waiting">${esc(m.status)}</span> <span class="age">${esc(ageText(minutesSince(m.received_at)) || "")}</span></div>
+      <div class="row-bottom">${esc(m.text_preview)}</div>
+    </div>`;
+}
+
+function renderArchiveScreen(messages) {
+  const totalPages = Math.max(1, Math.ceil(archiveState.total / archiveState.pageSize));
+  document.getElementById("archiveCount").textContent = `(${archiveState.total} total)`;
+  document.getElementById("archivePageLabel").textContent = `Page ${archiveState.page} of ${totalPages}`;
+  document.getElementById("archivePrevBtn").disabled = archiveState.page <= 1;
+  document.getElementById("archiveNextBtn").disabled = archiveState.page >= totalPages;
+
+  const tbody = document.getElementById("archiveTableBody");
+  const mobileList = document.getElementById("archiveMobileList");
+  const emptyState = document.getElementById("archiveEmptyState");
+  if (!messages.length) {
+    tbody.innerHTML = "";
+    mobileList.innerHTML = "";
+    emptyState.style.display = "block";
+  } else {
+    emptyState.style.display = "none";
+    tbody.innerHTML = messages.map(archiveRowHtml).join("");
+    mobileList.innerHTML = messages.map(archiveMobileCardHtml).join("");
+  }
+}
+
+document.getElementById("archiveSearchBtn").addEventListener("click", () => {
+  archiveState.search = document.getElementById("archiveSearch").value.trim();
+  archiveState.unmatchedOnly = document.getElementById("archiveUnmatchedOnly").checked;
+  archiveState.page = 1;
+  loadArchive();
+});
+document.getElementById("archiveSearch").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("archiveSearchBtn").click();
+});
+document.getElementById("archivePrevBtn").addEventListener("click", () => {
+  if (archiveState.page > 1) { archiveState.page -= 1; loadArchive(); }
+});
+document.getElementById("archiveNextBtn").addEventListener("click", () => {
+  archiveState.page += 1; loadArchive();
 });
 
 function jobRowHtml(j, bodyId) {
@@ -442,7 +461,7 @@ function selectJob(mid) {
   state.jobsSelected = mid;
   renderJobsScreen();
   if (isMobile()) {
-    const j = newJobsLive.concat(newJobsOlder).find(x => x.message_id === mid);
+    const j = newJobsLive.find(x => x.message_id === mid);
     if (j) { openSheet(jobDetailHtml(j)); wireJobDetailActions(j); }
   }
 }
@@ -542,7 +561,7 @@ function wireJobDetailActions(j) {
 }
 
 async function handleJobAction(action, mid) {
-  const j = newJobsLive.concat(newJobsOlder).find(x => x.message_id === mid);
+  const j = newJobsLive.find(x => x.message_id === mid);
   if (!j) return;
   try {
     if (action === "reveal_k") {
@@ -608,7 +627,7 @@ const _origShowConfirmModal = showConfirmModal;
 showConfirmModal = function (html) {
   _origShowConfirmModal(html);
   const mid = state.jobsSelected;
-  const j = newJobsLive.concat(newJobsOlder).find(x => x.message_id === mid);
+  const j = newJobsLive.find(x => x.message_id === mid);
   if (j) wireConfirmModal(j);
 };
 

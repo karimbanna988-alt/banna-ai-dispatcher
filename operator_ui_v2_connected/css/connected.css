@@ -143,3 +143,10 @@
 .cc-pipeline-fill { background: var(--primary); height: 100%; border-radius: 999px; }
 .cc-pipeline-count { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; }
 .cc-chart-footnote { color: var(--text-muted); font-size: 10.5px; margin-top: 8px; font-style: italic; }
+
+/* -------------------------------------------------- Archive / Inbox Review */
+.jobs-archive-link-wrap { margin-top: 16px; }
+.jobs-archive-link-count { color: var(--text-muted); font-weight: 500; margin-left: 4px; }
+.archive-filter-label { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.archive-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
+.archive-page-label { font-size: 12px; color: var(--text-muted); font-weight: 600; }
