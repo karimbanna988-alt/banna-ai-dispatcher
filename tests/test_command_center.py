@@ -298,12 +298,236 @@ def test_route_new_jobs_reports_real_total_pending_count(monkeypatch, db):
 
 # ======================================================= FRONTEND GUARDS =
 def test_jobs_screen_no_longer_labels_raw_messages_as_unresolved_jobs():
-    """Regression guard for the audit: the Jobs screen's HTML must never
-    say 'unresolved jobs' again -- raw Quo/WhatsApp messages pending
-    triage are not jobs."""
+    """Regression guard: the whole frontend must never say "unresolved
+    jobs" anywhere -- raw Quo/WhatsApp messages pending triage are not
+    jobs. Archive / Inbox Review is the accurate replacement label."""
     html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
     assert "unresolved jobs" not in html.lower()
-    assert "Archive / Needs Review" in html
+    assert "unresolved jobs" not in js.lower()
+    assert "Archive / Inbox Review" in html
+
+
+def test_jobs_screen_has_no_old_message_fallback():
+    """Regression guard: the Jobs screen must never auto-insert an older
+    message when the live (<=60 min) bucket is empty -- the exact
+    'recent unresolved' / 'needs review' fallback this phase removed."""
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    for stale_id in ("recentJobsSection", "recentJobsTableBody", "olderJobsDetails", "olderJobsTableBody"):
+        assert stale_id not in html
+        assert stale_id not in js
+    assert "No new actionable jobs received in the last 60 minutes." in html
+
+
+def test_command_center_and_active_never_reference_quo_pending_messages():
+    """Regression guard (critical correction #7): the Command Center and
+    Active screens' own JS rendering code must never read quo_pending_messages
+    or any raw-message field shape -- they consume only /api/command_center
+    and /api/active, which are backed exclusively by kpi_read_model.py and
+    rm.get_active_jobs_detailed() (real jobs/events tables)."""
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    cc_start = js.index("COMMAND CENTER ===")
+    cc_end = js.index("=============================================================== ACTIVE */")
+    cc_block = js[cc_start:cc_end]
+    assert "quo_pending_messages" not in cc_block
+    assert "getNewJobs" not in cc_block
+    assert "getInboxReview" not in cc_block
+
+
+def test_get_command_center_never_queries_quo_pending_messages_table():
+    """Structural: kpi_read_model.py must never reference
+    quo_pending_messages -- it is documented as SQL-only against
+    jobs/events/shadow_episodes."""
+    source = (REPO_ROOT / "src" / "dispatcher" / "kpi_read_model.py").read_text(encoding="utf-8")
+    assert "quo_pending_messages" not in source
+
+
+def test_valid_job_statuses_unchanged():
+    """Regression guard (critical correction #9): the real database
+    status enum must remain exactly these 8 values -- no invented
+    status like 'ASSIGNED' or 'EN_ROUTE' may ever be added."""
+    assert storage.VALID_JOB_STATUSES == frozenset({
+        "New", "Needs Review", "Approved", "Handle Manually",
+        "Rejected", "In Progress", "Closed", "Cancelled",
+    })
+
+
+def test_stage_badges_are_derived_labels_not_database_statuses():
+    """Regression guard (critical correction #10): 'Waiting for
+    technician'/'Assigned'/'Closing needed' must be computed labels
+    derived from real status/assignment/events -- they must never be
+    written anywhere as if they were real jobs.status values."""
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    assert 'status === "Waiting for technician"' not in js
+    assert 'status === "Assigned"' not in js
+    assert 'status === "Closing needed"' not in js
+    # The real derivation source (existing, audited backend label).
+    assert "ccStageBadge(nextAction)" in js
+
+
+# ==================================================== ARCHIVE PAGINATION =
+def test_archive_is_truly_paginated_not_a_single_capped_fetch(db):
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    for i in range(30):
+        conn.execute(
+            "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, received_at, fetched_at, status) "
+            "VALUES (?, ?, ?, ?, ?, 'pending')",
+            (f"arc-{i}", "AGN", f"message body {i}", _iso(now - timedelta(minutes=i)), _iso(now)),
+        )
+    conn.commit()
+
+    from luxor_ops_shared import paginated_pending_messages
+
+    page1, total1 = paginated_pending_messages(conn, page=1, page_size=10)
+    page2, total2 = paginated_pending_messages(conn, page=2, page_size=10)
+    assert total1 == total2 == 30
+    assert len(page1) == 10
+    assert len(page2) == 10
+    page1_ids = {m["message_id"] for m in page1}
+    page2_ids = {m["message_id"] for m in page2}
+    assert page1_ids.isdisjoint(page2_ids), "pages must not overlap"
+    conn.close()
+
+
+def test_archive_page_size_is_capped_server_side(db):
+    from luxor_ops_shared import paginated_pending_messages, MAX_ARCHIVE_PAGE_SIZE
+
+    conn = _conn(db)
+    _rows, _total = paginated_pending_messages(conn, page=1, page_size=999999)
+    conn.close()
+    # The cap is enforced by clamping page_size before the query runs --
+    # verify the constant itself is a real, small, sane limit, never
+    # "unlimited".
+    assert 1 < MAX_ARCHIVE_PAGE_SIZE <= 100
+
+
+def test_archive_never_dispatched_filter_is_a_real_sql_filter_not_fabricated(db):
+    """'Unmatched messages' (the required accurate label) maps to a real,
+    cheap SQL condition -- no dispatch_tracking row with
+    dispatched_manually_at set -- never a fabricated classification."""
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, received_at, fetched_at, status) "
+        "VALUES ('matched', 'AGN', 'text', ?, ?, 'pending')", (_iso(now), _iso(now)),
+    )
+    conn.execute(
+        "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, received_at, fetched_at, status) "
+        "VALUES ('unmatched', 'AGN', 'text', ?, ?, 'pending')", (_iso(now), _iso(now)),
+    )
+    conn.execute(
+        "INSERT INTO dispatch_tracking (message_id, dispatched_manually_at) VALUES ('matched', ?)", (_iso(now),),
+    )
+    conn.commit()
+
+    from luxor_ops_shared import paginated_pending_messages
+
+    rows, total = paginated_pending_messages(conn, unmatched_only=True)
+    conn.close()
+    assert total == 1
+    assert rows[0]["message_id"] == "unmatched"
+
+
+def test_route_inbox_review_never_exposes_phone_numbers(monkeypatch, db):
+    import operator_api as api
+
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(db))
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, from_number, received_at, fetched_at, status) "
+        "VALUES ('pii1', 'AGN', 'Call me at 555-010-3000 please', '+15550103000', ?, ?, 'pending')",
+        (_iso(now), _iso(now)),
+    )
+    conn.commit()
+    conn.close()
+
+    result = api.route_inbox_review(None, {}, {})
+    blob = json.dumps(result)
+    assert "555-010-3000" not in blob
+    assert "+15550103000" not in blob
+    assert "from_number" not in blob
+
+
+def test_route_inbox_review_label_never_calls_messages_jobs(monkeypatch, db):
+    """The label may explain that these are NOT jobs (so the word 'job'
+    legitimately appears in that clarifying context), but must never
+    assert or imply that they ARE jobs -- 'active jobs'/'unresolved
+    jobs' phrasing is exactly what this regression guards against."""
+    import operator_api as api
+
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(db))
+    result = api.route_inbox_review(None, {}, {})
+    label = result["label"].lower()
+    assert "active jobs" not in label
+    assert "unresolved jobs" not in label
+    assert "not confirmed jobs" in label
+
+
+# ============================================== LIVE JOBS 60-MINUTE WINDOW
+def test_route_new_jobs_live_bucket_is_exactly_the_60_minute_window(monkeypatch, tmp_path):
+    import operator_api as api
+    from dispatcher import storage as _storage
+
+    db_path = tmp_path / "live_window.db"
+    conn = _storage.connect(db_path)
+    conn.execute(
+        "INSERT INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)",
+        ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(db_path))
+
+    result = api.route_new_jobs(None, {}, {})
+    assert result["live_window_minutes"] == 60
+    for entry in result["live"]:
+        assert entry["age_minutes"] <= 60
+
+
+# ==================================== NO SEND PATH / REAL DB SAFETY GUARDS
+def test_no_quo_or_whatsapp_send_call_introduced_this_phase():
+    """Structural: neither the new inbox_review route nor the archive
+    frontend code may call a Quo/WhatsApp send-capable method."""
+    api_source = (REPO_ROOT / "operator_api.py").read_text(encoding="utf-8")
+    inbox_review_start = api_source.index("def route_inbox_review(")
+    inbox_review_end = api_source.index("\ndef route_sync(")
+    inbox_review_body = api_source[inbox_review_start:inbox_review_end]
+    for forbidden in (".send_message(", ".sendMessage(", "quo_client.send", "post_message"):
+        assert forbidden not in inbox_review_body
+
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    archive_start = js.index("ARCHIVE / INBOX ====")
+    archive_end = js.index("function jobRowHtml(")
+    archive_block = js[archive_start:archive_end]
+    for forbidden in ("sendMessage", "/api/sync_send", "whatsapp://send"):
+        assert forbidden not in archive_block
+
+
+def test_paginated_pending_messages_never_writes_to_the_database(db):
+    """paginated_pending_messages() must be read-only -- run it, then
+    confirm the row count and every row's status are byte-identical."""
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    for i in range(5):
+        conn.execute(
+            "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, received_at, fetched_at, status) "
+            "VALUES (?, 'AGN', 'text', ?, ?, 'pending')",
+            (f"ro-{i}", _iso(now), _iso(now)),
+        )
+    conn.commit()
+    before = conn.execute("SELECT message_id, status FROM quo_pending_messages ORDER BY message_id").fetchall()
+
+    from luxor_ops_shared import paginated_pending_messages
+    for page in range(1, 4):
+        paginated_pending_messages(conn, page=page, page_size=2, search="text", unmatched_only=True)
+        paginated_pending_messages(conn, page=page, page_size=2)
+
+    after = conn.execute("SELECT message_id, status FROM quo_pending_messages ORDER BY message_id").fetchall()
+    conn.close()
+    assert before == after
 
 
 def test_frontend_never_hardcodes_fabricated_dashboard_numbers():

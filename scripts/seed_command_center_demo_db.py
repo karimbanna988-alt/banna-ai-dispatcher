@@ -126,7 +126,26 @@ def seed(db_path: Path) -> None:
         "text": "job done, customer paid cash",
     })
 
-    print(f"Seeded demo DB at {db_path}: jobs {job1}, {job2}, {job3}, {job4}; technicians {tech_a}, {tech_b}.")
+    # 30 extra raw historical messages, direct inserts (never through the
+    # route pipeline -- these deliberately never become jobs), purely to
+    # give Archive / Inbox Review real pagination to demonstrate. Ages
+    # spread from 2 to 60 hours so they're all well outside the 60-minute
+    # Jobs-screen window.
+    conn = storage.connect(db_path)
+    now = datetime.now(timezone.utc)
+    for i in range(30):
+        received = (now - timedelta(hours=2 + i)).isoformat().replace("+00:00", "Z")
+        conn.execute(
+            "INSERT INTO quo_pending_messages (message_id, group_label, raw_text, from_number, received_at, fetched_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (f"demo-archive-{i}", "AGN" if i % 2 == 0 else "MAINLEADS",
+             f"Historical demo message #{i} -- status update chatter, never actioned.",
+             "+15550109900", received, received),
+        )
+    conn.commit()
+    conn.close()
+
+    print(f"Seeded demo DB at {db_path}: jobs {job1}, {job2}, {job3}, {job4}; technicians {tech_a}, {tech_b}; 30 archive messages.")
 
 
 if __name__ == "__main__":
