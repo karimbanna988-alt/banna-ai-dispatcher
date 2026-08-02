@@ -15,7 +15,10 @@
     <div class="login-sub">Dispatch Command Center</div>
     <div class="form-field">
       <label>Password</label>
-      <input type="password" id="loginPassword" autocomplete="current-password">
+      <div class="login-password-wrap">
+        <input type="password" id="loginPassword" autocomplete="current-password">
+        <button type="button" class="login-password-toggle" id="loginPasswordToggle" aria-label="Show password">&#128065;</button>
+      </div>
     </div>
     <button class="btn btn-primary btn-block" id="loginSubmitBtn">
       <span id="loginSubmitLabel">Log in</span>

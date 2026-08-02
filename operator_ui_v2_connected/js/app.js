@@ -137,7 +137,12 @@ async function attemptLogin() {
     await Api.login(password);
     showApp();
   } catch (e) {
-    showLogin(e.message || "Login failed.");
+    // Distinguish "the server said no" (a real, specific message like
+    // "Invalid password.") from "we couldn't reach the server at all"
+    // (a generic browser-level fetch failure) -- so a dispatcher isn't
+    // told "invalid password" when the real problem is connectivity.
+    const unreachable = e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(e.message || "");
+    showLogin(unreachable ? "Can't reach the server. Check your connection and try again." : (e.message || "Login failed."));
   } finally {
     btn.disabled = false;
     label.textContent = "Log in";
@@ -145,6 +150,15 @@ async function attemptLogin() {
 }
 document.getElementById("loginSubmitBtn").addEventListener("click", attemptLogin);
 document.getElementById("loginPassword").addEventListener("keydown", (e) => { if (e.key === "Enter") attemptLogin(); });
+document.getElementById("loginPasswordToggle").addEventListener("click", () => {
+  const input = document.getElementById("loginPassword");
+  const btn = document.getElementById("loginPasswordToggle");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  btn.textContent = showing ? "\u{1F441}" : "\u{1F576}";
+  btn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+  input.focus();
+});
 
 async function attemptLogout() {
   try { await Api.logout(); } catch (e) { /* already expired/logged out -- fine, still show login */ }
