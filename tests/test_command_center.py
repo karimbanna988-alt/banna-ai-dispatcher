@@ -169,12 +169,15 @@ def test_job_pipeline_counts_are_mutually_exclusive(db):
     targets = kpi.load_targets()
     _insert_job(conn, "P1", "AGN", status="New", created_at=_iso(now - timedelta(minutes=5)))  # New
     _insert_job(conn, "P2", "AGN", status="New", created_at=_iso(now - timedelta(minutes=90)))  # Waiting (>30min target)
-    _insert_job(conn, "P3", "AGN", status="Approved")  # Assigned
-    _insert_job(conn, "P4", "AGN", status="In Progress")  # Closing Due
-    _insert_job(conn, "P5", "AGN", status="Closed", updated_at=_iso(now))  # Completed
+    _insert_job(conn, "P3", "AGN", status="Approved")  # Approved / Assigned
+    _insert_job(conn, "P4", "AGN", status="In Progress")  # In Progress / Closing Due
+    _insert_job(conn, "P5", "AGN", status="Closed", updated_at=_iso(now))  # Closed
     _insert_job(conn, "P6", "AGN", status="Cancelled", created_at=_iso(now))  # Cancelled
     counts = kpi.job_pipeline_counts(conn, now - timedelta(hours=1), now + timedelta(hours=1), now, targets)
-    assert counts == {"New": 1, "Waiting": 1, "Assigned": 1, "Closing Due": 1, "Completed": 1, "Cancelled": 1}
+    assert counts == {
+        "New": 1, "Waiting": 1, "Approved / Assigned": 1,
+        "In Progress / Closing Due": 1, "Closed": 1, "Cancelled": 1,
+    }
     conn.close()
 
 
@@ -205,6 +208,27 @@ def test_attention_now_with_age_caps_at_five(db):
     conn.close()
 
 
+def test_attention_now_with_age_sorts_most_urgent_first(db):
+    """Sort by urgency (Phase 6C Part 4): the oldest (most overdue) real
+    exception must come first, and the 5 kept after capping must be the
+    5 oldest -- not just the first 5 attention_now() happened to return."""
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    targets = kpi.load_targets()
+    # Insert 6 stale-active jobs with distinct, increasing staleness so
+    # only the 5 oldest should survive the cap, in oldest-first order.
+    for i in range(6):
+        stale_at = now - timedelta(minutes=200 + i * 10)
+        _insert_job(conn, f"U{i}", "AGN", status="Approved", last_event_at=_iso(stale_at), updated_at=_iso(stale_at))
+    result = kpi._attention_now_with_age(conn, now, targets)
+    ages = [item["age_minutes"] for item in result]
+    assert ages == sorted(ages, reverse=True)
+    assert len(result) == 5
+    # The single newest (least urgent, i=0) must have been dropped by the cap.
+    assert not any(item["ticket"] == "U0" for item in result)
+    conn.close()
+
+
 # ==================================================== GET_COMMAND_CENTER ==
 def test_get_command_center_never_exposes_customer_pii(db):
     """No phone/address/customer-name field anywhere in the composed
@@ -230,7 +254,28 @@ def test_get_command_center_deterministic_across_two_calls(db):
     second = kpi.get_command_center(conn, now=now)
     conn.close()
     assert first["kpis"] == second["kpis"]
-    assert first["charts"]["job_pipeline_today"] == second["charts"]["job_pipeline_today"]
+    assert first["charts"]["job_pipeline"] == second["charts"]["job_pipeline"]
+
+
+def test_get_command_center_rejects_unknown_chart_period(db):
+    conn = _conn(db)
+    with pytest.raises(ValueError):
+        kpi.get_command_center(conn, chart_period="not-a-real-period")
+    conn.close()
+
+
+def test_get_command_center_chart_period_affects_only_charts_not_top_kpis(db):
+    """The top KPI cards (Part 3) always stay 'today'/'right now' -- only
+    the charts section (Part 6) honors chart_period."""
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    _insert_job(conn, "CP1", "AGN", status="Closed", updated_at=_iso(now - timedelta(days=10)))
+    today_view = kpi.get_command_center(conn, now=now, chart_period="today")
+    month_view = kpi.get_command_center(conn, now=now, chart_period="30d")
+    conn.close()
+    assert today_view["kpis"] == month_view["kpis"]
+    assert today_view["charts"]["job_pipeline"]["Closed"] == 0
+    assert month_view["charts"]["job_pipeline"]["Closed"] == 1
 
 
 def test_get_command_center_composes_only_existing_functions_not_duplicate_sql():
@@ -264,8 +309,27 @@ def test_route_command_center_returns_real_shape(monkeypatch, db):
     assert set(result.keys()) >= {"kpis", "verified_closed_amount_today", "attention_now", "charts"}
     assert set(result["kpis"].keys()) == {
         "new_last_60_minutes", "waiting_for_assignment", "active_with_technician",
-        "en_route", "closings_due", "completed_today",
+        "in_progress_en_route", "closings_due", "completed_today",
     }
+    assert set(result["charts"].keys()) == {
+        "job_source_mix", "job_pipeline", "technician_activity", "verified_closings",
+    }
+
+
+def test_route_command_center_accepts_chart_period_query_param(monkeypatch, db):
+    import operator_api as api
+
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(db))
+    result = api.route_command_center(None, {}, {"chart_period": "30d"})
+    assert result["period"]["chart_period"] == "30d"
+
+
+def test_route_command_center_rejects_invalid_chart_period(monkeypatch, db):
+    import operator_api as api
+
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(db))
+    with pytest.raises(api.ApiError):
+        api.route_command_center(None, {}, {"chart_period": "not-a-real-period"})
 
 
 def test_route_command_center_merges_whatsapp_pending_into_attention(monkeypatch, db):
@@ -577,3 +641,60 @@ def test_login_screen_has_command_center_branding():
     login_block = html[html.index('id="loginScreen"'):html.index('id="appShell"')]
     assert "Dispatch Command Center" in login_block
     assert "LUXOR" in login_block
+
+
+# =================================================== PHASE 6C: VISUAL/UX ==
+def test_login_screen_has_a_password_visibility_toggle():
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    login_block = html[html.index('id="loginScreen"'):html.index('id="appShell"')]
+    assert 'id="loginPasswordToggle"' in login_block
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    assert "loginPasswordToggle" in js
+    assert 'input.type = showing ? "password" : "text"' in js
+
+
+def test_login_distinguishes_network_failure_from_invalid_password():
+    """Part 1 requires a distinct 'server unavailable' state, not just
+    whatever generic message the server's own 401 body happens to say."""
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    attempt_start = js.index("async function attemptLogin(")
+    attempt_end = js.index("\ndocument.getElementById(\"loginSubmitBtn\")")
+    block = js[attempt_start:attempt_end]
+    assert "unreachable" in block
+    assert "Can't reach the server" in block
+
+
+def test_command_center_has_a_chart_period_selector():
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    assert 'id="ccChartPeriodSelect"' in html
+    for expected_value in ('"today"', '"shift"', '"7d"', '"30d"'):
+        assert expected_value.strip('"') in html
+
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    assert "ccChartPeriodSelect" in js
+    assert "getCommandCenter(ccState.chartPeriod)" in js
+
+
+def test_mobile_bottom_nav_has_safe_area_clearance_in_main_content():
+    """Part 10: 'mobile bottom navigation does not cover content' --
+    main-content must reserve space for the fixed bottom nav at mobile
+    widths."""
+    css = (REPO_ROOT / "operator_ui_v2_connected" / "css" / "styles.css").read_text(encoding="utf-8")
+    assert "safe-area-inset-bottom" in css
+    assert ".main-content" in css
+
+
+def test_in_progress_en_route_kpi_is_a_real_number_not_fabricated(db):
+    """The Phase 6C 'In progress / en route' card must be backed by the
+    real closings_due_count() (status='In Progress') -- never a made-up
+    'en route' figure. See kpi_read_model.get_command_center()'s own
+    comment for why this intentionally matches the Closings due card."""
+    conn = _conn(db)
+    now = datetime.now(timezone.utc)
+    tech = _insert_technician(conn)
+    _insert_job(conn, "IP1", "AGN", status="In Progress", technician_id=tech)
+    dashboard = kpi.get_command_center(conn, now=now)
+    conn.close()
+    assert dashboard["kpis"]["in_progress_en_route"]["value"] == 1
+    assert dashboard["kpis"]["in_progress_en_route"]["value"] == dashboard["kpis"]["closings_due"]["value"]
+    assert dashboard["kpis"]["in_progress_en_route"]["data_quality"] in ("ok", "zero")
