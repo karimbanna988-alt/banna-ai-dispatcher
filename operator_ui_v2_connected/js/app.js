@@ -899,11 +899,19 @@ function renderCommandCenterScreen(dashboard, activeEntries) {
   wireScreenLinks(document.getElementById("ccActiveViewAllWrap"));
   wireScreenLinks(document.getElementById("ccAttentionViewAllWrap"));
 
-  document.getElementById("ccSourceMixChart").innerHTML = ccDonutChartSvg(dashboard.charts.job_source_mix_today);
-  document.getElementById("ccPipelineChart").innerHTML = ccPipelineBarsHtml(dashboard.charts.job_pipeline_today);
-  document.getElementById("ccTechActivityChart").innerHTML = ccTechActivityHtml(dashboard.charts.technician_activity_today);
-  document.getElementById("ccClosingsChart").innerHTML = ccClosingsChartHtml(dashboard.charts.verified_closings_today);
+  const periodSelect = document.getElementById("ccChartPeriodSelect");
+  if (periodSelect && periodSelect.value !== ccState.chartPeriod) periodSelect.value = ccState.chartPeriod;
+
+  document.getElementById("ccSourceMixChart").innerHTML = ccDonutChartSvg(dashboard.charts.job_source_mix);
+  document.getElementById("ccPipelineChart").innerHTML = ccPipelineBarsHtml(dashboard.charts.job_pipeline);
+  document.getElementById("ccTechActivityChart").innerHTML = ccTechActivityHtml(dashboard.charts.technician_activity);
+  document.getElementById("ccClosingsChart").innerHTML = ccClosingsChartHtml(dashboard.charts.verified_closings);
 }
+
+document.getElementById("ccChartPeriodSelect").addEventListener("change", (e) => {
+  ccState.chartPeriod = e.target.value;
+  loadCommandCenter();
+});
 
 /* =============================================================== ACTIVE */
 let whatsappPending = [];

@@ -90,21 +90,30 @@
       <div class="mobile-row-list" id="ccActiveMobileList"></div>
       <div id="ccActiveEmpty" class="empty-state" style="display:none;">No active jobs with a technician right now.</div>
 
+      <div class="cc-section-header">
+        <div class="subsection-label">Charts</div>
+        <select id="ccChartPeriodSelect" class="cc-period-select">
+          <option value="today" selected>Today</option>
+          <option value="shift">Current shift</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+      </div>
       <div class="cc-charts-grid">
         <div class="perf-card cc-chart-card">
-          <div class="subsection-label">Job source mix -- today</div>
+          <div class="subsection-label">Job source mix</div>
           <div id="ccSourceMixChart"></div>
         </div>
         <div class="perf-card cc-chart-card">
-          <div class="subsection-label">Job pipeline -- today</div>
+          <div class="subsection-label">Job pipeline</div>
           <div id="ccPipelineChart"></div>
         </div>
         <div class="perf-card cc-chart-card">
-          <div class="subsection-label">Technician activity -- today</div>
+          <div class="subsection-label">Technician activity</div>
           <div id="ccTechActivityChart"></div>
         </div>
         <div class="perf-card cc-chart-card">
-          <div class="subsection-label">Verified closings -- today</div>
+          <div class="subsection-label">Verified closings</div>
           <div id="ccClosingsChart"></div>
         </div>
       </div>

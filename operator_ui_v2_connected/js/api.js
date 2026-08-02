@@ -44,7 +44,10 @@ const Api = {
   },
   checkSession() { return this._call("GET", "/api/me"); },
 
-  getCommandCenter() { return this._call("GET", "/api/command_center"); },
+  getCommandCenter(chartPeriod) {
+    const qs = chartPeriod ? `?chart_period=${encodeURIComponent(chartPeriod)}` : "";
+    return this._call("GET", `/api/command_center${qs}`);
+  },
 
   getInboxReview(params) {
     const q = new URLSearchParams(Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== null && v !== ""));
