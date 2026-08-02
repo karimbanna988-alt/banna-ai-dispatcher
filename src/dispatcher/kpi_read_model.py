@@ -579,14 +579,21 @@ def verified_closed_amount(conn: sqlite3.Connection, start: datetime, end: datet
     return _kpi(round(total, 2), reliable, len(job_ids), len(job_ids), DQ_OK, f"${total:,.2f} verified across {reliable} closed job(s).")
 
 
-def job_pipeline_counts(conn: sqlite3.Connection, today_start: datetime, today_end: datetime, now: datetime, targets: dict, source=None, area=None) -> dict:
+def job_pipeline_counts(conn: sqlite3.Connection, period_start: datetime, period_end: datetime, now: datetime, targets: dict, source=None, area=None) -> dict:
     """Mutually-exclusive pipeline-stage snapshot for the Command
-    Center's pipeline chart. New/Waiting/Assigned/Closing Due are
-    current-state snapshots (a job that's still open isn't naturally
-    'today'-bound, matching jobs_waiting_over_target/closings_due_count's
-    own snapshot semantics); Completed/Cancelled are scoped to today so
-    the chart doesn't accumulate all-time history. No fabricated 'En
-    route' bucket -- see en_route_count()."""
+    Center's pipeline chart. New/Waiting/Approved-Assigned/In-Progress-
+    are-Closing-Due are current-state snapshots (a job that's still open
+    isn't naturally period-bound, matching jobs_waiting_over_target/
+    closings_due_count's own snapshot semantics); Closed/Cancelled are
+    scoped to the selected period so the chart doesn't accumulate
+    all-time history. "In Progress" and "Closing Due" are intentionally
+    ONE bucket, not two: in the real schema, status='In Progress' IS the
+    exact population closings_due_count() already surfaces (a job
+    reaching In Progress is simultaneously "being worked" and "awaiting
+    its closing") -- there is no real field distinguishing "actively en
+    route" from "closing due" within that status, and inventing one
+    would violate "do not create new database statuses". No fabricated
+    'En route'-only bucket -- see en_route_count()."""
     dispatch_target = targets["dispatch_target_minutes"]
     where, params = _build_job_filters(source, area, status_in=["New", "Needs Review"])
     rows = conn.execute(f"SELECT created_at FROM jobs j WHERE 1=1{where}", params).fetchall()
@@ -602,29 +609,31 @@ def job_pipeline_counts(conn: sqlite3.Connection, today_start: datetime, today_e
     assigned_where, assigned_params = _build_job_filters(source, area, status_in=["Approved"])
     assigned_count = conn.execute(f"SELECT COUNT(*) FROM jobs j WHERE 1=1{assigned_where}", assigned_params).fetchone()[0]
 
-    closing_due = closings_due_count(conn, source, area)["value"]
-    completed_today = completed_jobs(conn, today_start, today_end, source, area)["value"]
+    in_progress_closing_due = closings_due_count(conn, source, area)["value"]
+    closed_in_period = completed_jobs(conn, period_start, period_end, source, area)["value"]
 
     cancelled_where, cancelled_params = _build_job_filters(source, area, status_in=["Cancelled"])
     cancelled_sql = f"SELECT COUNT(*) FROM jobs j WHERE j.created_at >= ? AND j.created_at < ?{cancelled_where}"
-    cancelled_today = conn.execute(cancelled_sql, [_iso_z(today_start), _iso_z(today_end), *cancelled_params]).fetchone()[0]
+    cancelled_in_period = conn.execute(cancelled_sql, [_iso_z(period_start), _iso_z(period_end), *cancelled_params]).fetchone()[0]
 
     return {
         "New": new_count,
         "Waiting": waiting_count,
-        "Assigned": assigned_count,
-        "Closing Due": closing_due,
-        "Completed": completed_today,
-        "Cancelled": cancelled_today,
+        "Approved / Assigned": assigned_count,
+        "In Progress / Closing Due": in_progress_closing_due,
+        "Closed": closed_in_period,
+        "Cancelled": cancelled_in_period,
     }
 
 
 def _attention_now_with_age(conn: sqlite3.Connection, now: datetime, targets: dict) -> list:
-    """attention_now(), capped to 5 and enriched with age_minutes for the
-    Command Center's display -- a small additive lookup local to this
-    function only, so attention_now()'s own return shape (and the
-    Performance screen/tests that already depend on it) stays unchanged."""
-    items = attention_now(conn, now, targets)[:5]
+    """attention_now(), enriched with age_minutes, sorted oldest-first
+    (most urgent first) and THEN capped to 5 -- so the 5 shown are truly
+    the most urgent, not just the first 5 attention_now() happened to
+    return. A small additive lookup local to this function only, so
+    attention_now()'s own return shape (and the Performance screen/tests
+    that already depend on it) stays unchanged."""
+    items = attention_now(conn, now, targets)
     for item in items:
         row = conn.execute("SELECT created_at, last_event_at, updated_at FROM jobs WHERE id = ?", [item["job_id"]]).fetchone()
         age_minutes = None
@@ -634,42 +643,70 @@ def _attention_now_with_age(conn: sqlite3.Connection, now: datetime, targets: di
             if reference:
                 age_minutes = max(0, int((now - reference).total_seconds() // 60))
         item["age_minutes"] = age_minutes
-    return items
+    items.sort(key=lambda i: i["age_minutes"] if i["age_minutes"] is not None else -1, reverse=True)
+    return items[:5]
 
 
-def get_command_center(conn: sqlite3.Connection, now: Optional[datetime] = None, source: Optional[str] = None, area: Optional[str] = None) -> dict:
+COMMAND_CENTER_CHART_PERIODS = ("shift", "today", "7d", "30d")
+
+
+def get_command_center(
+    conn: sqlite3.Connection, now: Optional[datetime] = None, source: Optional[str] = None,
+    area: Optional[str] = None, chart_period: str = "today",
+) -> dict:
     """Single orchestrator for the boss-facing Command Center screen.
     Every metric below is either an existing function from this module
     called as-is, or a small new function defined immediately above --
     nothing here re-implements SQL or business logic that already exists
     elsewhere in this file. See docs/command_center.md for the exact
-    definition behind every field."""
+    definition behind every field.
+
+    The top KPI cards (Part 3 of the phase brief) are always "right
+    now"/"today" -- they never move with chart_period, matching the
+    brief's literal wording ("Completed today", "Verified closed amount
+    today"). Only the charts section (Part 6) honors chart_period, one
+    of "today"/"shift" (both = today so far, America/New_York),
+    "7d" (last 7 days), "30d" (last 30 days)."""
     targets = load_targets()
     now = now or datetime.now(timezone.utc)
     today_start, today_end = resolve_period("shift", now, targets)
+    if chart_period not in COMMAND_CENTER_CHART_PERIODS:
+        raise ValueError(f"chart_period must be one of {COMMAND_CENTER_CHART_PERIODS}")
+    chart_start, chart_end = resolve_period("shift" if chart_period in ("today", "shift") else chart_period, now, targets)
     min_sample = targets["min_sample_size"]
+
+    # "In progress / en route" and "Closings due" intentionally share one
+    # real number (closings_due_count() = status='In Progress'): the real
+    # schema has no field distinguishing "actively en route" from
+    # "closing due" within that status -- see en_route_count()'s own
+    # docstring for why that distinction is not fabricated. Both cards
+    # are honest about the same real population, not a bug.
+    in_progress = closings_due_count(conn, source, area)
 
     return {
         "generated_at": _iso_z(now),
-        "period": {"today_start": today_start.isoformat(), "today_end": today_end.isoformat()},
+        "period": {
+            "today_start": today_start.isoformat(), "today_end": today_end.isoformat(),
+            "chart_period": chart_period, "chart_start": chart_start.isoformat(), "chart_end": chart_end.isoformat(),
+        },
         "targets": targets,
         "kpis": {
             "new_last_60_minutes": new_jobs_recent(conn, now, window_minutes=60, source=source, area=area),
             "waiting_for_assignment": jobs_waiting_over_target(conn, now, targets, source, area),
             "active_with_technician": active_with_technician_count(conn, source, area),
-            "en_route": en_route_count(conn),
+            "in_progress_en_route": in_progress,
             "closings_due": closings_due_count(conn, source, area),
             "completed_today": completed_jobs(conn, today_start, today_end, source, area),
         },
         "verified_closed_amount_today": verified_closed_amount(conn, today_start, today_end, source, area),
         "attention_now": _attention_now_with_age(conn, now, targets),
         "charts": {
-            "job_source_mix_today": new_jobs_by_source(conn, today_start, today_end, area),
-            "job_pipeline_today": job_pipeline_counts(conn, today_start, today_end, now, targets, source, area),
-            "technician_activity_today": [
-                t for t in technicians_summary(conn, today_start, today_end, min_sample) if t["jobs_assigned"] > 0
+            "job_source_mix": new_jobs_by_source(conn, chart_start, chart_end, area),
+            "job_pipeline": job_pipeline_counts(conn, chart_start, chart_end, now, targets, source, area),
+            "technician_activity": [
+                t for t in technicians_summary(conn, chart_start, chart_end, min_sample) if t["jobs_assigned"] > 0
             ],
-            "verified_closings_today": verified_closed_amount(conn, today_start, today_end, source, area),
+            "verified_closings": verified_closed_amount(conn, chart_start, chart_end, source, area),
         },
     }
 

@@ -1016,10 +1016,19 @@ def route_command_center(handler: "Handler", match: dict, body: dict) -> dict:
     docstring) is a real WhatsApp observation waiting for review -- that
     lives in whatsapp_bridge_adapter's in-memory queue, the same source
     route_whatsapp_pending already reads. Merged in here, capped at 5
-    total attention items, never a second WhatsApp queue invented."""
+    total attention items, never a second WhatsApp queue invented.
+
+    chart_period (query param, GET): one of
+    kpi_read_model.COMMAND_CENTER_CHART_PERIODS ("today"/"shift"/"7d"/
+    "30d") -- affects only the charts section; the top KPI cards always
+    stay "right now"/"today" regardless."""
+    chart_period = body.get("chart_period") or "today"
     conn = get_conn()
     try:
-        dashboard = kpi_read_model.get_command_center(conn)
+        try:
+            dashboard = kpi_read_model.get_command_center(conn, chart_period=chart_period)
+        except ValueError as exc:
+            raise ApiError(400, str(exc)) from exc
         remaining = 5 - len(dashboard["attention_now"])
         if remaining > 0:
             for observation in whatsapp_bridge_adapter.list_pending()[:remaining]:
