@@ -6,13 +6,22 @@ const { handleIncomingMessage } = require("../src/messageHandler");
 
 function fakeDeps(overrides = {}) {
   const posted = [];
+  const seenMarked = [];
+  const enqueued = [];
+  const dequeued = [];
   return {
-    config: { allowlistFile: "fake-allowlist", dedupeFile: "fake-dedupe" },
+    config: { allowlistFile: "fake-allowlist", dedupeFile: "fake-dedupe", retryQueueFile: "fake-retry-queue" },
     isApproved: overrides.isApproved || (() => true),
-    markIfNew: overrides.markIfNew || (() => true),
+    isSeen: overrides.isSeen || (() => false),
+    markSeen: overrides.markSeen || ((file, id) => { seenMarked.push(id); return true; }),
+    enqueueRetry: overrides.enqueueRetry || ((file, obs) => { enqueued.push(obs); }),
+    dequeueRetry: overrides.dequeueRetry || ((file, id) => { dequeued.push(id); }),
     postObservation: overrides.postObservation || (async (config, obs) => { posted.push(obs); return { ok: true }; }),
     log: () => {},
     _posted: posted,
+    _seenMarked: seenMarked,
+    _enqueued: enqueued,
+    _dequeued: dequeued,
   };
 }
 
@@ -50,13 +59,14 @@ test("a message from a non-allowlisted group is ignored and never forwarded", as
 });
 
 test("a duplicate message id (already seen) is ignored and never forwarded twice", async () => {
-  const deps = fakeDeps({ markIfNew: () => false });
+  const deps = fakeDeps({ isSeen: () => true });
   const result = await handleIncomingMessage(
     { id: "m1", isGroupMessage: true, groupId: "g@g.us", text: "hi", timestamp: 1 },
     deps,
   );
   assert.equal(result.forwarded, false);
   assert.equal(result.reason, "duplicate");
+  assert.equal(deps._posted.length, 0);
 });
 
 test("an allowlisted, new, group message is forwarded with its extracted ticket guess", async () => {
@@ -90,6 +100,72 @@ test("no ticket found -> extractedTicket is null, message is still forwarded (ne
   );
   assert.equal(result.forwarded, true);
   assert.equal(result.extractedTicket, null);
+});
+
+// ============================== LIVE RECEIVE FIX: ORDERING GUARANTEES ====
+// Regression coverage for the real live-pilot failure: a message was
+// received and deduped by the bridge, but the adapter rejected it (see
+// tests/test_whatsapp_bridge_adapter.py for the matching Python-side
+// timestamp-type bug) and the failure was silently swallowed -- the
+// message was already marked "seen" before delivery was even attempted,
+// so it was unrecoverable. These tests pin the corrected ordering.
+
+test("adapter unavailable (throws): the message is enqueued for retry but NOT marked seen", async () => {
+  const deps = fakeDeps({ postObservation: async () => { throw new Error("ECONNREFUSED"); } });
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "PDL: A100 done", timestamp: 1 },
+    deps,
+  );
+  assert.equal(result.forwarded, false);
+  assert.equal(result.reason, "adapter_delivery_failed");
+  assert.deepEqual(deps._seenMarked, []); // never marked seen
+  assert.equal(deps._enqueued.length, 1); // durably captured for retry
+  assert.deepEqual(deps._dequeued, []); // never dequeued -- it was never delivered
+});
+
+test("adapter returns non-2xx (postObservation rejects): message remains retryable, not marked seen", async () => {
+  const deps = fakeDeps({ postObservation: async () => { throw new Error("adapter rejected observation: 400 bad timestamp"); } });
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "hi", timestamp: 1 },
+    deps,
+  );
+  assert.equal(result.forwarded, false);
+  assert.deepEqual(deps._seenMarked, []);
+  assert.equal(deps._enqueued.length, 1);
+});
+
+test("successful delivery: message is enqueued first, delivered, then marked seen and dequeued -- in that order", async () => {
+  const callOrder = [];
+  const deps = fakeDeps({
+    enqueueRetry: () => callOrder.push("enqueue"),
+    postObservation: async () => { callOrder.push("post"); return { ok: true }; },
+    markSeen: () => { callOrder.push("markSeen"); return true; },
+    dequeueRetry: () => callOrder.push("dequeue"),
+  });
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "hi", timestamp: 1 },
+    deps,
+  );
+  assert.equal(result.forwarded, true);
+  assert.deepEqual(callOrder, ["enqueue", "post", "markSeen", "dequeue"]);
+});
+
+test("a message that quotes an earlier one forwards quotedMessageId to the adapter", async () => {
+  const deps = fakeDeps();
+  await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "k", timestamp: 1, quotedMessageId: "original-post-id" },
+    deps,
+  );
+  assert.equal(deps._posted[0].quotedMessageId, "original-post-id");
+});
+
+test("a message with no quoted message forwards quotedMessageId as null", async () => {
+  const deps = fakeDeps();
+  await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "hi", timestamp: 1 },
+    deps,
+  );
+  assert.equal(deps._posted[0].quotedMessageId, null);
 });
 
 test("never changes job status or attaches to anything -- this module has no such function to call", async () => {

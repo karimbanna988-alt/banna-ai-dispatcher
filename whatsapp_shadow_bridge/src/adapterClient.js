@@ -36,6 +36,7 @@ async function postObservation(config, observation, fetchImpl = fetch) {
       message_id: observation.messageId,
       text: observation.text,
       extracted_ticket: observation.extractedTicket || null,
+      quoted_message_id: observation.quotedMessageId || null,
     }),
   });
   if (!res.ok) {

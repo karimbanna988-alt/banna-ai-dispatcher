@@ -39,6 +39,7 @@ test("state.paired is false before the ready callback fires", () => {
     runPairing,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   assert.equal(state.paired, false);
@@ -51,6 +52,7 @@ test("state.paired becomes true only after the ready callback fires", () => {
     runPairing,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   assert.equal(state.paired, false);
@@ -65,6 +67,7 @@ test("getGroups is not exposed until after ready", () => {
     runPairing,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   assert.equal(state.getGroups, null, "getGroups must be null before ready");
@@ -78,6 +81,7 @@ test("disconnect resets paired to false and clears getGroups", () => {
     runPairing,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   getHooks().onReady();
@@ -93,6 +97,7 @@ test("auth failure resets paired to false and clears getGroups", () => {
     runPairing,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   getHooks().onReady();
@@ -119,6 +124,7 @@ test("getGroups, once ready, returns only id and name for groups (no history/par
     runPairing: wrapped,
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   captured.hooks.onReady();
@@ -134,6 +140,7 @@ test("bridge disabled: paired stays false, getGroups stays null, no pairing atte
     runPairing: () => { pairingCalled = true; },
     initializeBridge: () => {},
     createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
   assert.equal(pairingCalled, false);

@@ -11,7 +11,7 @@ const { createHealthServer } = require("./healthServer");
 
 /**
  * @param {string[]} argv
- * @param {object} deps - injectable for tests: { config, runPairing, initializeBridge, createHealthServer }.
+ * @param {object} deps - injectable for tests: { config, runPairing, initializeBridge, createHealthServer, startRetryDrainLoop }.
  *   Defaults to the real implementations/real env-derived config; tests
  *   pass a fake config and fakes for the rest so no real whatsapp-web.js
  *   Client, real environment variable, or network call is ever needed.
@@ -30,6 +30,13 @@ function main(argv = process.argv.slice(2), deps = {}) {
     console.log("No WhatsApp session will be opened. Pass --pair with WHATSAPP_SHADOW_ENABLED=true to pair explicitly.");
     return { server, client: null, state };
   }
+
+  // Redelivers anything left in the durable retry queue from a prior
+  // run (adapter was down, etc.) -- independent of WhatsApp pairing
+  // state, since draining only needs the Python adapter to be
+  // reachable, not a live WhatsApp session.
+  const startRetryDrainLoop = deps.startRetryDrainLoop || require("./retryDrain").startRetryDrainLoop;
+  startRetryDrainLoop(config, { log: console.log });
 
   if (!argv.includes("--pair")) {
     console.log("Bridge is enabled but --pair was not passed -- staying idle. Run with --pair to begin pairing.");

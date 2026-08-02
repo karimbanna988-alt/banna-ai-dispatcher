@@ -19,7 +19,8 @@
 
 const { handleIncomingMessage } = require("./messageHandler");
 const { isApproved } = require("./allowlist");
-const { markIfNew } = require("./dedupeStore");
+const { isSeen, markSeen } = require("./dedupeStore");
+const { enqueue: enqueueRetry, dequeue: dequeueRetry } = require("./deliveryQueue");
 const { postObservation } = require("./adapterClient");
 
 function initializeBridge(config, options = {}) {
@@ -63,6 +64,20 @@ function initializeBridge(config, options = {}) {
   client.on("message", async (msg) => {
     try {
       const chat = await msg.getChat();
+      // Best-effort only: if this message is a reply, capture which
+      // message it quotes so a technician's reply (e.g. "k" under a
+      // dispatch post) can later be correlated back to that job. Never
+      // fetches anything beyond this one message's own quoted-message
+      // reference -- not a history fetch.
+      let quotedMessageId = null;
+      if (msg.hasQuotedMsg) {
+        try {
+          const quoted = await msg.getQuotedMessage();
+          quotedMessageId = quoted && quoted.id ? quoted.id._serialized : null;
+        } catch (quoteErr) {
+          quotedMessageId = null;
+        }
+      }
       const message = {
         id: msg.id && msg.id._serialized,
         groupId: chat.isGroup ? chat.id._serialized : null,
@@ -72,8 +87,9 @@ function initializeBridge(config, options = {}) {
         text: msg.body,
         isGroupMessage: !!chat.isGroup,
         fromMe: !!msg.fromMe,
+        quotedMessageId,
       };
-      await handleIncomingMessage(message, { config, isApproved, markIfNew, postObservation, log });
+      await handleIncomingMessage(message, { config, isApproved, isSeen, markSeen, enqueueRetry, dequeueRetry, postObservation, log });
     } catch (err) {
       log(`WhatsApp Shadow Bridge: error handling incoming message: ${err.message}`);
     }

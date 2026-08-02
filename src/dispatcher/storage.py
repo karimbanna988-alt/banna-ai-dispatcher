@@ -183,6 +183,7 @@ _SCHEMA_MARKERS: tuple = (
     ("dispatch_tracking", None),
     ("console_activation_state", None),
     ("quo_pending_messages", None),
+    ("whatsapp_pending_observations", None),
 )
 
 # Deliberately NOT part of _SCHEMA_MARKERS/check_schema_status(): those
@@ -354,6 +355,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_idempotency_and_schema_version_support(conn)
     _add_dispatch_tracking_support(conn)
     _add_console_activation_support(conn)
+    _add_whatsapp_pending_observations_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -1127,6 +1129,137 @@ def reset_live_queue_boundary(conn: sqlite3.Connection, note: str = "Manual rese
     )
     conn.commit()
     return now
+
+
+def _add_whatsapp_pending_observations_support(conn: sqlite3.Connection) -> None:
+    """Durable replacement for whatsapp_bridge_adapter.py's previous
+    in-memory-only pending queue. An observation the adapter has
+    accepted must survive a CRM process restart; a Python module-level
+    list cannot do that. Deduplication by message_id is enforced here
+    (UNIQUE + INSERT OR IGNORE) instead of a separate in-memory seen-set
+    -- one source of truth, not two that could drift. Still never
+    written to by the bridge itself (only via the adapter's HTTP layer,
+    unchanged), and still never auto-attached to a job -- job_id stays
+    NULL until a human explicitly attaches it via the existing connected
+    UI flow."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_pending_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL UNIQUE,
+            group_id TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            sender TEXT,
+            direction TEXT NOT NULL DEFAULT 'incoming',
+            whatsapp_timestamp TEXT,
+            text TEXT NOT NULL,
+            extracted_ticket TEXT,
+            quoted_message_id TEXT,
+            correlated_job_id INTEGER,
+            job_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            human_review_needed INTEGER NOT NULL DEFAULT 0,
+            human_review_reason TEXT,
+            received_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_pending_observations_quoted "
+        "ON whatsapp_pending_observations(quoted_message_id)"
+    )
+    conn.commit()
+
+
+_WHATSAPP_OBSERVATION_COLUMNS = (
+    "message_id", "group_id", "group_name", "sender", "direction", "timestamp",
+    "text", "extracted_ticket", "quoted_message_id", "correlated_job_id", "job_id",
+    "status", "human_review_needed", "human_review_reason", "received_at", "created_at",
+)
+
+
+def add_whatsapp_observation(conn: sqlite3.Connection, observation: dict) -> dict:
+    """Durably inserts one captured WhatsApp observation. message_id is
+    UNIQUE, so a retry of the same message_id is a safe no-op (reports
+    duplicate=True) rather than a second row -- exactly-once storage,
+    enforced by the database itself, not by a caller-side check-then-act
+    that could race. If quoted_message_id matches an earlier
+    observation that already has a job_id, that job_id is copied here as
+    correlated_job_id -- a hint surfaced to the operator, never an
+    automatic attach or status change."""
+    now = _now()
+    correlated_job_id = None
+    if observation.get("quoted_message_id"):
+        row = conn.execute(
+            "SELECT job_id FROM whatsapp_pending_observations WHERE message_id = ? AND job_id IS NOT NULL",
+            (observation["quoted_message_id"],),
+        ).fetchone()
+        if row:
+            correlated_job_id = row[0]
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO whatsapp_pending_observations "
+        "(message_id, group_id, group_name, sender, direction, whatsapp_timestamp, text, extracted_ticket, "
+        "quoted_message_id, correlated_job_id, status, human_review_needed, human_review_reason, received_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            observation["message_id"], observation["group_id"], observation["group_name"],
+            observation.get("sender"), observation.get("direction", "incoming"),
+            observation.get("timestamp"), observation["text"], observation.get("extracted_ticket"),
+            observation.get("quoted_message_id"), correlated_job_id, "pending",
+            1 if observation.get("human_review_needed") else 0, observation.get("human_review_reason"),
+            now, now,
+        ),
+    )
+    conn.commit()
+    return {"accepted": True, "duplicate": cur.rowcount == 0}
+
+
+def _whatsapp_observation_row_to_dict(row) -> dict:
+    d = dict(zip(_WHATSAPP_OBSERVATION_COLUMNS, row))
+    d["human_review_needed"] = bool(d["human_review_needed"])
+    return d
+
+
+def list_whatsapp_pending_observations(conn: sqlite3.Connection, include_resolved: bool = False) -> list:
+    where = "" if include_resolved else "WHERE status = 'pending'"
+    rows = conn.execute(
+        "SELECT message_id, group_id, group_name, sender, direction, whatsapp_timestamp, "
+        "text, extracted_ticket, quoted_message_id, correlated_job_id, job_id, status, "
+        f"human_review_needed, human_review_reason, received_at, created_at FROM whatsapp_pending_observations {where} "
+        "ORDER BY id ASC"
+    ).fetchall()
+    return [_whatsapp_observation_row_to_dict(r) for r in rows]
+
+
+def get_whatsapp_observation(conn: sqlite3.Connection, message_id: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT message_id, group_id, group_name, sender, direction, whatsapp_timestamp, "
+        "text, extracted_ticket, quoted_message_id, correlated_job_id, job_id, status, "
+        "human_review_needed, human_review_reason, received_at, created_at "
+        "FROM whatsapp_pending_observations WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    return _whatsapp_observation_row_to_dict(row) if row else None
+
+
+def resolve_whatsapp_observation(conn: sqlite3.Connection, message_id: str, status: str, job_id: Optional[int] = None) -> Optional[dict]:
+    """Marks an observation resolved (e.g. status='attached') and, only
+    when the caller explicitly supplies one (the human-driven attach
+    flow), records the real job_id it was attached to -- this is what
+    lets a later quoted-reply correlate back to the right job."""
+    if job_id is not None:
+        conn.execute(
+            "UPDATE whatsapp_pending_observations SET status = ?, job_id = ? WHERE message_id = ?",
+            (status, job_id, message_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE whatsapp_pending_observations SET status = ? WHERE message_id = ?",
+            (status, message_id),
+        )
+    conn.commit()
+    return get_whatsapp_observation(conn, message_id)
 
 
 # Module-level clock, swappable only by tests (production always uses

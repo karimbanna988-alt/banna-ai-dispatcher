@@ -848,7 +848,14 @@ import whatsapp_bridge_adapter as bridge_adapter  # noqa: E402
 
 
 @pytest.fixture()
-def clean_bridge_state():
+def clean_bridge_state(api_env):
+    """Depends on api_env (not just tmp_path) so OPERATOR_API_DB_PATH is
+    always pointed at a throwaway database before any test in this
+    section calls add_observation() -- that function now durably writes
+    to whatsapp_pending_observations via storage.py, so an unset env var
+    here would silently write test rows into the real data/dispatcher.db.
+    Fixture sharing means this is a no-op re-set for tests that also
+    request api_env directly (e.g. to seed a real job first)."""
     bridge_adapter._reset_state_for_tests()
     yield
     bridge_adapter._reset_state_for_tests()

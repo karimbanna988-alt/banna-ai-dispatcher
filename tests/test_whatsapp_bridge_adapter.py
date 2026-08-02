@@ -1,9 +1,10 @@
 """Focused tests for whatsapp_bridge_adapter.py -- the narrow,
 localhost-only listener between the isolated Node.js WhatsApp Shadow
 Bridge and the Python dispatcher. No real WhatsApp session, no real
-network beyond loopback HTTP the test itself drives, no real database
-write anywhere in this file (this module never touches
-data/dispatcher.db at all -- see its own module docstring)."""
+network beyond loopback HTTP the test itself drives. Every test points
+OPERATOR_API_DB_PATH at a fresh tmp_path database -- never the real
+data/dispatcher.db -- exercising the same real whatsapp_pending_observations
+table storage.py provisions in production, not a mock."""
 
 from __future__ import annotations
 
@@ -15,12 +16,14 @@ import time
 import pytest
 
 import whatsapp_bridge_adapter as adapter
+from dispatcher import storage
 
 
 @pytest.fixture()
-def clean_adapter_state(monkeypatch):
-    adapter._reset_state_for_tests()
+def clean_adapter_state(monkeypatch, tmp_path):
     monkeypatch.setenv(adapter.ADAPTER_SECRET_ENV_VAR, "test-bridge-secret")
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(tmp_path / "adapter_test.db"))
+    adapter._reset_state_for_tests()
     yield
     adapter._reset_state_for_tests()
 
@@ -198,16 +201,19 @@ def test_adapter_module_never_imports_a_whatsapp_client_library():
         assert not any(bad in line for line in import_lines)
 
 
-def test_adapter_module_owns_no_dispatcher_database_sql():
-    """This module must never write to the real dispatcher database --
-    it only ever holds observations in memory until a human, via the
-    existing operator_api.py commercial/save route, does so through
-    DispatcherService."""
+def test_adapter_module_never_writes_jobs_or_events_or_calls_dispatcher_service():
+    """This module durably stores observations in its own dedicated
+    table (whatsapp_pending_observations, via storage.py's accessor
+    functions) but must never write to jobs/events directly and must
+    never call DispatcherService -- attaching an observation to a real
+    job stays the existing, human-driven operator_api.py commercial/save
+    route, untouched by this module."""
     import pathlib
 
     source = pathlib.Path("whatsapp_bridge_adapter.py").read_text(encoding="utf-8")
-    for forbidden in ("import sqlite3", "INSERT INTO", "storage.connect", "dispatcher.storage"):
-        assert forbidden not in source
+    assert "import sqlite3" not in source  # all SQL stays inside storage.py
+    for forbidden in ("INSERT INTO jobs", "INSERT INTO events", "UPDATE jobs", "UPDATE events", "DispatcherService("):
+        assert forbidden not in source  # mentioning it in prose (docstrings/comments) is fine; calling it is not
 
 
 # ============================================= SECRET LOADING / NO ROTATION
@@ -287,3 +293,161 @@ def test_bridge_launch_scripts_load_the_env_file_before_starting_node():
     for name in ("start_pairing.ps1", "start_normal.ps1"):
         source = (scripts_dir / name).read_text(encoding="utf-8")
         assert pattern.search(source), f"{name} must load whatsapp_shadow_bridge/.env before starting the bridge"
+
+
+# ==================================================== LIVE RECEIVE FIX ====
+# Regression coverage for the real live-pilot failure (2026-08-02, ticket
+# JO5O-N7JA never appeared in the CRM): whatsapp-web.js's real
+# Message.timestamp is a numeric Unix epoch, never a string -- the
+# original validate_observation() demanded a string and silently 400'd
+# every real message while every test (including this file's own
+# `valid_payload()` default) used a string fixture that never matched
+# real bridge traffic. Combined with the Node-side bug where the dedupe
+# file was marked "seen" before delivery was even attempted, the message
+# was received, deduped, permanently rejected by the adapter, and lost.
+def test_validate_observation_accepts_a_real_numeric_timestamp(clean_adapter_state):
+    """whatsapp-web.js's Message.timestamp is a number -- this is the
+    exact real payload shape, not the string fixture every other test
+    in this file (deliberately) still uses for backward compatibility."""
+    cleaned = adapter.validate_observation(valid_payload(timestamp=1700000000))
+    assert cleaned["timestamp"] == "1700000000"
+
+
+def test_add_observation_accepts_a_real_numeric_timestamp_end_to_end(clean_adapter_state):
+    result = adapter.add_observation(valid_payload(message_id="numeric-ts", timestamp=1700000000))
+    assert result["accepted"] is True
+    pending = adapter.list_pending()
+    assert len(pending) == 1
+    assert pending[0]["timestamp"] == "1700000000"
+
+
+def test_validate_observation_rejects_boolean_timestamp(clean_adapter_state):
+    """A bool is technically an int subclass in Python -- must not be
+    silently accepted as a real timestamp."""
+    with pytest.raises(adapter.AdapterError):
+        adapter.validate_observation(valid_payload(timestamp=True))
+
+
+# --------------------------------------------- DURABLE STORAGE / RESTART --
+def test_add_observation_persists_to_the_real_table_not_memory(clean_adapter_state):
+    adapter.add_observation(valid_payload())
+    conn = storage.connect(adapter._db_path())
+    try:
+        row = conn.execute(
+            "SELECT message_id, status FROM whatsapp_pending_observations WHERE message_id = ?",
+            ("wamid.ABC123",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[1] == "pending"
+
+
+def test_accepted_observation_survives_a_simulated_crm_restart(clean_adapter_state):
+    """A restart re-opens storage.connect() against the same on-disk
+    file -- nothing in this module's own state (there is none left) can
+    lose the row. Simulated here by simply opening a brand-new
+    connection to the same path, exactly like a fresh operator_api.py
+    process would."""
+    adapter.add_observation(valid_payload())
+    fresh_conn = storage.connect(adapter._db_path())
+    try:
+        pending_after_restart = storage.list_whatsapp_pending_observations(fresh_conn)
+    finally:
+        fresh_conn.close()
+    assert len(pending_after_restart) == 1
+    assert pending_after_restart[0]["message_id"] == "wamid.ABC123"
+
+
+def test_duplicate_message_id_never_creates_a_second_row(clean_adapter_state):
+    adapter.add_observation(valid_payload())
+    adapter.add_observation(valid_payload())
+    adapter.add_observation(valid_payload())
+    conn = storage.connect(adapter._db_path())
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM whatsapp_pending_observations WHERE message_id = ?", ("wamid.ABC123",)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_invalid_payload_never_creates_a_phantom_pending_row(clean_adapter_state):
+    """A rejected (400) request must leave no trace -- the Node bridge
+    does not mark a rejected message as seen, so it stays retryable; the
+    Python side must not have quietly stored a partial/invalid row
+    either."""
+    bad_payload = valid_payload()
+    del bad_payload["timestamp"]
+    with pytest.raises(adapter.AdapterError):
+        adapter.add_observation(bad_payload)
+    assert adapter.list_pending(include_resolved=True) == []
+
+
+# ------------------------------------------------- QUOTED-REPLY CORRELATION
+def test_technician_reply_quoting_an_attached_job_message_is_correlated(clean_adapter_state):
+    """A technician's reply (e.g. "k") that quotes the original dispatch
+    message must surface the job it was attached to -- a hint for the
+    operator, never an automatic status change or attach."""
+    adapter.add_observation(valid_payload(message_id="original-job-post"))
+    adapter.resolve_observation("original-job-post", "attached", job_id=42)
+
+    reply = adapter.add_observation(valid_payload(
+        message_id="tech-reply-1", text="k", quoted_message_id="original-job-post",
+    ))
+    assert reply["accepted"] is True
+    stored = adapter.get_observation("tech-reply-1")
+    assert stored["correlated_job_id"] == 42
+    assert stored["job_id"] is None  # correlation is a hint, never an auto-attach
+
+
+def test_reply_quoting_a_never_attached_message_has_no_correlation(clean_adapter_state):
+    adapter.add_observation(valid_payload(message_id="original-job-post"))
+    # Never attached -- no job_id recorded against it.
+    reply = adapter.add_observation(valid_payload(
+        message_id="tech-reply-1", text="k", quoted_message_id="original-job-post",
+    ))
+    assert reply["accepted"] is True
+    stored = adapter.get_observation("tech-reply-1")
+    assert stored["correlated_job_id"] is None
+
+
+# --------------------------------------------------- ACKNOWLEDGEMENT-ONLY --
+def test_bare_acknowledgement_reply_is_flagged_for_human_review_not_ignored():
+    """'k' has no deterministic, tested business meaning -- it must never
+    be silently dropped nor invented into a real technician status. It
+    is stored as-is and flagged for a human to interpret."""
+    import whatsapp_bridge_adapter as adapter_module
+
+    assert adapter_module._acknowledgement_only("k") is True
+    assert adapter_module._acknowledgement_only("  K  ") is True
+    assert adapter_module._acknowledgement_only("kk") is True
+    assert adapter_module._acknowledgement_only("On my way, 10 min out") is False
+
+
+def test_add_observation_flags_bare_k_reply_human_review_needed(clean_adapter_state):
+    result_obs = adapter.add_observation(valid_payload(message_id="k-reply", text="k"))
+    assert result_obs["accepted"] is True
+    stored = adapter.get_observation("k-reply")
+    assert stored["human_review_needed"] is True
+    assert stored["human_review_reason"] == "acknowledgement_only_reply"
+    assert stored["status"] == "pending"  # still a real pending observation, not silently dropped
+
+
+def test_add_observation_does_not_flag_an_informative_reply(clean_adapter_state):
+    stored_result = adapter.add_observation(valid_payload(message_id="eta-reply", text="On my way, 10 min"))
+    assert stored_result["accepted"] is True
+    stored = adapter.get_observation("eta-reply")
+    assert stored["human_review_needed"] is False
+
+
+# ------------------------------------------------------------- DIRECTION --
+def test_stored_observation_direction_is_always_incoming(clean_adapter_state):
+    """Defense in depth: even if a caller tried to smuggle a different
+    direction through the payload, this endpoint's only legitimate use
+    is incoming messages -- direction is always set server-side, never
+    trusted from the request body."""
+    adapter.add_observation(valid_payload())
+    stored = adapter.get_observation("wamid.ABC123")
+    assert stored["direction"] == "incoming"

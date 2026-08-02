@@ -1134,7 +1134,7 @@ def route_whatsapp_attach(handler: "Handler", match: dict, body: dict) -> dict:
     observation = whatsapp_bridge_adapter.get_observation(message_id)
     if observation is None:
         raise ApiError(404, "No such pending WhatsApp observation.")
-    whatsapp_bridge_adapter.resolve_observation(message_id, "attached")
+    whatsapp_bridge_adapter.resolve_observation(message_id, "attached", job_id=int(job_id))
     return {"message_id": message_id, "job_id": int(job_id), "text": observation["text"]}
 
 

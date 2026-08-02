@@ -42,6 +42,14 @@ function loadConfig(env = process.env) {
     dedupeFile: env.WHATSAPP_SHADOW_DEDUPE_FILE
       || path.join(REPO_ROOT, ".runtime", "whatsapp-shadow-session", "seen-message-ids.json"),
 
+    // Durable holding area for a captured observation until the Python
+    // adapter confirms it accepted and durably stored it -- see
+    // deliveryQueue.js. Same directory/convention as dedupeFile above.
+    retryQueueFile: env.WHATSAPP_SHADOW_RETRY_QUEUE_FILE
+      || path.join(REPO_ROOT, ".runtime", "whatsapp-shadow-session", "pending-delivery.json"),
+
+    retryDrainIntervalMs: intEnv(env, "WHATSAPP_SHADOW_RETRY_DRAIN_INTERVAL_MS", 30000),
+
     // The bridge's own tiny local admin/pairing server -- 127.0.0.1 only,
     // never bound to 0.0.0.0, never proxied through any tunnel.
     localAdminPort: intEnv(env, "WHATSAPP_SHADOW_LOCAL_PORT", 8514),
