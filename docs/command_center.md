@@ -58,8 +58,9 @@ same question:
 | RECENT NEW | `status='New'`, received within the window (60 min for the KPI card) | `new_jobs_recent()` (new) |
 | WAITING | `status IN ('New','Needs Review')` older than `dispatch_target_minutes` (30 min default) | `jobs_waiting_over_target()` (existing) |
 | ACTIVE (with technician) | `status IN ('Approved','In Progress')` AND `assigned_technician_id IS NOT NULL` | `active_with_technician_count()` (new) -- deliberately distinct from the Performance screen's `active_jobs_count()`, which also includes not-yet-dispatched New jobs and doesn't require a technician; these answer different questions and must not converge |
-| EN ROUTE | Not trackable -- no `update_type` value in the real schema reliably distinguishes "en route" from any other technician update | `en_route_count()` (new), returns `data_quality=needs_business_definition`, same posture as the existing `no_answer_no_show_counts` |
-| CLOSING DUE | `status='In Progress'` | `closings_due_count()` (existing, unchanged) |
+| EN ROUTE | Not trackable -- no `update_type` value in the real schema reliably distinguishes "en route" from any other technician update. Not shown as its own KPI card; jobs that might be "en route" show simply as "In Progress" | `en_route_count()`, returns `data_quality=needs_business_definition`, same posture as the existing `no_answer_no_show_counts` -- never wired into the dashboard |
+| IN PROGRESS | `status='In Progress'` | `in_progress_count()` |
+| CLOSING DUE | `status='In Progress'` OR (`status='Closed'` AND `reconciliation_state != 'Settled'`) -- the same population `luxor_desk_read_model.get_closing_candidates()` already surfaces on the real Closings screen (`operator_api.route_closings`). Not identical to IN PROGRESS: a Closed-but-unsettled job counts here but not there | `closings_due_count()` |
 | COMPLETED | `status='Closed'`, today | `completed_jobs()` (existing) |
 | ARCHIVE / NEEDS REVIEW | Store A backlog (raw pending messages) | Jobs screen's "Archive / Needs Review" disclosure |
 
@@ -79,8 +80,8 @@ All six top cards plus "Verified closed amount today" come from
 1. **New jobs -- last 60 min**: `new_jobs_recent()`.
 2. **Waiting for assignment**: `jobs_waiting_over_target()`.
 3. **Active with technician**: `active_with_technician_count()`.
-4. **En route**: `en_route_count()` -- always "N/A, not trackable yet".
-5. **Closings due**: `closings_due_count()`.
+4. **In progress**: `in_progress_count()` -- `status='In Progress'` only. Not labeled "en route": no real signal distinguishes that from any other In Progress job (`en_route_count()` documents this and is intentionally never wired in here).
+5. **Closings due**: `closings_due_count()` -- the real Closings-workspace population (In Progress, plus Closed-but-unsettled). Deliberately independent from "In progress" above, not a duplicate of it.
 6. **Completed today**: `completed_jobs()`, scoped to today (`America/New_York`, via the existing `resolve_period("shift", ...)` -- shift start defaults to local midnight, i.e. "today so far").
 7. **Verified closed amount today**: `verified_closed_amount()` (new) -- sums only `events.closing_amount` values that parse as a plain number (same `$`/comma-stripping rule as the existing `average_closed_amount` KPI). If any closed-today job lacks a reliable numeric amount, the card shows "Closing data incomplete" instead of a partial/misleading total. Zero closings today is a real, distinct zero (`$0.00`), never conflated with "incomplete".
 
@@ -107,7 +108,7 @@ composition only.
 Native SVG/CSS only, no chart library:
 
 1. **Job source mix -- today**: `new_jobs_by_source()` (existing), rendered as an SVG donut.
-2. **Job pipeline -- today**: `job_pipeline_counts()` (new) -- mutually-exclusive snapshot across New/Waiting/Assigned/Closing Due (all current-state, matching the snapshot semantics of the KPIs they're built from) plus Completed/Cancelled (scoped to today). Rendered as horizontal bars. A footnote explains the "En route" merge into "Assigned".
+2. **Job pipeline -- today**: `job_pipeline_counts()` -- mutually-exclusive snapshot across New/Waiting/Approved-Assigned/In Progress (all current-state, matching the snapshot semantics of the KPIs they're built from) plus Closed/Cancelled (scoped to today). Uses `in_progress_count()`, not `closings_due_count()`, for the In Progress bucket -- the latter's broader Closed-but-unsettled jobs would otherwise double-count against the Closed bucket. A footnote explains that "en route" jobs show simply as In Progress.
 3. **Technician activity -- today**: `technicians_summary()` (existing), filtered to technicians with real activity this period, sorted alphabetically (not by volume -- never a leaderboard).
 4. **Verified closings -- today**: `verified_closed_amount()` -- same function as the KPI card. Shows an honest "insufficient data" state instead of a chart when any closing lacks a reliable amount, per the phase's explicit instruction not to show an empty/misleading chart.
 

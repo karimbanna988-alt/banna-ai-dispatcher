@@ -49,6 +49,7 @@ def seed(db_path: Path) -> None:
     import whatsapp_bridge_adapter
     from dispatcher import storage
     from dispatcher.app_models import TechnicianUpdateCommand
+    from dispatcher.rules.service_areas import load_service_areas
 
     conn = storage.connect(db_path)
     conn.execute(
@@ -59,7 +60,9 @@ def seed(db_path: Path) -> None:
 
     tech_a = storage.add_technician(conn, name="Demo Ashraf", areas=["Charlotte"], skills=["car lockout"], dispatch_group="Demo Ashraf Dispatch", closing_group="Demo Ashraf Closings")
     tech_b = storage.add_technician(conn, name="Demo Sebai", areas=["Savannah"], skills=["house lockout"], dispatch_group="Demo Sebai Dispatch", closing_group="Demo Sebai Closings")
+    tech_c = storage.add_technician(conn, name="Demo Marcus", areas=["Charlotte", "Savannah"], skills=["car lockout", "house lockout"], dispatch_group="Demo Marcus Dispatch", closing_group="Demo Marcus Closings")
     conn.close()
+    service_areas = load_service_areas()
 
     def seed_and_dispatch(message_id, text, group_label="AGN"):
         storage.save_pending_and_mark_processed(
@@ -114,6 +117,73 @@ def seed(db_path: Path) -> None:
         group_label="AGN", raw_text=agn_message("D500"), from_number="+15550109900", received_at=future_ts(1),
     )
 
+    # ---------------------------------------------------- POPULATED ACTIVE BOARD --
+    # The Command Center's Active Jobs board only shows jobs with a real
+    # assigned technician (operator_ui_v2_connected/js/app.js filters on
+    # j.technician_name) -- dispatching alone (jobs 1-4 above) never sets
+    # that. storage.assign_technician() is the one real entry point for it
+    # (per its own docstring), so it's called directly here exactly like
+    # storage.add_technician() already is above -- not a hand-built row.
+    def assign(job_id: int, technician_id: int) -> None:
+        conn = storage.connect(db_path)
+        try:
+            result = storage.assign_technician(conn, job_id, technician_id, service_areas)
+            if result.outcome not in ("assigned", "reassigned"):
+                raise RuntimeError(f"assign_technician did not assign job {job_id}: {result}")
+        finally:
+            conn.close()
+
+    def technician_update(job_id: int, update_type: str, raw_update: str, eta_minutes=None) -> None:
+        conn = api.get_conn()
+        try:
+            service = api._service(conn)
+            service.record_technician_update(TechnicianUpdateCommand(
+                job_id=job_id, update_type=update_type, raw_update=raw_update, eta_minutes=eta_minutes,
+            ))
+        finally:
+            conn.close()
+
+    # F100: recently dispatched + assigned, technician has not replied yet
+    # -- "Waiting for technician" on the board, no attention-now exception
+    # (well within the SLA target).
+    jobF1 = seed_and_dispatch("demo-mf1", agn_message("F100"))
+    assign(jobF1, tech_a)
+
+    # F200: assigned + a recent technician ETA update -- "Assigned" badge,
+    # status flips to real "In Progress" (the one real status every
+    # non-Custom technician update derives to).
+    jobF2 = seed_and_dispatch("demo-mf2", agn_message("F200"))
+    assign(jobF2, tech_c)
+    technician_update(jobF2, "ETA", "15 minutes out", eta_minutes=15)
+
+    # F300: a second, independent In Progress job from a different source
+    # and technician -- the real population in_progress_count() now
+    # counts (see the Section 1 KPI correction).
+    jobF3 = seed_and_dispatch("demo-mf3", main_leads_message("F300"), group_label="MAINLEADS")
+    assign(jobF3, tech_b)
+    technician_update(jobF3, "Going", "On my way")
+
+    # F400: technician marked the job Completed but the dispatcher hasn't
+    # recorded the closing yet -- "Record closing" -> "Closing needed"
+    # badge, and counts toward closings_due_count() (real, not fabricated:
+    # status is still In Progress, exactly matching that function's
+    # documented definition).
+    jobF4 = seed_and_dispatch("demo-mf4", agn_message("F400"))
+    assign(jobF4, tech_a)
+    technician_update(jobF4, "Completed", "Job done, customer signed off")
+
+    # F500: assigned + dispatched, then backdated stale -- surfaces both
+    # in Attention Now (stale_active_job) and on the Active board with a
+    # visibly old "time since last update", from a third technician and
+    # the second source.
+    jobF5 = seed_and_dispatch("demo-mf5", main_leads_message("F500"))
+    assign(jobF5, tech_c)
+    stale_at_f5 = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat().replace("+00:00", "Z")
+    conn = storage.connect(db_path)
+    conn.execute("UPDATE jobs SET last_event_at = ?, updated_at = ? WHERE id = ?", (stale_at_f5, stale_at_f5, jobF5))
+    conn.commit()
+    conn.close()
+
     # One synthetic WhatsApp observation, in-memory only (this process),
     # for the Active screen / Attention now WhatsApp-item demonstration.
     whatsapp_bridge_adapter.add_observation({
@@ -145,7 +215,15 @@ def seed(db_path: Path) -> None:
     conn.commit()
     conn.close()
 
-    print(f"Seeded demo DB at {db_path}: jobs {job1}, {job2}, {job3}, {job4}; technicians {tech_a}, {tech_b}; 30 archive messages.")
+    print(
+        f"Seeded demo DB at {db_path}: "
+        f"jobs {job1}, {job2}, {job3}, {job4}, {jobF1}, {jobF2}, {jobF3}, {jobF4}, {jobF5}; "
+        f"technicians {tech_a} (Ashraf), {tech_b} (Sebai), {tech_c} (Marcus); 30 archive messages.\n"
+        f"Active-board fixtures: F100={jobF1} (assigned, awaiting technician), "
+        f"F200={jobF2} (assigned, recent ETA update), F300={jobF3} (In Progress, Going update), "
+        f"F400={jobF4} (In Progress, Completed update -- closing needed), "
+        f"F500={jobF5} (assigned, backdated stale)."
+    )
 
 
 if __name__ == "__main__":

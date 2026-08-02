@@ -38,13 +38,13 @@ def _iso(dt: datetime) -> str:
 
 
 def _insert_job(conn, ticket, source, status="New", created_at=None, updated_at=None,
-                 last_event_at=None, technician_id=None, city="Charlotte"):
+                 last_event_at=None, technician_id=None, city="Charlotte", reconciliation_state=None):
     now = created_at or _iso(datetime.now(timezone.utc))
     fields = json.dumps({"city": city, "state": "NC", "service_type": "Car Lockout", "phone": "1-555-010-3000", "address": "100 Fake St"})
     conn.execute(
         "INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at, status, "
-        "last_event_at, assigned_technician_id) VALUES (?,?,?,?,?,?,?,?)",
-        (ticket, source, fields, now, updated_at or now, status, last_event_at, technician_id),
+        "last_event_at, assigned_technician_id, reconciliation_state) VALUES (?,?,?,?,?,?,?,?,?)",
+        (ticket, source, fields, now, updated_at or now, status, last_event_at, technician_id, reconciliation_state),
     )
     conn.commit()
     return conn.execute("SELECT id FROM jobs WHERE ticket_number=? AND source=?", (ticket, source)).fetchone()[0]
@@ -170,13 +170,18 @@ def test_job_pipeline_counts_are_mutually_exclusive(db):
     _insert_job(conn, "P1", "AGN", status="New", created_at=_iso(now - timedelta(minutes=5)))  # New
     _insert_job(conn, "P2", "AGN", status="New", created_at=_iso(now - timedelta(minutes=90)))  # Waiting (>30min target)
     _insert_job(conn, "P3", "AGN", status="Approved")  # Approved / Assigned
-    _insert_job(conn, "P4", "AGN", status="In Progress")  # In Progress / Closing Due
+    _insert_job(conn, "P4", "AGN", status="In Progress")  # In Progress
     _insert_job(conn, "P5", "AGN", status="Closed", updated_at=_iso(now))  # Closed
     _insert_job(conn, "P6", "AGN", status="Cancelled", created_at=_iso(now))  # Cancelled
+    # A Closed-but-unsettled job: counts toward closings_due_count() (broader
+    # definition) but must land in "Closed" here, not "In Progress" -- proves
+    # the pipeline's In Progress bucket uses in_progress_count(), never
+    # closings_due_count(), so this job is never double-counted.
+    _insert_job(conn, "P7", "AGN", status="Closed", updated_at=_iso(now), reconciliation_state=None)
     counts = kpi.job_pipeline_counts(conn, now - timedelta(hours=1), now + timedelta(hours=1), now, targets)
     assert counts == {
         "New": 1, "Waiting": 1, "Approved / Assigned": 1,
-        "In Progress / Closing Due": 1, "Closed": 1, "Cancelled": 1,
+        "In Progress": 1, "Closed": 2, "Cancelled": 1,
     }
     conn.close()
 
@@ -289,7 +294,7 @@ def test_get_command_center_composes_only_existing_functions_not_duplicate_sql()
     end = source.index("\ndef get_dashboard(")
     body = source[start:end]
     for reused_call in (
-        "jobs_waiting_over_target(", "closings_due_count(", "completed_jobs(",
+        "jobs_waiting_over_target(", "closings_due_count(", "in_progress_count(", "completed_jobs(",
         "new_jobs_by_source(", "technicians_summary(", "_attention_now_with_age(",
     ):
         assert reused_call in body, f"get_command_center must reuse {reused_call} rather than recompute it"
@@ -309,7 +314,7 @@ def test_route_command_center_returns_real_shape(monkeypatch, db):
     assert set(result.keys()) >= {"kpis", "verified_closed_amount_today", "attention_now", "charts"}
     assert set(result["kpis"].keys()) == {
         "new_last_60_minutes", "waiting_for_assignment", "active_with_technician",
-        "in_progress_en_route", "closings_due", "completed_today",
+        "in_progress", "closings_due", "completed_today",
     }
     assert set(result["charts"].keys()) == {
         "job_source_mix", "job_pipeline", "technician_activity", "verified_closings",
@@ -684,17 +689,62 @@ def test_mobile_bottom_nav_has_safe_area_clearance_in_main_content():
     assert ".main-content" in css
 
 
-def test_in_progress_en_route_kpi_is_a_real_number_not_fabricated(db):
-    """The Phase 6C 'In progress / en route' card must be backed by the
-    real closings_due_count() (status='In Progress') -- never a made-up
-    'en route' figure. See kpi_read_model.get_command_center()'s own
-    comment for why this intentionally matches the Closings due card."""
+# ============================ ACCEPTANCE CHECK: IN PROGRESS / CLOSINGS DUE =
+def test_in_progress_count_is_status_in_progress_only(db):
+    """in_progress_count() must count exactly status='In Progress' jobs
+    -- nothing broader, nothing narrower, no EN_ROUTE inference."""
     conn = _conn(db)
-    now = datetime.now(timezone.utc)
-    tech = _insert_technician(conn)
-    _insert_job(conn, "IP1", "AGN", status="In Progress", technician_id=tech)
-    dashboard = kpi.get_command_center(conn, now=now)
+    _insert_job(conn, "IP1", "AGN", status="In Progress")
+    _insert_job(conn, "IP2", "AGN", status="In Progress")
+    _insert_job(conn, "IP3", "AGN", status="Approved")  # not In Progress -- must not count
+    _insert_job(conn, "IP4", "AGN", status="Closed", reconciliation_state=None)  # not In Progress -- must not count
+    result = kpi.in_progress_count(conn)
     conn.close()
-    assert dashboard["kpis"]["in_progress_en_route"]["value"] == 1
-    assert dashboard["kpis"]["in_progress_en_route"]["value"] == dashboard["kpis"]["closings_due"]["value"]
-    assert dashboard["kpis"]["in_progress_en_route"]["data_quality"] in ("ok", "zero")
+    assert result["value"] == 2
+    assert result["data_quality"] == "ok"
+
+
+def test_closings_due_count_includes_closed_but_unsettled_jobs(db):
+    """closings_due_count() must match the real Closings workspace
+    definition (luxor_desk_read_model.get_closing_candidates()): In
+    Progress jobs, PLUS Closed jobs not yet reconciliation_state ==
+    'Settled'. A Settled Closed job must NOT count -- it has left the
+    Closings workspace for good."""
+    conn = _conn(db)
+    _insert_job(conn, "CD1", "AGN", status="In Progress")
+    _insert_job(conn, "CD2", "AGN", status="Closed", reconciliation_state=None)  # unsettled -- counts
+    _insert_job(conn, "CD3", "AGN", status="Closed", reconciliation_state="Settled")  # settled -- must not count
+    _insert_job(conn, "CD4", "AGN", status="Approved")  # not a closing candidate at all
+    result = kpi.closings_due_count(conn)
+    conn.close()
+    assert result["value"] == 2
+
+
+def test_in_progress_and_closings_due_are_independently_computed_not_duplicates(db):
+    """The two KPI cards must be able to diverge -- proving they are not
+    the same query wearing two labels. A Closed-but-unsettled job counts
+    toward Closings Due but not In Progress."""
+    conn = _conn(db)
+    _insert_job(conn, "D1", "AGN", status="In Progress")
+    _insert_job(conn, "D2", "AGN", status="Closed", reconciliation_state=None)
+    dashboard = kpi.get_command_center(conn, now=datetime.now(timezone.utc))
+    conn.close()
+    assert dashboard["kpis"]["in_progress"]["value"] == 1
+    assert dashboard["kpis"]["closings_due"]["value"] == 2
+    assert dashboard["kpis"]["in_progress"]["value"] != dashboard["kpis"]["closings_due"]["value"]
+
+
+def test_command_center_kpis_never_claim_en_route():
+    """No KPI key, dashboard label, or explanation string anywhere in
+    get_command_center()'s own source may claim 'en route' as a real,
+    trackable fact -- en_route_count() exists and documents why that
+    signal isn't real, but it must never be wired into the dashboard."""
+    source = (REPO_ROOT / "src" / "dispatcher" / "kpi_read_model.py").read_text(encoding="utf-8")
+    start = source.index("def get_command_center(")
+    end = source.index("\ndef get_dashboard(")
+    body = source[start:end]
+    assert "en_route_count(conn" not in body  # documented-but-never-called is fine; an actual call is not
+
+    js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
+    assert "k.in_progress_en_route" not in js
+    assert 'ccKpiCardHtml("In progress"' in js

@@ -806,7 +806,7 @@ function ccDonutChartSvg(counts) {
 }
 
 function ccPipelineBarsHtml(counts) {
-  const order = ["New", "Waiting", "Approved / Assigned", "In Progress / Closing Due", "Closed", "Cancelled"];
+  const order = ["New", "Waiting", "Approved / Assigned", "In Progress", "Closed", "Cancelled"];
   const max = Math.max(1, ...order.map(k => counts[k] || 0));
   return `<div class="cc-pipeline">` + order.map(label => {
     const n = counts[label] || 0;
@@ -818,7 +818,7 @@ function ccPipelineBarsHtml(counts) {
         <div class="cc-pipeline-count">${n}</div>
       </div>`;
   }).join("") + `</div>
-  <div class="cc-chart-footnote">"En route" has no signal separate from "In Progress" in the real data yet -- both share one real status.</div>`;
+  <div class="cc-chart-footnote">"En route" has no signal separate from "In Progress" in the real data yet -- jobs that might be en route show simply as In Progress.</div>`;
 }
 
 function ccTechActivityHtml(rows) {
@@ -859,7 +859,7 @@ function renderCommandCenterScreen(dashboard, activeEntries) {
     ccKpiCardHtml("New jobs -- last 60 min", k.new_last_60_minutes, "jobs"),
     ccKpiCardHtml("Waiting for assignment", k.waiting_for_assignment, "jobs"),
     ccKpiCardHtml("Active with technician", k.active_with_technician, "active"),
-    ccKpiCardHtml("In progress / en route", k.in_progress_en_route, "active"),
+    ccKpiCardHtml("In progress", k.in_progress, "active"),
     ccKpiCardHtml("Closings due", k.closings_due, "closings"),
     ccKpiCardHtml("Completed today", k.completed_today, "history"),
   ].join("");

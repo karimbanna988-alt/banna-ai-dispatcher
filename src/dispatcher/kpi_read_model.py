@@ -320,11 +320,37 @@ def active_jobs_count(conn: sqlite3.Connection, source=None, area=None) -> dict:
     return _kpi(n, n, n, n, DQ_OK if n > 0 else DQ_ZERO, f"{n} active job(s) right now.")
 
 
-def closings_due_count(conn: sqlite3.Connection, source=None, area=None) -> dict:
-    """Current snapshot: dispatched jobs (In Progress) still awaiting a
-    closing -- the same population the Closings screen surfaces."""
+def in_progress_count(conn: sqlite3.Connection, source=None, area=None) -> dict:
+    """Current snapshot: jobs whose real status is 'In Progress' right
+    now. Distinct from closings_due_count(): every In Progress job is a
+    closing candidate, but closings_due_count() also includes
+    Closed-but-not-yet-Settled jobs that are no longer In Progress --
+    see that function's docstring."""
     where, params = _build_job_filters(source, area, status_in=["In Progress"])
     n = conn.execute(f"SELECT COUNT(*) FROM jobs j WHERE 1=1{where}", params).fetchone()[0]
+    return _kpi(n, n, n, n, DQ_OK if n > 0 else DQ_ZERO, f"{n} job(s) in progress right now.")
+
+
+def closings_due_count(conn: sqlite3.Connection, source=None, area=None) -> dict:
+    """Current snapshot: jobs the real Closings workspace already treats
+    as closing candidates -- dispatched jobs still 'In Progress' (ready
+    to receive a technician's closing) PLUS jobs already 'Closed' but
+    not yet reconciliation_state == 'Settled' (closing recorded,
+    awaiting company-closing dispatch and COMPLETE JOB). This mirrors
+    luxor_desk_read_model.get_closing_candidates() exactly -- the same
+    business definition operator_api.py's real /api/closings route
+    already uses -- rather than silently duplicating in_progress_count().
+    A job can legitimately count here and not in in_progress_count()
+    (Closed-but-unsettled), which is why the two are no longer the same
+    number by construction."""
+    where, params = _build_job_filters(source, area)
+    sql = (
+        f"SELECT COUNT(*) FROM jobs j WHERE 1=1{where} AND ("
+        "j.status = 'In Progress' OR "
+        "(j.status = 'Closed' AND (j.reconciliation_state IS NULL OR j.reconciliation_state != 'Settled'))"
+        ")"
+    )
+    n = conn.execute(sql, params).fetchone()[0]
     return _kpi(n, n, n, n, DQ_OK if n > 0 else DQ_ZERO, f"{n} closing(s) due right now.")
 
 
@@ -581,19 +607,16 @@ def verified_closed_amount(conn: sqlite3.Connection, start: datetime, end: datet
 
 def job_pipeline_counts(conn: sqlite3.Connection, period_start: datetime, period_end: datetime, now: datetime, targets: dict, source=None, area=None) -> dict:
     """Mutually-exclusive pipeline-stage snapshot for the Command
-    Center's pipeline chart. New/Waiting/Approved-Assigned/In-Progress-
-    are-Closing-Due are current-state snapshots (a job that's still open
-    isn't naturally period-bound, matching jobs_waiting_over_target/
-    closings_due_count's own snapshot semantics); Closed/Cancelled are
-    scoped to the selected period so the chart doesn't accumulate
-    all-time history. "In Progress" and "Closing Due" are intentionally
-    ONE bucket, not two: in the real schema, status='In Progress' IS the
-    exact population closings_due_count() already surfaces (a job
-    reaching In Progress is simultaneously "being worked" and "awaiting
-    its closing") -- there is no real field distinguishing "actively en
-    route" from "closing due" within that status, and inventing one
-    would violate "do not create new database statuses". No fabricated
-    'En route'-only bucket -- see en_route_count()."""
+    Center's pipeline chart. New/Waiting/Approved-Assigned/In-Progress
+    are current-state snapshots (a job that's still open isn't naturally
+    period-bound, matching jobs_waiting_over_target/in_progress_count's
+    own snapshot semantics); Closed/Cancelled are scoped to the selected
+    period so the chart doesn't accumulate all-time history. This bucket
+    intentionally uses in_progress_count(), not closings_due_count():
+    closings_due_count() also includes Closed-but-unsettled jobs, which
+    would double-count against the "Closed" bucket below and break
+    mutual exclusivity. No fabricated 'En route'-only bucket -- see
+    en_route_count()."""
     dispatch_target = targets["dispatch_target_minutes"]
     where, params = _build_job_filters(source, area, status_in=["New", "Needs Review"])
     rows = conn.execute(f"SELECT created_at FROM jobs j WHERE 1=1{where}", params).fetchall()
@@ -609,7 +632,7 @@ def job_pipeline_counts(conn: sqlite3.Connection, period_start: datetime, period
     assigned_where, assigned_params = _build_job_filters(source, area, status_in=["Approved"])
     assigned_count = conn.execute(f"SELECT COUNT(*) FROM jobs j WHERE 1=1{assigned_where}", assigned_params).fetchone()[0]
 
-    in_progress_closing_due = closings_due_count(conn, source, area)["value"]
+    in_progress_snapshot = in_progress_count(conn, source, area)["value"]
     closed_in_period = completed_jobs(conn, period_start, period_end, source, area)["value"]
 
     cancelled_where, cancelled_params = _build_job_filters(source, area, status_in=["Cancelled"])
@@ -620,7 +643,7 @@ def job_pipeline_counts(conn: sqlite3.Connection, period_start: datetime, period
         "New": new_count,
         "Waiting": waiting_count,
         "Approved / Assigned": assigned_count,
-        "In Progress / Closing Due": in_progress_closing_due,
+        "In Progress": in_progress_snapshot,
         "Closed": closed_in_period,
         "Cancelled": cancelled_in_period,
     }
@@ -675,14 +698,6 @@ def get_command_center(
     chart_start, chart_end = resolve_period("shift" if chart_period in ("today", "shift") else chart_period, now, targets)
     min_sample = targets["min_sample_size"]
 
-    # "In progress / en route" and "Closings due" intentionally share one
-    # real number (closings_due_count() = status='In Progress'): the real
-    # schema has no field distinguishing "actively en route" from
-    # "closing due" within that status -- see en_route_count()'s own
-    # docstring for why that distinction is not fabricated. Both cards
-    # are honest about the same real population, not a bug.
-    in_progress = closings_due_count(conn, source, area)
-
     return {
         "generated_at": _iso_z(now),
         "period": {
@@ -694,7 +709,13 @@ def get_command_center(
             "new_last_60_minutes": new_jobs_recent(conn, now, window_minutes=60, source=source, area=area),
             "waiting_for_assignment": jobs_waiting_over_target(conn, now, targets, source, area),
             "active_with_technician": active_with_technician_count(conn, source, area),
-            "in_progress_en_route": in_progress,
+            # "In progress" and "Closings due" are deliberately two
+            # independent queries now (in_progress_count() vs
+            # closings_due_count()) -- see both docstrings. They are NOT
+            # guaranteed equal: closings_due_count() also includes
+            # Closed-but-unsettled jobs. No EN_ROUTE claim is made
+            # anywhere -- see en_route_count(), unused here on purpose.
+            "in_progress": in_progress_count(conn, source, area),
             "closings_due": closings_due_count(conn, source, area),
             "completed_today": completed_jobs(conn, today_start, today_end, source, area),
         },
