@@ -18,6 +18,8 @@ const state = {
   activePreview: {},       // job_id -> last commercial preview/save result (client-side draft)
   activeRawText: {},       // job_id -> last pasted text, preserved verbatim across re-renders
   closingDraft: {},        // job_id -> in-progress technician-closing form values
+  statusUpdateDraft: {},   // job_id -> in-progress technician-status-update form values
+  statusUpdatePrepared: {}, // job_id -> {text} once a company reply has been prepared, not yet confirmed sent
   learningSelected: null,
   jobsShowAllLive: false,  // "Show N more" toggle for the live-jobs landing list
 };
@@ -131,6 +133,7 @@ function clearAllLocalData() {
   archiveState.page = 1; archiveState.search = ""; archiveState.unmatchedOnly = false; archiveState.total = 0;
   state.jobsSelected = null; state.activeSelected = null; state.closingsSelected = null; state.historySelected = null; state.learningSelected = null;
   state.kRevealed = {}; state.activePreview = {}; state.activeRawText = {}; state.closingDraft = {};
+  state.statusUpdateDraft = {}; state.statusUpdatePrepared = {};
   state.jobsShowAllLive = false;
   ["jobsTableBody", "jobsMobileList", "jobsDetailPane",
    "archiveTableBody", "archiveMobileList",
@@ -1083,11 +1086,71 @@ function selectActive(id) {
 const QUOTE_TYPES = ["FIXED", "STARTING", "RANGE", "ESTIMATE", "NO_AMOUNT", "UNKNOWN"];
 const CUSTOMER_RESPONSES = ["ACCEPTED", "DECLINED", "WILL_CALL_BACK", "THINKING", "TOO_EXPENSIVE", "SHOPPING_AROUND", "REQUESTED_DISCOUNT", "NO_RESPONSE", "UNKNOWN"];
 
+const TECHNICIAN_UPDATE_TYPES = ["Going", "ETA", "No Answer", "No Show", "Not Available", "Customer Cancelled", "Completed", "Custom"];
+
+function statusUpdateBlockHtml(j) {
+  const owed = j.company_update_owed;
+  const draft = state.statusUpdateDraft[j.id] || {};
+  const recordForm = `
+    <div class="form-row">
+      <div class="form-field">
+        <label>Technician status</label>
+        <select id="statusUpdateType-${j.id}">${TECHNICIAN_UPDATE_TYPES.map(t => `<option value="${esc(t)}" ${t === draft.update_type ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>
+      </div>
+      <div class="form-field" id="statusUpdateEtaWrap-${j.id}" style="${draft.update_type === "ETA" ? "" : "display:none;"}">
+        <label>ETA (minutes)</label>
+        <input type="number" min="1" id="statusUpdateEta-${j.id}" value="${esc(draft.eta_minutes || "")}">
+      </div>
+    </div>
+    <div class="form-field">
+      <label>Technician's actual reply (verbatim)</label>
+      <textarea id="statusUpdateRaw-${j.id}">${esc(draft.raw_update || "")}</textarea>
+    </div>
+    <button type="button" class="btn btn-primary btn-block" data-activeaction="record_status_update" data-id="${j.id}">Record technician update</button>`;
+
+  if (!owed) {
+    return `
+      <div class="detail-section">
+        <div class="subsection-label">Technician status update</div>
+        ${recordForm}
+      </div>`;
+  }
+
+  const prepared = state.statusUpdatePrepared[j.id];
+  let actionBlock;
+  if (prepared) {
+    actionBlock = `
+      <pre class="msg-block">${esc(prepared.text)}</pre>
+      <button type="button" class="btn btn-secondary btn-block" data-activeaction="copy_status_reply" data-id="${j.id}">Copy reply</button>
+      <button type="button" class="btn btn-primary btn-block" style="margin-top:6px;" data-activeaction="confirm_status_update_sent" data-id="${j.id}">I sent this reply manually</button>`;
+  } else if (owed.confirmed) {
+    actionBlock = `
+      <pre class="msg-block">${esc(owed.suggested_reply)}</pre>
+      <button type="button" class="btn btn-secondary btn-block" data-activeaction="prepare_company_update" data-id="${j.id}">Prepare company reply</button>`;
+  } else {
+    actionBlock = `
+      <div class="review-banner">${esc(owed.reason)}</div>
+      <div class="form-field"><label>Company reply (typed manually -- no deterministic reply for this update)</label>
+      <textarea id="statusUpdateManualText-${j.id}"></textarea></div>
+      <button type="button" class="btn btn-secondary btn-block" data-activeaction="prepare_company_update" data-id="${j.id}">Prepare company reply</button>`;
+  }
+
+  return `
+    <div class="detail-section">
+      <div class="subsection-label">Technician status update</div>
+      <div class="detail-meta">Latest: <strong>${esc(owed.update_type)}${owed.eta_minutes ? ` (${owed.eta_minutes} min)` : ""}</strong> -- ${esc(owed.raw_update || "")}</div>
+      <div class="review-banner" style="background:var(--kpi-waiting-bg);">Company update owed since ${esc((owed.recorded_at || "").slice(0, 16).replace("T", " "))}</div>
+      ${actionBlock}
+      <details class="disclosure"><summary>Record another update</summary>${recordForm}</details>
+    </div>`;
+}
+
 function activeDetailHtml(j) {
   const preview = state.activePreview[j.id];
   const rawText = state.activeRawText[j.id] || "";
 
   let interpretBlock = `
+    <div class="subsection-label">Price / commercial update (quote, negotiation)</div>
     <div class="form-field">
       <label>Paste technician's exact WhatsApp message</label>
       <textarea id="pasteText-${j.id}">${esc(rawText)}</textarea>
@@ -1141,6 +1204,7 @@ function activeDetailHtml(j) {
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span></div>
     <div class="detail-meta">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")} · Status: <strong>${esc(j.status)}</strong></div>
     <div class="detail-meta">Next: <strong>${esc(j.next_action)}</strong></div>
+    ${statusUpdateBlockHtml(j)}
     <div class="detail-section">${interpretBlock}</div>
     <div class="detail-section" id="activeEditBlock-${j.id}">${editBlock}</div>
     <div id="activeReplyBlock-${j.id}">${replyBlock}</div>
@@ -1152,6 +1216,13 @@ function wireActiveDetailActions(j) {
   root.querySelectorAll("[data-activeaction]").forEach(el => {
     el.addEventListener("click", () => handleActiveAction(el.dataset.activeaction, parseInt(el.dataset.id, 10)));
   });
+  const typeSelect = document.getElementById(`statusUpdateType-${j.id}`);
+  const etaWrap = document.getElementById(`statusUpdateEtaWrap-${j.id}`);
+  if (typeSelect && etaWrap) {
+    typeSelect.addEventListener("change", () => {
+      etaWrap.style.display = typeSelect.value === "ETA" ? "" : "none";
+    });
+  }
 }
 
 async function handleActiveAction(action, id) {
@@ -1181,6 +1252,41 @@ async function handleActiveAction(action, id) {
       if (preview && preview.preparedText) await copyText(preview.preparedText);
     } else if (action === "confirm_reply") {
       const r = await callOrHandleAuth(() => Api.confirmReplySent(id, "whatsapp")); if (!r) return;
+      await loadActive();
+    } else if (action === "record_status_update") {
+      const update_type = document.getElementById(`statusUpdateType-${id}`).value;
+      const eta_minutes = document.getElementById(`statusUpdateEta-${id}`) ? document.getElementById(`statusUpdateEta-${id}`).value : "";
+      const raw_update = document.getElementById(`statusUpdateRaw-${id}`).value;
+      if (!raw_update.trim()) { showTransientError("Paste the technician's actual reply first."); return; }
+      if (update_type === "ETA" && !eta_minutes) { showTransientError("ETA updates require a minutes value."); return; }
+      state.statusUpdateDraft[id] = { update_type, eta_minutes, raw_update };
+      const r = await callOrHandleAuth(() => Api.recordTechnicianUpdate(id, update_type, raw_update, eta_minutes ? parseInt(eta_minutes, 10) : null));
+      if (!r) return;
+      delete state.statusUpdatePrepared[id];
+      state.statusUpdateDraft[id] = {};
+      await loadActive();
+    } else if (action === "prepare_company_update") {
+      const owed = (activeJobs.find(x => x.id === id) || {}).company_update_owed;
+      if (!owed) return;
+      const manualTextEl = document.getElementById(`statusUpdateManualText-${id}`);
+      const manualText = manualTextEl ? manualTextEl.value : null;
+      if (!owed.confirmed && (!manualText || !manualText.trim())) {
+        showTransientError("Type the company reply first -- no deterministic reply for this update.");
+        return;
+      }
+      const r = await callOrHandleAuth(() => Api.prepareCompanyUpdate(id, owed.update_type, owed.eta_minutes, manualText));
+      if (!r) return;
+      state.statusUpdatePrepared[id] = { text: r.prepared_text };
+      rerenderActiveDetail(id);
+    } else if (action === "copy_status_reply") {
+      const prepared = state.statusUpdatePrepared[id];
+      if (prepared) await copyText(prepared.text);
+    } else if (action === "confirm_status_update_sent") {
+      const prepared = state.statusUpdatePrepared[id];
+      if (!prepared) return;
+      const r = await callOrHandleAuth(() => Api.confirmCompanyUpdateSent(id, prepared.text));
+      if (!r) return;
+      delete state.statusUpdatePrepared[id];
       await loadActive();
     }
   } catch (e) {

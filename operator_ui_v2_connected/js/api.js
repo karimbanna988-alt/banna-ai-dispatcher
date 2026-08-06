@@ -82,6 +82,20 @@ const Api = {
     return this._call("POST", `/api/job/${jobId}/commercial/confirm_reply_sent`, { sent_channel: sentChannel });
   },
 
+  recordTechnicianUpdate(jobId, updateType, rawUpdate, etaMinutes) {
+    return this._call("POST", `/api/job/${jobId}/technician_update`, {
+      update_type: updateType, raw_update: rawUpdate, eta_minutes: etaMinutes || undefined,
+    });
+  },
+  prepareCompanyUpdate(jobId, updateType, etaMinutes, manualText) {
+    return this._call("POST", `/api/job/${jobId}/company_update/prepare`, {
+      update_type: updateType, eta_minutes: etaMinutes || undefined, manual_text: manualText || undefined,
+    });
+  },
+  confirmCompanyUpdateSent(jobId, preparedText) {
+    return this._call("POST", `/api/job/${jobId}/company_update/confirm_sent`, { prepared_text: preparedText });
+  },
+
   getClosings() { return this._call("GET", "/api/closings"); },
   recordClosing(jobId, fields) { return this._call("POST", `/api/closings/${jobId}/record`, fields); },
   prepareClosing(jobId) { return this._call("POST", `/api/closings/${jobId}/prepare`, {}); },

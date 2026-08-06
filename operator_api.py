@@ -68,10 +68,12 @@ import luxor_ops_shared as shared  # noqa: E402
 import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
-from dispatcher.app_models import ClosingCommand  # noqa: E402
+from dispatcher.action_names import TECHNICIAN_UPDATE_TYPES  # noqa: E402
+from dispatcher.app_models import ClosingCommand, TechnicianUpdateCommand  # noqa: E402
 from dispatcher.application import DispatcherService  # noqa: E402
 from dispatcher.closing import ClosingInput, render_closing_from_persisted_fields  # noqa: E402
 from dispatcher.policy import get_policy  # noqa: E402
+from dispatcher.updates import reply_for_update_type  # noqa: E402
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
@@ -524,8 +526,98 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "bucket": luxor_desk_shared.active_job_bucket(j),
                 "waiting_since": j.get("last_event_at") or j.get("updated_at"),
                 "shadow_episode": _episode_summary(episode) if episode else None,
+                "company_update_owed": _company_update_owed_dto(conn, j),
             })
         return {"entries": entries}
+    finally:
+        conn.close()
+
+
+_TECHNICIAN_UPDATE_TYPES_SET = frozenset(TECHNICIAN_UPDATE_TYPES)
+
+
+def _company_update_owed_dto(conn, job: dict) -> Optional[dict]:
+    """Whether this job has a technician status update that hasn't been
+    answered to the company yet, plus the deterministic reply preview --
+    computed fresh from reply_for_update_type() each time (a pure
+    formatter, same pattern route_closing_confirm_sent already uses),
+    never persisted speculatively. None means nothing is owed: either no
+    technician update has ever been recorded, or the latest one already
+    has a Company-Update-Sent-Manually note at or after it."""
+    latest = job.get("latest_technician_update")
+    if latest is None:
+        return None
+    if luxor_desk_shared._reply_already_sent_since(conn, job["id"], latest.get("created_at")):
+        return None
+    reply = reply_for_update_type(latest["update_type"], latest.get("eta_minutes"))
+    return {
+        "update_type": latest["update_type"],
+        "eta_minutes": latest.get("eta_minutes"),
+        "raw_update": latest.get("raw_message"),
+        "recorded_at": latest.get("created_at"),
+        "suggested_reply": reply.reply,
+        "confirmed": reply.confirmed,
+        "reason": reply.reason,
+    }
+
+
+def route_technician_update_record(handler: "Handler", match: dict, body: dict) -> dict:
+    """Records a technician's real status reply (Going/ETA/No Answer/No
+    Show/Not Available/Customer Cancelled/Completed/Custom) against an
+    already-committed job -- the dispatcher-typed status text, never
+    inferred from free text. This is distinct from the Commercial
+    Update (quote/negotiation) flow already wired on this same screen;
+    that flow answers "what price was quoted," this one answers "what
+    is the job status," per docs/workflow.md section 8."""
+    job_id = int(match["id"])
+    update_type = _require(body, "update_type")
+    raw_update = _require(body, "raw_update")
+    if update_type not in _TECHNICIAN_UPDATE_TYPES_SET:
+        raise ApiError(400, f"update_type must be one of {sorted(_TECHNICIAN_UPDATE_TYPES_SET)}.")
+    eta_minutes = body.get("eta_minutes")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        command = TechnicianUpdateCommand(
+            job_id=job_id, update_type=update_type, raw_update=raw_update,
+            eta_minutes=int(eta_minutes) if eta_minutes else None,
+        )
+        result = service.record_technician_update(command)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not record this update.")
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+def route_company_update_prepare(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    update_type = _require(body, "update_type")
+    eta_minutes = body.get("eta_minutes")
+    manual_text = body.get("manual_text") or None
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.prepare_company_update(
+            job_id, update_type, eta_minutes=int(eta_minutes) if eta_minutes else None, manual_text=manual_text,
+        )
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not prepare a company update.")
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+def route_company_update_confirm_sent(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    prepared_text = _require(body, "prepared_text")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.confirm_company_update_sent(job_id, prepared_text)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not confirm this update as sent.")
+        return _action_result_dto(result)
     finally:
         conn.close()
 
@@ -1164,6 +1256,9 @@ ROUTES = [
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
     ("POST", r"^/api/sync$", route_sync, {}),
     ("GET", r"^/api/active$", route_active, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/technician_update$", route_technician_update_record, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/company_update/prepare$", route_company_update_prepare, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/company_update/confirm_sent$", route_company_update_confirm_sent, {}),
     ("GET", r"^/api/technicians$", route_technicians, {}),
     ("POST", r"^/api/technicians/(?P<id>\d+)/destinations$", route_update_destinations, {}),
     ("GET", r"^/api/job/(?P<id>\d+)$", route_job_workspace, {}),
