@@ -1,170 +1,182 @@
-# Current Sprint Checkpoint — Autonomous 3-Hour Finalization Sprint
+# Current Sprint Checkpoint — Fail-Closed Safety + Technician K Tracking
 
-Written at a natural stopping point, not a session-limit cutoff. The
-sprint's own instructions (Step 0 and the delivery section) explicitly
-anticipated this document, so it's written proactively rather than in a
-rush at the end.
+Written at a natural stopping point, not a session-limit cutoff. Supersedes
+the previous checkpoint (that sprint's work is preserved in git history;
+its incident and reasoning are summarized below where still relevant).
 
 ## Starting state
 
-HEAD `35e7ad5` (end of the prior "visual redesign" phase). Real DB
-(`data/dispatcher.db`): 6 jobs, 10 events, integrity OK, unchanged
-throughout this sprint (re-verified after every write-adjacent
-operation below).
+HEAD `1e5c3e9` (end of the prior "technician update / company reply
+workflow" sprint). Real DB (`data/dispatcher.db`): 6 jobs, 10 events,
+integrity OK — unchanged throughout this sprint, re-verified after
+every write-adjacent operation and after both full-suite runs.
 
-## What's actually done (verified, not just written)
+## Priority 1 — Fail-closed production database protection (DONE)
 
-1. **`docs/END_TO_END_WORKFLOW_AUDIT.md`** — every one of the 12
-   lifecycle steps classified against real code with file:line
-   evidence. Conclusion: most of the lifecycle (intake, validation, K
-   preparation, technician assignment, dispatch preparation, closing,
-   completion+audit) was already real and working — the "prepare, never
-   auto-send" pattern the sprint asked for (Step 12's `DeliveryConnector`)
-   already exists pervasively as `dispatch_tracking`'s prepare→confirm-sent
-   milestone columns, reused identically for company updates and
-   closings. Building a new connector class would have duplicated this
-   without adding capability, so I didn't.
+The prior sprint disclosed that two demo-seeding calls briefly resolved
+to the real database's default path because `OPERATOR_API_DB_PATH` was
+unset in the calling shell — net effect was zero (verified), but the
+*mechanism* that made that possible (silent fallback) was still live.
+This priority closed the mechanism itself, not just the one incident.
 
-2. **The one genuine gap the audit found, closed this sprint**:
-   `record_technician_update` / `prepare_company_update` /
-   `confirm_company_update_sent` existed at the `DispatcherService`/
-   storage layer, fully tested, but had zero HTTP route and zero UI —
-   the Active screen already computed and displayed a "Prepare company
-   reply" next-action label with literally nothing behind it to click.
-   Added:
-   - 3 routes in `operator_api.py` (`POST /api/job/<id>/technician_update`,
-     `.../company_update/prepare`, `.../company_update/confirm_sent`).
-   - A `company_update_owed` field on `/api/active`'s per-job DTO,
-     computed fresh each call via `reply_for_update_type()` (a pure
-     formatter, never persisted speculatively).
-   - A "Technician status update" panel on the Active job detail,
-     clearly separate from the pre-existing "Price / commercial update"
-     (quote/negotiation) panel it sits next to — the two answer
-     different questions and were previously easy to conflate.
-   - 14 new focused tests in `tests/test_operator_api.py`.
-   - Verified end-to-end in a live browser against the isolated demo:
-     confirmed-reply path (Going → "Going"), ETA path (→ "Tech ETA N
-     min"), and the Custom/unconfirmed human-review path (manual text
-     required) — all three transitioned `next_action` correctly
-     afterward (`"Waiting for customer"` / `"Add technician update"`).
+**What changed:**
+- New `src/dispatcher/db_safety.py` — one shared `resolve_db_path(mode,
+  path)` function. `"live"` mode (the sanctioned `scripts/start_crm.ps1`
+  path) keeps the existing default-to-real-DB behavior unchanged.
+  `"demo"` and `"test"` mode now **require** an explicit path and
+  **reject** one that canonically resolves (via `Path.resolve()`, not
+  string comparison — proven against relative paths, redundant `.`
+  segments, and a real filesystem symlink) to the production DB path.
+- `operator_api.py` and `whatsapp_bridge_adapter.py` both route their
+  `_db_path()` through this one function. Mode is auto-detected:
+  `"pytest" in sys.modules` → `"test"` (so a test that forgets to set
+  the env var now fails loudly instead of silently touching the real
+  DB — this is the actual fix for the fixture-level version of the
+  incident), `LUXOR_DEMO_MODE=true` → `"demo"`, else `"live"`.
+- `scripts/seed_command_center_demo_db.py` now force-sets both
+  `LUXOR_DEMO_MODE` and `OPERATOR_API_DB_PATH` in its own process
+  environment before making any `operator_api` calls — a caller
+  forgetting to set the env var in their shell (exactly what happened
+  last sprint) can no longer matter, because the script no longer
+  trusts the caller's environment for this.
+- `conftest.py` gained a session-wide autouse fixture that asserts the
+  real database's mtime/size are identical before vs. after the entire
+  test run — independent, whole-suite tripwire on top of the per-module
+  guard. Ran across a live 1401-test session with zero trips.
+- 24 new tests (`tests/test_db_safety.py` plus additions to
+  `tests/test_operator_api.py`), including the exact five negative
+  cases from the brief (missing demo path, missing test path, relative
+  path resolving to prod, absolute prod path, symlink to prod) plus the
+  positive cases (valid temp path succeeds, live startup unaffected).
 
-3. Full relevant test suite green: `tests/test_operator_api.py`,
-   `tests/test_crm_ux_design.py`, `tests/test_ui_acceptance_redesign.py`,
-   `tests/test_demo_isolation.py`, `tests/test_quo_client.py`,
-   `tests/test_whatsapp_bridge_adapter.py` — 141+55 = 196 tests, all
-   passing. Real DB integrity/FK checks clean, job/event counts
-   unchanged from the sprint's starting baseline.
+**Commit:** `3b46c05`.
 
-4. `docs/KNOWN_LIMITATIONS.md` and `docs/COMMERCIAL_READINESS.md`
-   updated to reflect both the newly-closed gap and the real remaining
-   one (technician "K"/acceptance tracking — see below).
+## Priority 2 — Technician K acceptance tracking (DONE)
 
-5. Three focused commits (see final report for hashes).
+The audit (prior sprint) found no schema concept anywhere of "the
+technician accepted this job" — `dispatch_tracking` tracks prepared/
+copied/WhatsApp-opened/dispatched-manually, nothing for the reply. A
+bare "K" was only ever flagged for human review, never recorded as a
+job fact.
 
-## An incident this sprint caused, and the honest resolution
+**What was built:**
+- `storage.technician_acceptance` — new, additive, job-keyed table
+  (deliberately excluded from the blanket schema-upgrade gate, same
+  precedent as Shadow Mode's tables, so it never forces "Database
+  upgrade required" on unrelated existing functionality). Idempotent
+  `mark_technician_accepted`/`mark_technician_declined`, both COALESCE
+  "set once" like every other milestone in this codebase, both also
+  writing a full audit-trail event (unlike `dispatch_tracking`'s silent
+  milestones — acceptance/decline is a fact worth showing in history).
+  Never touches `jobs.status` — orthogonal, same pattern as
+  `reconciliation_state`.
+- `src/dispatcher/technician_ack.py` — pure, deterministic matching. No
+  guessing: a candidate WhatsApp observation is classified EXACT (group
+  + ticket both match), STRONG (group matches, technician has exactly
+  one job waiting), AMBIGUOUS (group matches, multiple jobs waiting,
+  no ticket to disambiguate), or UNMATCHED (anything else) — from
+  evidence already in the schema (dispatch-group name, extracted
+  ticket, an exact acknowledgement/decline vocabulary reusing the same
+  words `whatsapp_bridge_adapter.py` already treats specially).
+- `DispatcherService.confirm_technician_accepted`/`confirm_technician_declined`,
+  two new routes, and a `technician_k` field on `/api/active`'s per-job
+  DTO (computed fresh, never persisted speculatively).
+- A "Technician acceptance — waiting on K" panel on the Active job
+  detail: shows each candidate's category and full reasoning, with
+  explicit Confirm-accepted / Confirm-declined buttons. Disappears once
+  either action is confirmed, or once a real technician status update
+  supersedes the question.
+- 20 new tests across `tests/test_technician_ack.py` (pure matching),
+  `tests/test_application_service.py` (service-layer idempotency/audit),
+  `tests/test_operator_api.py` (route/DTO integration, including an
+  AMBIGUOUS case with two jobs genuinely waiting on the same technician).
+- **Verified end-to-end in a live browser** against the isolated demo:
+  seeded a bare "K" WhatsApp observation, confirmed the DTO correctly
+  classified it AMBIGUOUS (two demo jobs were waiting on the same
+  technician), confirmed accepting it via the real UI action persisted
+  and the panel updated to show "Technician confirmed accepted."
 
-Re-seeding a demo database, I forgot to set `OPERATOR_API_DB_PATH`
-before calling `operator_api`'s route functions directly (a script
-convenience, not the HTTP server) — two of them (`route_acknowledge`,
-`route_prepare_dispatch`) fell through to `operator_api.py`'s *default*
-DB path, which is `data/dispatcher.db`, before a third call raised an
-exception and stopped the sequence. I verified precisely what happened
-before doing anything else: both calls upsert into `dispatch_tracking`
-keyed by a synthetic `message_id` ("demo-m1") that has no corresponding
-row in `quo_pending_messages`, `jobs`, or `events` in the real database
-— and a row for that exact `message_id`, dated **2026-08-01** (five
-days before this sprint), already existed, meaning this exact mistake
-happened once before in an earlier phase. Because the write is a
-COALESCE-based "set once" upsert, my accidental re-run found the fields
-already populated and changed nothing (confirmed: `jobs` and `events`
-row counts identical before/after, `PRAGMA integrity_check` clean). Net
-effect: zero. I'm disclosing it anyway because "I checked and it was
-harmless" is exactly the kind of claim that needs the evidence attached,
-not just the conclusion.
+**Commits:** `7d7cba1`, `8873827`.
+
+## Full-suite verification (both priorities)
+
+Ran twice (once per priority, from a clean background process): 1378
+tests then 1401 tests, both green except one pre-existing, reproducible
+flake (`test_post_with_valid_csrf_token_reaches_the_route` — a socket
+`recv_into` timeout during teardown, confirmed to pass on isolated
+retry both times it appeared; unrelated to any change this sprint or
+last — it also appeared in the prior sprint's report). Real DB
+integrity/FK checks clean and job/event counts unchanged after both runs.
 
 ## What was deliberately not attempted, and why
 
-The sprint's brief describes 15 major steps, several of which are each
-a multi-hour feature in their own right (a new technician-K-matching
-system with confidence scoring; 5 full synthetic demo scenarios wired
-through real service paths; a 12-minute sales script; 4 commercial docs
-rewritten in full). Rather than touch all of them shallowly, I picked
-the one gap the audit proved was real, safely scoped, and directly
-matched the sprint's own "non-negotiable workflow," and did it
-completely — implementation, verification in a live browser, and
-tests — rather than leaving a wider set of half-finished pieces.
+Priorities 3-7 from this sprint's brief were not started:
 
-Specifically not started:
-
-- **Technician "K"/acceptance tracking (Step 6).** No schema concept
-  exists for this at all (confirmed in the audit). This is a real
-  design task — matching evidence, confidence categories, a new
-  `dispatch_tracking`-style column or table — not a wiring fix like the
-  update/reply gap was. Flagged in `docs/KNOWN_LIMITATIONS.md`.
-- **Formal `DeliveryConnector` class (Step 12).** Deliberately not
-  built — see the audit's reasoning above. If a future phase wants the
-  literal `prepare()/deliver()/status()` interface shape (e.g. to make
-  a future sanctioned Quo/WhatsApp connector a drop-in), it should wrap
-  the *existing* `dispatch_tracking`/`mark_*_prepared`/`mark_*_sent_manually`
-  functions rather than duplicate their logic.
-- **A dedicated "Action Center" screen (Step 8).** The audit found
-  Command Center already serves this role structurally; the real gap
-  was that one of the actions it should route to (company update) had
-  nothing behind it. That's now fixed. A literal new screen would
-  duplicate Command Center without solving a problem that still exists.
-- **Steps 2-5 UI polish, lifecycle stepper (Step 9), 5 demo scenarios
-  (Step 10), sales script (Step 11), full commercial-doc rewrite (Step
-  14), additional screenshots beyond the one captured (Step 15).** Not
-  started this sprint.
+- **P3 — Unified next-action projection.** A real per-job workflow
+  projection already exists and now covers technician acceptance too
+  (`_active_next_action_label` plus the `technician_k`/
+  `company_update_owed` DTOs added across the last two sprints). What
+  the brief additionally wants is *every* CRM screen (New Jobs,
+  Closings, not just Active) consuming one single projection function
+  instead of each screen computing its own next-action signal. That's
+  a real refactor touching several route handlers and their read
+  models, not a wiring gap — doing it hastily risks silently changing
+  behavior on screens that already work and are tested. Scoped, not
+  started.
+- **P4 — Action Center.** Per the audit, Command Center already serves
+  this structural role; building a literal second screen without first
+  finishing P3's unified projection would mean the new screen either
+  duplicates each source screen's logic a third time, or is built on
+  the same per-screen computation P3 is meant to eliminate. Sequencing
+  matters here — P3 before P4.
+- **P5 — Five synthetic demo scenarios**, **P6 — lifecycle stepper
+  UI**, **P7 — sales/commercial doc rewrite.** Each is a real, multi-hour
+  deliverable in its own right. Not started.
 
 ## Exact next steps
 
-In priority order, for whoever picks this up next:
-
-1. **Design technician-K/acceptance tracking** (Step 6). Start by
-   reading `whatsapp_bridge_adapter.py`'s `_ACKNOWLEDGEMENT_ONLY_TEXTS`
-   handling and `docs/END_TO_END_WORKFLOW_AUDIT.md`'s step 6 entry —
-   the matching-evidence fields the original sprint brief listed
-   (allowlisted group, quoted-message ID, ticket/PDL, timestamp
-   proximity, confidence category) are a reasonable starting spec.
-2. **Build 3-5 synthetic end-to-end demo scenarios** (Step 10) through
-   real service paths (`seed_and_dispatch()`-style, matching
-   `scripts/seed_command_center_demo_db.py`'s existing pattern) —
-   Happy Path, Human Review, Duplicate/Correction are the highest-value
-   three if time is short.
-3. **Write `docs/SALES_DEMO_SCRIPT.md`'s update** (Step 11) once the
-   demo scenarios above exist to script against.
-4. Full `docs/COMMERCIAL_READINESS.md` / `PRODUCTION_CHECKLIST.md` /
-   `CUSTOMER_ONBOARDING.md` pass (Step 14) — this sprint only touched
-   the one section directly affected by the update/reply fix.
-5. Capture the remaining screenshots (Step 15) once the above exist to
-   screenshot.
+1. **P3 first, then P4.** Design one projection function (module-level,
+   pure, takes a job + its related state, returns the fixed label set
+   from the brief) that `route_new_jobs`, `route_active`, and
+   `route_closings` all call instead of each computing next-action
+   independently. Migrate one screen at a time, re-running that
+   screen's existing tests after each migration before moving to the
+   next, so a regression is caught immediately and attributable.
+2. **Then Action Center (P4)**, once every screen the brief lists (new
+   jobs, company K owed, ready-for-dispatch, waiting-for-K, updates to
+   review, company updates owed, closings to review/send, human
+   review) has one real, projection-backed data source to read from.
+3. **Demo scenarios (P5)** — Happy Path first (it exercises P1-P4's
+   work end-to-end and makes a good regression fixture for future
+   sprints), then Human Review and Duplicate/Correction if time allows.
+4. **Lifecycle stepper (P6)** and **sales/doc updates (P7)** — lowest
+   priority; cosmetic/narrative, not functional gaps.
 
 ## Safety confirmations (re-verified at checkpoint time)
 
 - Real `data/dispatcher.db`: `PRAGMA integrity_check` = `ok`, zero FK
-  violations, 6 jobs / 10 events — identical to the sprint's starting
-  count.
-- `.env`: no diff from sprint start; still exactly 2
-  `OPERATOR_API_SESSION_SECRET` lines; no secret rotation, printing, or
-  cleanup performed.
-- No Quo message sent (Quo client remains structurally GET-only,
-  unchanged this sprint; `QUO_OUTBOUND_MODE` unset/disabled in the real
-  `.env`).
-- No WhatsApp message sent (bridge adapter remains structurally
-  receive-only, unchanged this sprint).
-- The live WhatsApp bridge was never started or re-paired — the demo
-  server this sprint used ran with `--no-bridge-adapter` throughout.
-- All new tests use `tmp_path`-backed throwaway databases
-  (`api_env` fixture) — zero real network calls, zero real-DB access.
+  violations, 6 jobs / 10 events — identical to both this sprint's and
+  the prior sprint's starting count.
+- `.env`: no diff; still exactly 2 `OPERATOR_API_SESSION_SECRET` lines;
+  no secret rotation, printing, or cleanup performed (none was needed
+  or attempted, per the brief's explicit instruction).
+- No Quo message sent (client remains structurally GET-only, unchanged).
+- No WhatsApp message sent (bridge remains structurally receive-only,
+  unchanged; this sprint's new `technician_ack` module only *reads*
+  observations already captured by the existing receive-only path and
+  never sends anything).
+- The live WhatsApp bridge was never started or re-paired — every demo
+  server this sprint used ran with `--no-bridge-adapter`.
+- All new tests use `tmp_path`/`api_env`-backed throwaway databases —
+  zero real network calls, zero real-DB writes (independently confirmed
+  by the new session-wide tripwire fixture in `conftest.py`).
 
 ## Demo
 
 Isolated demo running at `http://127.0.0.1:8517` against a freshly
-seeded throwaway database at
-`<session scratchpad>/sprint_demo.db` (never `data/dispatcher.db`).
+seeded throwaway database in the session scratchpad (never
+`data/dispatcher.db`), seeded via the now-fail-closed seed script.
 Login password is a per-process override, never the real
-`LUXOR_DEMO_PASSWORD` — see the final report for the exact (test-only)
-value if you want to click through it yourself; it's not written to
-any file, only passed as an environment variable to the running
-process.
+`LUXOR_DEMO_PASSWORD` — not written to any file, only passed as an
+environment variable to the running process; see the final report if
+you want the exact value to click through it yourself.
