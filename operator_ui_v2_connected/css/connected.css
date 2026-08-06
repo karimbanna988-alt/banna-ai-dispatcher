@@ -55,9 +55,14 @@
 
 /* --------------------------------------------------------- Login screen - */
 .login-screen {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
   background: var(--bg);
   padding: 16px;
+}
+#loginDemoModeBanner {
+  background: var(--danger); color: #fff; text-align: center; font-weight: 700;
+  font-size: 12.5px; letter-spacing: 0.02em; padding: 8px 14px; border-radius: var(--radius);
+  text-transform: uppercase; max-width: 360px; width: 100%; margin-bottom: 14px;
 }
 .login-card {
   background: var(--surface); border-radius: 14px; padding: 36px 30px; width: 100%; max-width: 360px;

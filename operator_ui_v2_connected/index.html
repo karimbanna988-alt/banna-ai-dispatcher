@@ -10,6 +10,7 @@
 <body>
 
 <div id="loginScreen" class="login-screen">
+  <div id="loginDemoModeBanner" style="display:none;">DEMO MODE &mdash; Synthetic data only. No live Quo or WhatsApp connection.</div>
   <div class="login-card">
     <div class="login-brand">LUXOR</div>
     <div class="login-sub">Dispatch Command Center</div>
@@ -32,7 +33,7 @@
 <header class="app-header">
   <div class="brand">
     LUXOR
-    <span class="status-text">Connected -- real data · manual WhatsApp bridge</span>
+    <span class="status-text" id="headerStatusText">Connected -- real data · manual WhatsApp bridge</span>
   </div>
   <div class="header-actions">
     <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>

@@ -43,6 +43,7 @@ const Api = {
     try { await this._call("POST", "/api/logout", {}); } finally { this._csrfToken = null; }
   },
   checkSession() { return this._call("GET", "/api/me"); },
+  getDemoStatus() { return this._call("GET", "/api/demo_status"); },
 
   getCommandCenter(chartPeriod) {
     const qs = chartPeriod ? `?chart_period=${encodeURIComponent(chartPeriod)}` : "";

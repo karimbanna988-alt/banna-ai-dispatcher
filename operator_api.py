@@ -352,6 +352,13 @@ def route_me(handler: "Handler", match: dict, body: dict) -> dict:
     return {"authenticated": True, "demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true"}
 
 
+def route_demo_status(handler: "Handler", match: dict, body: dict) -> dict:
+    """Unauthenticated on purpose -- exposes nothing but a boolean, so the
+    login screen itself can show a DEMO MODE indicator before any
+    credential is entered. No PII, no secret, no job data."""
+    return {"demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true"}
+
+
 # --------------------------------------------------------- Route handlers -
 def route_new_jobs(handler: "Handler", match: dict, body: dict) -> dict:
     """Returns incoming Quo/WhatsApp messages that have not yet been
@@ -1151,6 +1158,7 @@ ROUTES = [
     ("POST", r"^/api/login$", route_login, {"public": True, "skip_csrf": True}),
     ("POST", r"^/api/logout$", route_logout, {}),
     ("GET", r"^/api/me$", route_me, {}),
+    ("GET", r"^/api/demo_status$", route_demo_status, {"public": True}),
     ("GET", r"^/api/command_center$", route_command_center, {}),
     ("GET", r"^/api/inbox_review$", route_inbox_review, {}),
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),

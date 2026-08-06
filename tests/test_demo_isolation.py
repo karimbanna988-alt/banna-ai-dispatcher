@@ -103,6 +103,38 @@ def test_route_me_demo_mode_is_case_insensitive(api_env, monkeypatch):
     assert api.route_me(None, {}, {})["demo_mode"] is True
 
 
+# ---------------------------------------------- unauthenticated demo status
+def test_route_demo_status_reports_true_without_authentication(api_env, monkeypatch):
+    monkeypatch.setenv("LUXOR_DEMO_MODE", "true")
+    result = api.route_demo_status(None, {}, {})
+    assert result == {"demo_mode": True}
+
+
+def test_route_demo_status_reports_false_by_default(api_env, monkeypatch):
+    monkeypatch.delenv("LUXOR_DEMO_MODE", raising=False)
+    result = api.route_demo_status(None, {}, {})
+    assert result == {"demo_mode": False}
+
+
+def test_demo_status_route_is_registered_as_public_get():
+    matches = [
+        (method, pattern.pattern, opts)
+        for method, pattern, fn, opts in api._COMPILED_ROUTES
+        if fn is api.route_demo_status
+    ]
+    assert len(matches) == 1
+    method, pattern, opts = matches[0]
+    assert method == "GET"
+    assert opts.get("public") is True
+
+
+def test_demo_status_route_exposes_only_a_boolean(api_env, monkeypatch):
+    monkeypatch.setenv("LUXOR_DEMO_MODE", "true")
+    result = api.route_demo_status(None, {}, {})
+    assert set(result.keys()) == {"demo_mode"}
+    assert isinstance(result["demo_mode"], bool)
+
+
 def test_route_me_demo_mode_false_for_any_other_value(api_env, monkeypatch):
     monkeypatch.setenv("LUXOR_DEMO_MODE", "1")  # only the literal "true" counts
     assert api.route_me(None, {}, {})["demo_mode"] is False

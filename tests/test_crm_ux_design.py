@@ -230,3 +230,40 @@ def test_charts_receive_data_only_from_dashboard_argument_never_a_new_fetch(app_
     section = app_js[chart_start:chart_end]
     assert "Api." not in section
     assert "fetch(" not in section
+
+
+# ------------------------------------------ login-screen demo mode banner -
+def test_login_screen_has_a_demo_mode_banner_with_required_copy(index_html):
+    login_start = index_html.index('id="loginScreen"')
+    login_end = index_html.index('id="appShell"')
+    section = index_html[login_start:login_end]
+    assert 'id="loginDemoModeBanner"' in section
+    assert "DEMO MODE" in section
+    assert "Synthetic data only" in section
+    assert "No live Quo or WhatsApp connection" in section
+
+
+def test_login_screen_banner_hidden_by_default(index_html):
+    banner_tag = re.search(r'<div id="loginDemoModeBanner"[^>]*>', index_html).group(0)
+    assert 'display:none' in banner_tag
+
+
+def test_login_demo_banner_never_appears_inside_appshell(index_html):
+    """The login-screen banner must be a sibling of appShell, not nested
+    inside it -- otherwise it would be gated by the same auth-only
+    display toggle as the post-login banner instead of showing before
+    any login attempt."""
+    appshell_start = index_html.index('id="appShell"')
+    appshell_end = index_html.index("</html>")
+    assert 'id="loginDemoModeBanner"' not in index_html[appshell_start:appshell_end]
+
+
+def test_boot_fetches_demo_status_unconditionally_before_login(app_js):
+    boot_index = app_js.index("(async function boot()")
+    pre_boot = app_js[:boot_index]
+    assert "Api.getDemoStatus()" in pre_boot
+
+
+def test_demo_status_fetch_never_blocks_or_gates_login(app_js):
+    fetch_block = app_js[app_js.index("Api.getDemoStatus()"):app_js.index("(async function boot()")]
+    assert ".catch(() => {})" in fetch_block or ".catch(" in fetch_block

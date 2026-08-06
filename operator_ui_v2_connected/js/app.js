@@ -101,6 +101,9 @@ function showApp(demoMode) {
   document.getElementById("loginScreen").style.display = "none";
   document.getElementById("appShell").style.display = "block";
   document.getElementById("demoModeBanner").style.display = demoMode ? "block" : "none";
+  document.getElementById("headerStatusText").textContent = demoMode
+    ? "Demo -- synthetic data only, not connected to Quo or WhatsApp"
+    : "Connected -- real data · manual WhatsApp bridge";
   setScreen("commandcenter");
 }
 
@@ -166,6 +169,14 @@ async function attemptLogout() {
   showLogin();
 }
 document.getElementById("settingsLogoutItem").addEventListener("click", () => { closeSettingsMenu(); attemptLogout(); });
+
+// Fire-and-forget: shows the DEMO MODE indicator on the login screen
+// itself, before any credential is entered. Never blocks or gates
+// login -- if this call fails for any reason, the banner just stays
+// hidden and login proceeds normally.
+Api.getDemoStatus().then(status => {
+  document.getElementById("loginDemoModeBanner").style.display = (status && status.demo_mode) ? "block" : "none";
+}).catch(() => {});
 
 (async function boot() {
   try {
