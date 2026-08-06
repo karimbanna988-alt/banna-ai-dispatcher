@@ -44,6 +44,13 @@ def main_leads_message(ticket: str, area: str = "Savannah, GA 31401") -> str:
     )
 
 
+def lucky_message(ticket: str, area: str = "Charlotte, NC") -> str:
+    return (
+        f"Confirm: pd.getjobox.com/demo123\n\nCo: LUCKY LOCKSMITH LLC\nPDL: {ticket}\n"
+        f"Ph: 5550105000\nAddr: 300 Demo Ln, {area}\nDesc: Business Lockout\nOccu: Locksmith\n\nNotes:\n"
+    )
+
+
 def seed(db_path: Path) -> None:
     from dispatcher import storage
 
@@ -191,6 +198,36 @@ def seed(db_path: Path) -> None:
     conn.commit()
     conn.close()
 
+    # F600/F700/F800: three more assigned + backdated-stale jobs, from a
+    # third source (Lucky) and mixed technicians, purely so the visual
+    # redesign (KPI tints, capped Attention Now, capped Active preview,
+    # avatar badges, alternating rows) is actually exercised by more than
+    # 2 stale examples -- matches this round's "populated visual
+    # fixtures" requirement, not a change to any deterministic rule.
+    jobF6 = seed_and_dispatch("demo-mf6", lucky_message("F600"))
+    assign(jobF6, tech_c)
+    stale_at_f6 = (datetime.now(timezone.utc) - timedelta(hours=6, minutes=30)).isoformat().replace("+00:00", "Z")
+    conn = storage.connect(db_path)
+    conn.execute("UPDATE jobs SET last_event_at = ?, updated_at = ? WHERE id = ?", (stale_at_f6, stale_at_f6, jobF6))
+    conn.commit()
+    conn.close()
+
+    jobF7 = seed_and_dispatch("demo-mf7", agn_message("F700", area="Charlotte, NC"))
+    assign(jobF7, tech_a)
+    stale_at_f7 = (datetime.now(timezone.utc) - timedelta(hours=3, minutes=15)).isoformat().replace("+00:00", "Z")
+    conn = storage.connect(db_path)
+    conn.execute("UPDATE jobs SET last_event_at = ?, updated_at = ? WHERE id = ?", (stale_at_f7, stale_at_f7, jobF7))
+    conn.commit()
+    conn.close()
+
+    jobF8 = seed_and_dispatch("demo-mf8", lucky_message("F800", area="Savannah, GA"))
+    assign(jobF8, tech_c)
+    stale_at_f8 = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat().replace("+00:00", "Z")
+    conn = storage.connect(db_path)
+    conn.execute("UPDATE jobs SET last_event_at = ?, updated_at = ? WHERE id = ?", (stale_at_f8, stale_at_f8, jobF8))
+    conn.commit()
+    conn.close()
+
     # One synthetic WhatsApp observation, in-memory only (this process),
     # for the Active screen / Attention now WhatsApp-item demonstration.
     whatsapp_bridge_adapter.add_observation({
@@ -238,12 +275,17 @@ def seed(db_path: Path) -> None:
 
     print(
         f"Seeded demo DB at {db_path}: "
-        f"jobs {job1}, {job2}, {job3}, {job4}, {job6}, {jobF1}, {jobF2}, {jobF3}, {jobF4}, {jobF5}; "
+        f"jobs {job1}, {job2}, {job3}, {job4}, {job6}, {jobF1}, {jobF2}, {jobF3}, {jobF4}, {jobF5}, "
+        f"{jobF6}, {jobF7}, {jobF8}; "
         f"technicians {tech_a} (Ashraf), {tech_b} (Sebai), {tech_c} (Marcus); 30 archive messages.\n"
         f"Active-board fixtures: F100={jobF1} (assigned, awaiting technician), "
         f"F200={jobF2} (assigned, recent ETA update), F300={jobF3} (In Progress, Going update), "
         f"F400={jobF4} (In Progress, Completed update -- closing needed), "
-        f"F500={jobF5} (assigned, backdated stale)."
+        f"F500={jobF5} (assigned, backdated stale, Main Leads), "
+        f"F600={jobF6} (assigned, backdated stale, Lucky), "
+        f"F700={jobF7} (assigned, backdated stale, AGN), "
+        f"F800={jobF8} (assigned, backdated stale, Lucky) -- "
+        f"8 active-board jobs, 5 stale/attention examples, 3 sources (AGN/Main Leads/Lucky)."
     )
 
 
