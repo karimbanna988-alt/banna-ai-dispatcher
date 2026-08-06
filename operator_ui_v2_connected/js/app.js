@@ -121,7 +121,7 @@ function clearAllLocalData() {
    "learningTableBody", "learningMobileList", "learningDetailPane",
    "whatsappPendingList", "whatsappBridgeBanner",
    "ccKpiGrid", "ccClosedAmount", "ccAttentionList", "ccActiveTableBody", "ccActiveMobileList",
-   "ccSourceMixChart", "ccPipelineChart", "ccTechActivityChart", "ccClosingsChart", "ccGeneratedAt"].forEach(id => {
+   "ccSourceMixChart", "ccPipelineChart", "ccTechActivityChart", "ccGeneratedAt"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
   });
@@ -676,6 +676,11 @@ function wireScreenLinks(container) {
 }
 
 const ccState = { chartPeriod: "today" };
+// Show the essential first, reveal the rest only when opened: the
+// dashboard is a summary, not a full list -- "View all" links to the
+// dedicated screen for anything beyond these caps.
+const CC_ATTENTION_MAX = 5;
+const CC_ACTIVE_BOARD_MAX = 6;
 
 async function loadCommandCenter() {
   const dashboard = await callOrHandleAuth(() => Api.getCommandCenter(ccState.chartPeriod));
@@ -784,9 +789,17 @@ function ccActiveMobileCardHtml(j) {
 const CC_CHART_COLORS = ["#2955d8", "#1f7d6f", "#9a5a12", "#c8323a", "#6b4fa0", "#0f2a4a"];
 
 function ccDonutChartSvg(counts) {
-  const entries = Object.entries(counts).filter(([, n]) => n > 0);
+  let entries = Object.entries(counts).filter(([, n]) => n > 0);
   const total = entries.reduce((sum, [, n]) => sum + n, 0);
   if (!total) return `<div class="empty-state">No jobs received yet today.</div>`;
+  // Never more than 6 slices -- readability over completeness. Beyond
+  // that, keep the top 5 by count and fold the rest into "Other".
+  if (entries.length > 6) {
+    const sorted = [...entries].sort((a, b) => b[1] - a[1]);
+    const top = sorted.slice(0, 5);
+    const otherTotal = sorted.slice(5).reduce((sum, [, n]) => sum + n, 0);
+    entries = [...top, ["Other", otherTotal]];
+  }
   const r = 54, cx = 60, cy = 60, circumference = 2 * Math.PI * r;
   let offset = 0;
   const arcs = entries.map(([label, n], i) => {
@@ -838,19 +851,6 @@ function ccTechActivityHtml(rows) {
   }).join("") + `</div>`;
 }
 
-function ccClosingsChartHtml(kpi) {
-  if (kpi.data_quality === "ok") {
-    return `<div class="cc-closed-amount-card cc-closed-amount-ok" style="margin:0;">
-      <div class="cc-closed-amount-value">$${Number(kpi.value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-      <div class="cc-closed-amount-label">${kpi.numerator} verified closing(s) today</div>
-    </div>`;
-  }
-  if (kpi.data_quality === "zero") {
-    return `<div class="empty-state">No jobs closed yet today.</div>`;
-  }
-  return `<div class="empty-state">Closing data incomplete -- ${kpi.numerator} of ${kpi.denominator} closed job(s) have a reliable numeric amount. Not shown as a chart to avoid implying more confidence than the data supports.</div>`;
-}
-
 function renderCommandCenterScreen(dashboard, activeEntries) {
   const k = dashboard.kpis;
   document.getElementById("ccGeneratedAt").textContent = "As of " + new Date(dashboard.generated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
@@ -871,16 +871,19 @@ function renderCommandCenterScreen(dashboard, activeEntries) {
 
   const attentionList = document.getElementById("ccAttentionList");
   const attentionEmpty = document.getElementById("ccAttentionEmpty");
-  if (dashboard.attention_now.length) {
+  const attentionViewAllWrap = document.getElementById("ccAttentionViewAllWrap");
+  const attentionForBoard = dashboard.attention_now.slice(0, CC_ATTENTION_MAX);
+  if (attentionForBoard.length) {
     attentionEmpty.style.display = "none";
-    attentionList.innerHTML = dashboard.attention_now.map(ccAttentionItemHtml).join("");
+    attentionList.innerHTML = attentionForBoard.map(ccAttentionItemHtml).join("");
     wireScreenLinks(attentionList);
   } else {
     attentionEmpty.style.display = "block";
     attentionList.innerHTML = "";
   }
+  attentionViewAllWrap.style.display = dashboard.attention_now.length > attentionForBoard.length ? "inline" : "none";
 
-  const activeForBoard = activeEntries.filter(j => j.technician_name).slice(0, 8);
+  const activeForBoard = activeEntries.filter(j => j.technician_name).slice(0, CC_ACTIVE_BOARD_MAX);
   const activeTbody = document.getElementById("ccActiveTableBody");
   const activeMobile = document.getElementById("ccActiveMobileList");
   const activeEmpty = document.getElementById("ccActiveEmpty");
@@ -906,7 +909,6 @@ function renderCommandCenterScreen(dashboard, activeEntries) {
   document.getElementById("ccSourceMixChart").innerHTML = ccDonutChartSvg(dashboard.charts.job_source_mix);
   document.getElementById("ccPipelineChart").innerHTML = ccPipelineBarsHtml(dashboard.charts.job_pipeline);
   document.getElementById("ccTechActivityChart").innerHTML = ccTechActivityHtml(dashboard.charts.technician_activity);
-  document.getElementById("ccClosingsChart").innerHTML = ccClosingsChartHtml(dashboard.charts.verified_closings);
 }
 
 document.getElementById("ccChartPeriodSelect").addEventListener("change", (e) => {
@@ -986,11 +988,13 @@ async function handleWhatsappPendingAction(action, messageId) {
 
 function activeMobileRowHtml(j) {
   const actionable = j.bucket === "needs_action";
+  const stage = ccStageBadge(j.next_action);
+  const lastUpdate = j.waiting_since ? j.waiting_since.slice(0, 16).replace("T", " ") : "—";
   return `
     <div class="mobile-row job-card ${actionable ? "needs-action" : "waiting"}" data-id="${j.id}">
-      <div class="row-top">${sourceChip(j.source)} <strong>${esc(j.ticket || "No ref")}</strong></div>
-      <div class="row-bottom">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")}</div>
-      <div class="row-status"><span class="chip ${actionable ? "chip-needs-action" : "chip-waiting"}">${esc(j.status)}</span></div>
+      <div class="row-top"><strong>${esc(j.ticket || "No ref")}</strong> <span class="chip ${stage.cls}">${stage.label}</span></div>
+      <div class="row-bottom">${sourceChip(j.source)} ${esc(j.city || "")} · ${esc(j.description || "—")}</div>
+      <div class="row-bottom">${esc(j.technician_name || "Unassigned")} · Last update ${esc(lastUpdate)}</div>
       ${actionable
         ? `<button type="button" class="btn btn-primary btn-block card-primary-btn">${esc(j.next_action)}</button>`
         : `<div class="row-next-action">${esc(j.next_action)}</div>`}
@@ -1000,15 +1004,20 @@ function activeMobileRowHtml(j) {
 function renderActiveScreen() {
   document.getElementById("activeCount").textContent = `(${activeJobs.length})`;
   const tbody = document.getElementById("activeTableBody");
-  tbody.innerHTML = activeJobs.length ? activeJobs.map(j => `
+  tbody.innerHTML = activeJobs.length ? activeJobs.map(j => {
+    const stage = ccStageBadge(j.next_action);
+    return `
     <tr data-id="${j.id}" class="${state.activeSelected === j.id ? "selected" : ""}">
       <td><strong>${esc(j.ticket || "No ref")}</strong></td>
       <td>${sourceChip(j.source)}</td>
-      <td>${esc(j.technician_name || "Unassigned")}</td>
       <td>${esc(j.city || "")}</td>
+      <td>${esc(j.description || "—")}</td>
+      <td>${esc(j.technician_name || "Unassigned")}</td>
+      <td><span class="chip ${stage.cls}">${stage.label}</span></td>
       <td>${esc(j.waiting_since ? j.waiting_since.slice(0, 16).replace("T", " ") : "—")}</td>
       <td>${esc(j.next_action)}</td>
-    </tr>`).join("") : `<tr><td colspan="6"><div class="empty-state">No active jobs.</div></td></tr>`;
+    </tr>`;
+  }).join("") : `<tr><td colspan="8"><div class="empty-state">No active jobs.</div></td></tr>`;
   tbody.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => selectActive(parseInt(tr.dataset.id, 10))));
 
   const mobileList = document.getElementById("activeMobileList");
@@ -1550,8 +1559,15 @@ function renderTechniciansScreen(missingDispatch, missingClosing) {
       <div class="row-top"><strong>${esc(t.name)}</strong><span class="age">${t.active ? "Active" : "Inactive"}</span></div>
       <div class="row-bottom">${(t.areas || []).map(esc).join(", ")}</div>
       ${!t.configured ? `<div class="chip chip-warning" style="margin-top:4px;">WhatsApp group not configured.</div>` : ""}
-      ${techEditFormHtml(t)}
+      <button type="button" class="btn btn-secondary" style="margin-top:6px;" data-toggledetail="${t.id}">View details</button>
+      <div id="techMobileDetail-${t.id}" style="display:none; margin-top:6px;">${techEditFormHtml(t)}</div>
     </div>`).join("");
+  mobileList.querySelectorAll("[data-toggledetail]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const detail = document.getElementById(`techMobileDetail-${btn.dataset.toggledetail}`);
+      detail.style.display = detail.style.display === "none" ? "block" : "none";
+    });
+  });
   wireTechEditForms();
 }
 
