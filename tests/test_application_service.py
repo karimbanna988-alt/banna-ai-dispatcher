@@ -142,6 +142,73 @@ def test_double_click_complete_job_is_idempotent(service, job_id):
     assert len(completed) == 1
 
 
+# ------------------------------------------------- technician K accept ---
+def _seed_observation(conn, message_id="wamid.1", text="K", group_name="Ref Group", extracted_ticket=None, quoted_message_id=None):
+    storage.add_whatsapp_observation(conn, {
+        "message_id": message_id, "group_id": "g1", "group_name": group_name, "text": text,
+        "extracted_ticket": extracted_ticket, "quoted_message_id": quoted_message_id,
+        "received_at": "2026-01-01T00:00:00Z",
+    })
+
+
+def test_confirm_technician_accepted_records_milestone_and_audit_event(conn, service, job_id):
+    _seed_observation(conn)
+    result = service.confirm_technician_accepted(job_id, "wamid.1")
+    assert result.success is True
+    assert result.idempotent_replay is False
+    ta = storage.get_technician_acceptance(conn, job_id)
+    assert ta["accepted_at"] is not None
+    assert ta["accepted_via_message_id"] == "wamid.1"
+    events = service.get_job_history(job_id)
+    accepted_events = [e for e in events if e["final_action"] == ActionName.TECHNICIAN_ACCEPTED.value]
+    assert len(accepted_events) == 1
+
+
+def test_confirm_technician_accepted_is_idempotent_on_replay(conn, service, job_id):
+    _seed_observation(conn)
+    r1 = service.confirm_technician_accepted(job_id, "wamid.1")
+    r2 = service.confirm_technician_accepted(job_id, "wamid.1")
+    assert r1.idempotent_replay is False
+    assert r2.idempotent_replay is True
+    events = service.get_job_history(job_id)
+    accepted_events = [e for e in events if e["final_action"] == ActionName.TECHNICIAN_ACCEPTED.value]
+    assert len(accepted_events) == 1
+
+
+def test_confirm_technician_accepted_also_resolves_the_observation(conn, service, job_id):
+    _seed_observation(conn)
+    service.confirm_technician_accepted(job_id, "wamid.1")
+    obs = storage.get_whatsapp_observation(conn, "wamid.1")
+    assert obs["status"] == "attached"
+    assert obs["job_id"] == job_id
+
+
+def test_confirm_technician_declined_requires_a_reason(service, job_id):
+    result = service.confirm_technician_declined(job_id, "wamid.1", "")
+    assert result.success is False
+    assert result.validation_issues
+
+
+def test_confirm_technician_declined_records_milestone_and_audit_event(conn, service, job_id):
+    _seed_observation(conn, text="no")
+    result = service.confirm_technician_declined(job_id, "wamid.1", "technician says too far")
+    assert result.success is True
+    ta = storage.get_technician_acceptance(conn, job_id)
+    assert ta["declined_at"] is not None
+    assert ta["decline_reason"] == "technician says too far"
+    events = service.get_job_history(job_id)
+    declined_events = [e for e in events if e["final_action"] == ActionName.TECHNICIAN_DECLINED.value]
+    assert len(declined_events) == 1
+
+
+def test_technician_acceptance_never_touches_job_status(conn, service, job_id):
+    before = storage.get_job_by_id(conn, job_id)["status"]
+    _seed_observation(conn)
+    service.confirm_technician_accepted(job_id, "wamid.1")
+    after = storage.get_job_by_id(conn, job_id)["status"]
+    assert before == after
+
+
 def test_repeated_pass_cancel_after_first_success_fails_safely(service, job_id):
     r1 = service.pass_or_cancel_job(job_id, "Cancel", "customer cancelled")
     assert r1.success is True

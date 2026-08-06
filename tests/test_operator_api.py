@@ -1033,6 +1033,114 @@ def test_company_update_routes_never_touch_quo_or_whatsapp_adapters():
         assert "whatsapp_adapter" not in src
 
 
+# ============================================= TECHNICIAN K ACCEPTANCE ====
+# Step 6 of the end-to-end workflow: there was previously no schema
+# concept of "the technician accepted this job" anywhere -- a bare "K"
+# reply was only ever surfaced for human review, never tracked as a job
+# fact. See docs/END_TO_END_WORKFLOW_AUDIT.md and dispatcher.technician_ack.
+def _seed_active_job_with_technician(db_path) -> int:
+    """_seed_active_job() only dispatches a job -- it never assigns a
+    technician (assign_technician() is a separate, explicit action; see
+    storage.assign_technician()'s own docstring). The K-acceptance tests
+    need a real assignment to exist, so this mirrors exactly how
+    scripts/seed_command_center_demo_db.py does it: dispatch, then a
+    separate explicit assign_technician() call."""
+    from dispatcher.rules.service_areas import load_service_areas
+    tech_id = add_configured_technician(db_path)
+    seed_live_boundary(db_path)
+    seed_pending(db_path, "m1", agn_message("A200"))
+    api.route_acknowledge(None, {"message_id": "m1"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m1"}, {})
+    job_id = api.route_confirm_dispatch(None, {"message_id": "m1"}, {})["job_id"]
+    conn = storage.connect(db_path)
+    try:
+        storage.assign_technician(conn, job_id, tech_id, load_service_areas())
+    finally:
+        conn.close()
+    return job_id
+
+
+def _seed_bridge_observation(message_id="wamid.1", text="K", group_name="Fab Dispatch", extracted_ticket=None):
+    import whatsapp_bridge_adapter as bridge_adapter
+    bridge_adapter.add_observation({
+        "event_type": "incoming_message", "message_id": message_id, "group_id": "g1",
+        "group_name": group_name, "sender": "1555", "timestamp": "1700000000", "text": text,
+        "extracted_ticket": extracted_ticket,
+    })
+
+
+def test_technician_k_is_none_before_technician_assigned(api_env):
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A300"))
+    api.route_acknowledge(None, {"message_id": "m1"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m1"}, {})
+    result = api.route_confirm_dispatch(None, {"message_id": "m1"}, {})
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == result["job_id"])
+    assert entry["technician_k"] is None  # no technician assigned -- A300 had no configured technician
+
+
+def test_technician_k_waiting_surfaces_a_strong_candidate(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation()
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["technician_k"]["status"] == "waiting"
+    assert len(entry["technician_k"]["candidates"]) == 1
+    assert entry["technician_k"]["candidates"][0]["category"] == "STRONG"
+
+
+def test_technician_k_confirm_accepted_route(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation()
+    result = api.route_technician_k_confirm_accepted(None, {"id": str(job_id)}, {"message_id": "wamid.1"})
+    assert result["success"] is True
+
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["technician_k"]["status"] == "accepted"
+
+
+def test_technician_k_confirm_declined_route_requires_reason(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation(text="no")
+    with pytest.raises(api.ApiError):
+        api.route_technician_k_confirm_declined(None, {"id": str(job_id)}, {"message_id": "wamid.1", "reason": ""})
+
+
+def test_technician_k_confirm_declined_route(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation(text="no")
+    result = api.route_technician_k_confirm_declined(
+        None, {"id": str(job_id)}, {"message_id": "wamid.1", "reason": "too far"},
+    )
+    assert result["success"] is True
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["technician_k"]["status"] == "declined"
+    assert entry["technician_k"]["reason"] == "too far"
+
+
+def test_technician_k_never_appears_once_a_technician_update_is_recorded(api_env):
+    """Once the job has moved past "waiting for K" (a real status update
+    landed), the K panel should not keep asking the dispatcher to
+    resolve a moot question."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation()
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "on my way"})
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["technician_k"] is None
+
+
+def test_technician_k_routes_never_touch_quo_or_whatsapp_adapters():
+    import inspect
+    for fn in (api.route_technician_k_confirm_accepted, api.route_technician_k_confirm_declined):
+        src = inspect.getsource(fn)
+        assert "quo_adapter" not in src
+        assert "whatsapp_adapter" not in src
+
+
 # ==================================================== WHATSAPP BRIDGE =====
 import whatsapp_bridge_adapter as bridge_adapter  # noqa: E402
 
