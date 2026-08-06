@@ -270,6 +270,7 @@ function hideConfirmModal() {
 /* ================================================================= JOBS */
 async function refreshAll() {
   if (state.screen === "commandcenter") await loadCommandCenter();
+  else if (state.screen === "actioncenter") await loadActionCenter();
   else if (state.screen === "jobs") await loadJobs();
   else if (state.screen === "archive") await loadArchive();
   else if (state.screen === "active") await loadActive();
@@ -279,6 +280,70 @@ async function refreshAll() {
   else if (state.screen === "technicians") await loadTechnicians();
   else if (state.screen === "learning") await loadLearningReview();
   else if (state.screen === "performance") await loadPerformance();
+}
+
+const ACTION_CENTER_SECTIONS = [
+  { key: "new_jobs_to_review", title: "New jobs to review", empty: "No new jobs waiting on review." },
+  { key: "company_k_owed", title: "Company K acknowledgments owed", empty: "Nothing owed." },
+  { key: "ready_for_dispatch", title: "Ready for technician dispatch", empty: "Nothing ready to dispatch." },
+  { key: "assign_technician", title: "Assign a technician", empty: "Every approved job has a technician assigned." },
+  { key: "waiting_technician_k", title: "Waiting for technician K", empty: "Nothing waiting on a technician reply." },
+  { key: "technician_updates_to_review", title: "Technician updates to review", empty: "Nothing to review." },
+  { key: "company_updates_owed", title: "Company updates owed", empty: "Nothing owed." },
+  { key: "closings_to_review", title: "Closings to review", empty: "No incomplete closings." },
+  { key: "closings_ready_to_send", title: "Closings ready to send", empty: "Nothing ready to send." },
+  { key: "human_review_required", title: "Human review required", empty: "Nothing needs manual review." },
+];
+
+async function loadActionCenter() {
+  const data = await callOrHandleAuth(() => Api.getActionCenter());
+  if (!data) return;
+  renderActionCenterScreen(data.sections);
+}
+
+function actionCenterItemHtml(item) {
+  const label = `#${esc(item.ticket || "No ref")}`;
+  const age = item.waiting_since ? ageText(minutesSince(item.waiting_since)) : (item.age_minutes != null ? ageText(item.age_minutes) : "");
+  return `
+    <div class="cc-attention-row">
+      <div class="cc-attention-marker" aria-hidden="true">&#33;</div>
+      <div class="cc-attention-main">
+        <span class="cc-attention-ticket">${label}</span>
+        <span class="cc-attention-source">${esc(item.source || "")}${item.technician_name ? " &middot; " + esc(item.technician_name) : ""}</span>
+        ${age ? `<span class="cc-attention-age">${esc(age)}</span>` : ""}
+      </div>
+      <div class="cc-attention-reason">${esc(item.blocking_reason || "")}</div>
+      <button type="button" class="btn btn-secondary cc-small-btn" data-acscreen="${esc(item.screen)}" data-ackind="${esc(item.kind)}" data-acid="${esc(String(item.id))}">Open</button>
+    </div>`;
+}
+
+function renderActionCenterScreen(sections) {
+  const root = document.getElementById("actionCenterSections");
+  root.innerHTML = ACTION_CENTER_SECTIONS.map(meta => {
+    const section = sections[meta.key] || { items: [], total: 0 };
+    const rows = section.items.length
+      ? section.items.map(actionCenterItemHtml).join("")
+      : `<div class="empty-state">${esc(meta.empty)}</div>`;
+    const overflow = section.total > section.items.length
+      ? `<div class="detail-meta">Showing ${section.items.length} of ${section.total}.</div>` : "";
+    return `
+      <div class="cc-attention-section-wrap" style="margin-bottom:14px;">
+        <div class="subsection-label">${esc(meta.title)} <span class="count">(${section.total})</span></div>
+        ${rows}
+        ${overflow}
+      </div>`;
+  }).join("");
+  root.querySelectorAll("[data-acscreen]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const targetScreen = btn.dataset.acscreen;
+      const kind = btn.dataset.ackind;
+      const id = btn.dataset.acid;
+      setScreen(targetScreen);
+      if (kind === "job" && targetScreen === "active") {
+        setTimeout(() => selectActive(parseInt(id, 10)), 0);
+      }
+    });
+  });
 }
 
 let newJobsTotalPending = 0;

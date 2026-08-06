@@ -56,6 +56,8 @@ const Api = {
     return this._call("GET", `/api/inbox_review${qs ? "?" + qs : ""}`);
   },
 
+  getActionCenter() { return this._call("GET", "/api/action_center"); },
+
   getNewJobs() { return this._call("GET", "/api/new_jobs"); },
   sync() { return this._call("POST", "/api/sync", {}); },
   getActive() { return this._call("GET", "/api/active"); },

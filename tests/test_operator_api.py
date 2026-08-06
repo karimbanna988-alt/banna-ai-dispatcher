@@ -1141,6 +1141,88 @@ def test_technician_k_routes_never_touch_quo_or_whatsapp_adapters():
         assert "whatsapp_adapter" not in src
 
 
+# ===================================== WORKFLOW PROJECTION / ACTION CENTER
+def test_action_center_returns_all_nine_sections(api_env):
+    result = api.route_action_center(None, {}, {})
+    expected = {
+        "new_jobs_to_review", "company_k_owed", "ready_for_dispatch", "assign_technician",
+        "waiting_technician_k", "technician_updates_to_review", "company_updates_owed",
+        "closings_to_review", "closings_ready_to_send", "human_review_required",
+    }
+    assert expected <= set(result["sections"].keys())
+    for section in result["sections"].values():
+        assert "items" in section and "total" in section
+
+
+def test_action_center_lists_a_job_missing_technician_assignment(api_env):
+    job_id = _seed_active_job(api_env)  # no technician assigned
+    result = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in result["sections"]["assign_technician"]["items"]]
+    assert job_id in ids
+
+
+def test_action_center_lists_a_job_waiting_on_technician_k(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    result = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in result["sections"]["waiting_technician_k"]["items"]]
+    assert job_id in ids
+
+
+def test_action_center_lists_company_update_owed(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "on my way"})
+    result = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in result["sections"]["company_updates_owed"]["items"]]
+    assert job_id in ids
+    # ...and it must NOT still appear as merely "waiting on K" once it has moved past that stage.
+    assert job_id not in [i["id"] for i in result["sections"]["waiting_technician_k"]["items"]]
+
+
+def test_action_center_lists_handle_manually_under_human_review(api_env):
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A900"))
+    result = api.route_handle_manually(None, {"message_id": "m1"}, {})
+    job_id = result["job_id"]
+    ac = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in ac["sections"]["human_review_required"]["items"]]
+    assert job_id in ids
+
+
+def test_action_center_sections_cap_at_five_items(api_env):
+    from dispatcher.rules.service_areas import load_service_areas
+    tech_id = add_configured_technician(api_env)
+    seed_live_boundary(api_env)
+    for i in range(7):
+        seed_pending(api_env, f"m{i}", agn_message(f"A{900 + i}"))
+        api.route_acknowledge(None, {"message_id": f"m{i}"}, {})
+        api.route_prepare_dispatch(None, {"message_id": f"m{i}"}, {})
+        job_id = api.route_confirm_dispatch(None, {"message_id": f"m{i}"}, {})["job_id"]
+        conn = storage.connect(api_env)
+        try:
+            storage.assign_technician(conn, job_id, tech_id, load_service_areas())
+        finally:
+            conn.close()
+    result = api.route_action_center(None, {}, {})
+    section = result["sections"]["waiting_technician_k"]
+    assert len(section["items"]) == 5
+    assert section["total"] == 7
+
+
+def test_action_center_items_never_include_phone_or_address(api_env):
+    _seed_active_job_with_technician(api_env)
+    result = api.route_action_center(None, {}, {})
+    combined = json.dumps(result)
+    assert "phone" not in combined.lower()
+    assert "555-010" not in combined  # the fixture's own fake phone number
+
+
+def test_action_center_never_touches_quo_or_whatsapp_adapters():
+    import inspect
+    src = inspect.getsource(api.route_action_center)
+    assert "quo_adapter" not in src
+    assert "whatsapp_adapter" not in src
+
+
 # ==================================================== WHATSAPP BRIDGE =====
 import whatsapp_bridge_adapter as bridge_adapter  # noqa: E402
 

@@ -45,6 +45,7 @@
 
 <div class="settings-menu-backdrop" id="settingsMenuBackdrop"></div>
 <div class="settings-menu" id="settingsMenu">
+  <div class="settings-menu-item" data-screen="actioncenter">Action Center</div>
   <div class="settings-menu-item" data-screen="history" id="settingsCompletedItem">Completed</div>
   <div class="settings-menu-item" data-screen="performance">Performance</div>
   <div class="settings-menu-item" data-screen="technicians">Technicians</div>
@@ -56,6 +57,7 @@
 <div class="app-body">
   <nav class="desktop-sidebar" id="desktopSidebar">
     <div class="nav-item" data-screen="commandcenter" data-icon="&#9635;">Command Center</div>
+    <div class="nav-item" data-screen="actioncenter" data-icon="&#9873;">Action Center</div>
     <div class="nav-item" data-screen="jobs" data-icon="&#9737;">Jobs</div>
     <div class="nav-item" data-screen="active" data-icon="&#9679;">Active</div>
     <div class="nav-item" data-screen="closings" data-icon="&#36;">Closings</div>
@@ -75,7 +77,7 @@
       <div id="ccAttentionSection">
         <div class="cc-section-header">
           <div class="subsection-label">Attention now</div>
-          <span id="ccAttentionViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="jobs">View all</button></span>
+          <span id="ccAttentionViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="actioncenter">View all</button></span>
         </div>
         <div class="cc-attention-section-wrap">
           <div id="ccAttentionList"></div>
@@ -119,6 +121,13 @@
           <div id="ccTechActivityChart"></div>
         </div>
       </div>
+    </section>
+
+    <!-- =================================================== ACTION CENTER -->
+    <section class="screen" id="screen-actioncenter">
+      <div class="section-title">Action Center</div>
+      <div class="scope-note">Everything that needs a human decision right now, grouped by what's blocking it. Sourced from one workflow projection -- not a second, independent count.</div>
+      <div id="actionCenterSections"></div>
     </section>
 
     <!-- ============================================================ JOBS -->

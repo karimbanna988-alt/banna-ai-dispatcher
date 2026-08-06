@@ -81,6 +81,7 @@ from dispatcher.closing import ClosingInput, render_closing_from_persisted_field
 from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
+from dispatcher.workflow_projection import derive_next_action  # noqa: E402
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
@@ -556,6 +557,7 @@ def _technician_k_dto(conn, job: dict, all_jobs: list) -> Optional[dict]:
 def route_active(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
+        service = _service(conn)
         jobs = rm.get_active_jobs_detailed(conn)
         entries = []
         for j in jobs:
@@ -576,6 +578,7 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "shadow_episode": _episode_summary(episode) if episode else None,
                 "company_update_owed": _company_update_owed_dto(conn, j),
                 "technician_k": _technician_k_dto(conn, j, jobs),
+                "workflow": _workflow_projection_dto(conn, service, j, jobs),
             })
         return {"entries": entries}
     finally:
@@ -637,6 +640,137 @@ def _company_update_owed_dto(conn, job: dict) -> Optional[dict]:
         "confirmed": reply.confirmed,
         "reason": reply.reason,
     }
+
+
+def _closing_summary_for_projection(conn, service: DispatcherService, job: dict) -> Optional[dict]:
+    """The subset of _closing_dto's fields dispatcher.workflow_projection
+    actually needs, computed the same way _closing_dto does -- only
+    meaningful once status == "Closed" (matches _closing_dto's own
+    logic, which returns empty/None fields for any other status), so
+    this returns None otherwise rather than doing the extra work for
+    every job regardless of stage."""
+    if job.get("status") != "Closed":
+        return None
+    full = _closing_dto(conn, service, job)
+    return {
+        "missing": full["missing"], "supported": full["supported"],
+        "unsupported_reason": full["unsupported_reason"], "sent_confirmed": full["sent_confirmed"],
+    }
+
+
+def _build_workflow_context(conn, service: DispatcherService, job: dict, all_jobs: list) -> dict:
+    """Gathers exactly the facts dispatcher.workflow_projection.derive_next_action()
+    needs for one job, reusing the same per-job DTOs every existing
+    screen already computes -- no new database queries of its own. See
+    that module's docstring for the full precedence rules this feeds."""
+    return {
+        "status": job.get("status"),
+        "reconciliation_state": job.get("reconciliation_state"),
+        "technician_name": job.get("assigned_technician_name"),
+        "technician_k": _technician_k_dto(conn, job, all_jobs),
+        "latest_technician_update": job.get("latest_technician_update"),
+        "company_update_owed": _company_update_owed_dto(conn, job),
+        "closing": _closing_summary_for_projection(conn, service, job),
+    }
+
+
+def _workflow_projection_dto(conn, service: DispatcherService, job: dict, all_jobs: list) -> dict:
+    projection = derive_next_action(_build_workflow_context(conn, service, job, all_jobs))
+    return {
+        "next_action": projection.next_action,
+        "blocking_reason": projection.blocking_reason,
+        "human_review_needed": projection.human_review_needed,
+        "terminal": projection.terminal,
+    }
+
+
+# ============================================================ ACTION CENTER
+# The one operational "what needs a human right now" surface, grouped
+# purely from dispatcher.workflow_projection -- no section here computes
+# its own next-action signal. Two of the nine sections (new jobs to
+# review, company K owed) necessarily draw from the *pending message*
+# queue (route_new_jobs' own data), not the committed-job projection --
+# see workflow_projection's module docstring for exactly why REVIEW_NEW_JOB
+# (as "not yet a job at all") and ACK_COMPANY_K are pre-commit concepts
+# in this architecture. The other seven sections are 100% projection-driven.
+_ACTION_CENTER_SECTION_MAX = 5
+
+_ACTION_CENTER_JOB_SECTIONS = (
+    ("assign_technician", "ASSIGN_TECHNICIAN"),
+    ("waiting_technician_k", "WAIT_TECHNICIAN_K"),
+    ("technician_updates_to_review", "REVIEW_TECHNICIAN_UPDATE"),
+    ("company_updates_owed", "UPDATE_COMPANY"),
+    ("closings_to_review", "REVIEW_CLOSING"),
+    ("closings_ready_to_send", "SEND_CLOSING_TO_COMPANY"),
+    ("human_review_required", "HUMAN_REVIEW_NEEDED"),
+)
+
+
+def _action_center_job_item(conn, service: DispatcherService, job: dict, all_jobs: list) -> dict:
+    job = dict(job)
+    job["latest_technician_update"] = rm.get_latest_technician_update(conn, job["id"])
+    projection = derive_next_action(_build_workflow_context(conn, service, job, all_jobs))
+    return {
+        "id": job["id"], "kind": "job", "ticket": job["ticket_number"], "source": job["source"],
+        "technician_name": job.get("assigned_technician_name"), "waiting_since": job.get("last_event_at") or job.get("updated_at"),
+        "blocking_reason": projection.blocking_reason, "next_action": projection.next_action, "screen": "active",
+    }
+
+
+def route_action_center(handler: "Handler", match: dict, body: dict) -> dict:
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        all_jobs = shared.fetch_jobs(conn)
+        non_terminal = [j for j in all_jobs if j["status"] not in ("Cancelled", "Rejected")]
+
+        by_next_action: dict = {code: [] for _, code in _ACTION_CENTER_JOB_SECTIONS}
+        for j in non_terminal:
+            item = _action_center_job_item(conn, service, j, non_terminal)
+            by_next_action.setdefault(item["next_action"], []).append(item)
+
+        live, _backlog, _other = rm.get_live_dispatch_queue(conn)
+        new_job_dtos = [_new_job_dto(conn, e) for e in live]
+        new_jobs_to_review = [d for d in new_job_dtos if d["needs_review"]]
+        company_k_owed = [d for d in new_job_dtos if d["k_required"] and not d["k_sent"]]
+        # "Ready for technician dispatch" is a pending-message concept too
+        # in this architecture (see workflow_projection's module docstring
+        # for why SEND_JOB_TO_TECHNICIAN can never fire for an
+        # already-committed job -- dispatch and job-creation are the same
+        # action here): reviewed, K resolved, not yet dispatched.
+        ready_for_dispatch = [
+            d for d in new_job_dtos
+            if not d["needs_review"] and not (d["k_required"] and not d["k_sent"]) and not d["dispatched"]
+        ]
+
+        def new_job_item(d: dict, reason: Optional[str] = None) -> dict:
+            return {
+                "id": d["message_id"], "kind": "message", "ticket": d["ticket"], "source": d["source"],
+                "technician_name": None, "age_minutes": d["age_minutes"],
+                "blocking_reason": reason if reason is not None else ("; ".join(d["review_problems"]) if d["review_problems"] else None),
+                "next_action": "REVIEW_NEW_JOB", "screen": "jobs",
+            }
+
+        sections = {
+            "new_jobs_to_review": {
+                "items": [new_job_item(d) for d in new_jobs_to_review[:_ACTION_CENTER_SECTION_MAX]],
+                "total": len(new_jobs_to_review),
+            },
+            "company_k_owed": {
+                "items": [new_job_item(d, "Company K acknowledgment required.") for d in company_k_owed[:_ACTION_CENTER_SECTION_MAX]],
+                "total": len(company_k_owed),
+            },
+            "ready_for_dispatch": {
+                "items": [new_job_item(d, "Ready to dispatch to technician.") for d in ready_for_dispatch[:_ACTION_CENTER_SECTION_MAX]],
+                "total": len(ready_for_dispatch),
+            },
+        }
+        for section_key, next_action_code in _ACTION_CENTER_JOB_SECTIONS:
+            items = by_next_action.get(next_action_code, [])
+            sections[section_key] = {"items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
+        return {"sections": sections}
+    finally:
+        conn.close()
 
 
 def route_technician_update_record(handler: "Handler", match: dict, body: dict) -> dict:
@@ -1330,6 +1464,7 @@ ROUTES = [
     ("GET", r"^/api/me$", route_me, {}),
     ("GET", r"^/api/demo_status$", route_demo_status, {"public": True}),
     ("GET", r"^/api/command_center$", route_command_center, {}),
+    ("GET", r"^/api/action_center$", route_action_center, {}),
     ("GET", r"^/api/inbox_review$", route_inbox_review, {}),
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
     ("POST", r"^/api/sync$", route_sync, {}),
