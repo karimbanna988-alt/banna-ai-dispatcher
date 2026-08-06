@@ -65,3 +65,26 @@ sprint's non-negotiable workflow calls out:
    well-scoped, safe (pure wrapper over already-tested code, no schema
    change), and directly closes a non-negotiable requirement — **this
    sprint's primary implementation target.**
+
+## Addendum (HEAD `016a06e`) — both gaps above are now closed
+
+Both weak points identified above were closed across the two sprints
+that followed this audit:
+
+- **Technician K acceptance** (gap 1): `src/dispatcher/technician_ack.py`
+  (deterministic EXACT/STRONG/AMBIGUOUS/UNMATCHED matching) +
+  `storage.technician_acceptance` (job-keyed, additive) + a UI panel on
+  Active. See `docs/CURRENT_SPRINT_CHECKPOINT.md`'s prior-sprint section
+  for the full writeup.
+- **Technician updates → company updates owed** (gap 2): routes wired,
+  UI built, per the checkpoint doc's prior-sprint section.
+
+This sprint (see `docs/CURRENT_SPRINT_CHECKPOINT.md` for the current
+one) added the piece both of the above were missing until now: **one
+unified workflow projection** (`src/dispatcher/workflow_projection.py`)
+that every screen's next-action signal should derive from, instead of
+each screen (Active's label, the K panel, the company-update-owed DTO)
+computing its own independently — plus an **Action Center** screen that
+sweeps every committed job through that projection and groups by what's
+blocking it. That is the CRM's real operational surface now, not a
+future item.
