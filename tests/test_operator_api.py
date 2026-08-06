@@ -843,6 +843,157 @@ def test_active_next_action_uses_only_the_fixed_label_set(api_env):
     assert entry["next_action"] in api._ACTIVE_NEXT_ACTION_LABELS
 
 
+# ============================================ TECHNICIAN STATUS UPDATES ===
+# Steps 6-8 of the end-to-end workflow (docs/END_TO_END_WORKFLOW_AUDIT.md):
+# record_technician_update / prepare_company_update / confirm_company_update_sent
+# were fully implemented and tested at the application/storage layer but had
+# zero HTTP route before this sprint. These tests exercise the new routes
+# directly -- distinct from the "commercial" (price-quote) flow already
+# covered above, which answers a different question.
+def test_company_update_owed_is_none_before_any_technician_update(api_env):
+    job_id = _seed_active_job(api_env)
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["company_update_owed"] is None
+
+
+def test_technician_update_record_route_persists_and_appears_in_active(api_env):
+    job_id = _seed_active_job(api_env)
+    result = api.route_technician_update_record(
+        None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "On my way"},
+    )
+    assert result["success"] is True
+    assert result["current_status"] == "In Progress"
+
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["latest_technician_update"]["update_type"] == "Going"
+    assert entry["latest_technician_update"]["raw_message"] == "On my way"
+
+
+def test_company_update_owed_computes_deterministic_reply_for_known_type(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "otw"})
+
+    entries = api.route_active(None, {}, {})["entries"]
+    owed = next(e for e in entries if e["id"] == job_id)["company_update_owed"]
+    assert owed["confirmed"] is True
+    assert owed["suggested_reply"] == "Going"
+    assert owed["update_type"] == "Going"
+
+
+def test_company_update_owed_eta_reply_includes_minutes(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(
+        None, {"id": str(job_id)}, {"update_type": "ETA", "raw_update": "20 min out", "eta_minutes": 20},
+    )
+    entries = api.route_active(None, {}, {})["entries"]
+    owed = next(e for e in entries if e["id"] == job_id)["company_update_owed"]
+    assert owed["confirmed"] is True
+    assert owed["suggested_reply"] == "Tech ETA 20 min"
+
+
+def test_company_update_owed_unconfirmed_for_custom_update(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(
+        None, {"id": str(job_id)}, {"update_type": "Custom", "raw_update": "Customer wants to reschedule"},
+    )
+    entries = api.route_active(None, {}, {})["entries"]
+    owed = next(e for e in entries if e["id"] == job_id)["company_update_owed"]
+    assert owed["confirmed"] is False
+    assert owed["suggested_reply"] is None
+    assert "human review" in owed["reason"]
+
+
+def test_technician_update_rejects_unknown_update_type(api_env):
+    job_id = _seed_active_job(api_env)
+    with pytest.raises(api.ApiError) as exc:
+        api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Sleeping", "raw_update": "zzz"})
+    assert exc.value.status == 400
+
+
+def test_technician_update_eta_without_minutes_is_rejected(api_env):
+    job_id = _seed_active_job(api_env)
+    with pytest.raises(api.ApiError):
+        api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "ETA", "raw_update": "soon"})
+
+
+def test_technician_update_requires_raw_update(api_env):
+    job_id = _seed_active_job(api_env)
+    with pytest.raises(api.ApiError):
+        api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": ""})
+
+
+def test_technician_update_is_idempotent_on_identical_resubmit(api_env):
+    job_id = _seed_active_job(api_env)
+    events_before = get_events_count(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "otw"})
+    events_after_first = get_events_count(api_env)
+    result = api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "otw"})
+    events_after_replay = get_events_count(api_env)
+    assert events_after_first == events_before + 1
+    assert events_after_replay == events_after_first
+    assert result["idempotent_replay"] is True
+
+
+def test_company_update_prepare_persists_and_returns_text(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "otw"})
+    events_before = get_events_count(api_env)
+
+    result = api.route_company_update_prepare(None, {"id": str(job_id)}, {"update_type": "Going"})
+    assert result["success"] is True
+    assert result["prepared_text"] == "Going"
+    assert get_events_count(api_env) == events_before + 1
+
+
+def test_company_update_prepare_fails_without_manual_text_for_custom(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Custom", "raw_update": "reschedule"})
+    with pytest.raises(api.ApiError):
+        api.route_company_update_prepare(None, {"id": str(job_id)}, {"update_type": "Custom"})
+
+
+def test_company_update_prepare_accepts_manual_text_for_custom(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Custom", "raw_update": "reschedule"})
+    result = api.route_company_update_prepare(
+        None, {"id": str(job_id)}, {"update_type": "Custom", "manual_text": "We'll call you back shortly."},
+    )
+    assert result["success"] is True
+    assert result["prepared_text"] == "We'll call you back shortly."
+
+
+def test_company_update_confirm_sent_clears_owed_state(api_env):
+    job_id = _seed_active_job(api_env)
+    api.route_technician_update_record(None, {"id": str(job_id)}, {"update_type": "Going", "raw_update": "otw"})
+    prepared = api.route_company_update_prepare(None, {"id": str(job_id)}, {"update_type": "Going"})
+
+    entries = api.route_active(None, {}, {})["entries"]
+    assert next(e for e in entries if e["id"] == job_id)["company_update_owed"] is not None
+
+    result = api.route_company_update_confirm_sent(None, {"id": str(job_id)}, {"prepared_text": prepared["prepared_text"]})
+    assert result["success"] is True
+
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["company_update_owed"] is None
+    assert entry["next_action"] == "Waiting for customer"
+
+
+def test_company_update_routes_never_touch_quo_or_whatsapp_adapters():
+    """Structural guard: the three new route handlers must only ever
+    call DispatcherService's storage-backed methods, never quo_adapter/
+    whatsapp_adapter -- these routes have no outbound-send capability by
+    construction."""
+    import inspect
+
+    for fn in (api.route_technician_update_record, api.route_company_update_prepare, api.route_company_update_confirm_sent):
+        src = inspect.getsource(fn)
+        assert "quo_adapter" not in src
+        assert "whatsapp_adapter" not in src
+
+
 # ==================================================== WHATSAPP BRIDGE =====
 import whatsapp_bridge_adapter as bridge_adapter  # noqa: E402
 
