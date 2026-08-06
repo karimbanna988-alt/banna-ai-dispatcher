@@ -122,15 +122,34 @@
 .cc-kpi-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
 @media (min-width: 900px) and (min-height: 500px) { .cc-kpi-grid { grid-template-columns: repeat(6, 1fr); gap: 12px; } }
 .cc-kpi-card {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-  padding: 18px 14px; text-align: center; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border); border-top: 3px solid var(--kpi-new-accent); border-radius: 10px;
+  padding: 16px 14px; text-align: left; cursor: pointer; position: relative;
   transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
   box-shadow: 0 1px 2px rgba(16,24,40,0.04);
 }
-.cc-kpi-card:hover { border-color: var(--primary); box-shadow: 0 4px 14px rgba(41,85,216,0.14); transform: translateY(-1px); }
-.cc-kpi-value { font-size: 30px; font-weight: 800; color: var(--header-navy); line-height: 1.1; letter-spacing: -0.01em; }
-.cc-kpi-label { font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-top: 6px; font-weight: 700; }
+.cc-kpi-card:hover { box-shadow: 0 6px 16px rgba(16,24,40,0.10); transform: translateY(-2px); }
+.cc-kpi-icon {
+  width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; background: var(--kpi-new-bg); color: var(--kpi-new-accent); margin-bottom: 10px;
+}
+.cc-kpi-value { font-size: 28px; font-weight: 800; color: var(--text); line-height: 1.1; letter-spacing: -0.01em; }
+.cc-kpi-label { font-size: 11px; color: var(--text); margin-top: 4px; font-weight: 700; }
+.cc-kpi-secondary { font-size: 10.5px; color: var(--text-muted); margin-top: 2px; }
 .cc-kpi-note { font-size: 10px; color: var(--text-muted); font-style: italic; margin-top: 2px; }
+
+/* One accent per KPI category -- top strip + icon container, restrained. */
+.cc-kpi-card.kpi-new { border-top-color: var(--kpi-new-accent); }
+.cc-kpi-card.kpi-new .cc-kpi-icon { background: var(--kpi-new-bg); color: var(--kpi-new-accent); }
+.cc-kpi-card.kpi-waiting { border-top-color: var(--kpi-waiting-accent); }
+.cc-kpi-card.kpi-waiting .cc-kpi-icon { background: var(--kpi-waiting-bg); color: var(--kpi-waiting-accent); }
+.cc-kpi-card.kpi-active { border-top-color: var(--kpi-active-accent); }
+.cc-kpi-card.kpi-active .cc-kpi-icon { background: var(--kpi-active-bg); color: var(--kpi-active-accent); }
+.cc-kpi-card.kpi-inprogress { border-top-color: var(--kpi-inprogress-accent); }
+.cc-kpi-card.kpi-inprogress .cc-kpi-icon { background: var(--kpi-inprogress-bg); color: var(--kpi-inprogress-accent); }
+.cc-kpi-card.kpi-closingsdue { border-top-color: var(--kpi-closingsdue-accent); }
+.cc-kpi-card.kpi-closingsdue .cc-kpi-icon { background: var(--kpi-closingsdue-bg); color: var(--kpi-closingsdue-accent); }
+.cc-kpi-card.kpi-completed { border-top-color: var(--kpi-completed-accent); }
+.cc-kpi-card.kpi-completed .cc-kpi-icon { background: var(--kpi-completed-bg); color: var(--kpi-completed-accent); }
 
 .cc-closed-amount { margin: 4px 0 22px 0; }
 .cc-closed-amount-card {
@@ -151,10 +170,18 @@
   font-size: 12px; font-weight: 600; background: var(--surface); color: var(--text); min-height: 32px;
 }
 
+.cc-attention-section-wrap {
+  background: var(--pale-yellow); border: 1px solid var(--pale-yellow-border); border-radius: 10px; padding: 10px; margin-bottom: 4px;
+}
 .cc-attention-row {
-  background: var(--surface); border: 1px solid var(--pale-yellow-border); border-left: 4px solid var(--warning-accent);
+  background: var(--surface); border: 1px solid var(--pale-yellow-border);
   border-radius: 8px; padding: 11px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+}
+.cc-attention-row:last-child { margin-bottom: 0; }
+.cc-attention-marker {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--kpi-waiting-bg); color: var(--warning-accent);
+  display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0;
 }
 .cc-attention-main { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
 .cc-attention-ticket { color: var(--text); }

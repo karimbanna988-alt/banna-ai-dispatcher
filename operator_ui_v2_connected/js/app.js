@@ -38,6 +38,22 @@ function sourceChip(source) {
   return `<span class="chip ${cls}">${esc(source)}</span>`;
 }
 
+// Deterministic color + initials badge for a technician name -- same
+// person always gets the same badge color across screens, no photo
+// upload or backend field needed.
+const TECH_AVATAR_COLORS = ["#2955d8", "#1f7d6f", "#b3541e", "#5b4fc4", "#1e6b3a", "#9a2f6b"];
+function techAvatarHtml(name) {
+  if (!name) return "";
+  const initials = name.trim().split(/\s+/).map(w => w[0]).slice(0, 2).join("").toUpperCase();
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  const color = TECH_AVATAR_COLORS[hash % TECH_AVATAR_COLORS.length];
+  return `<span class="tech-avatar" style="background:${color}">${esc(initials)}</span>`;
+}
+function technicianWithAvatarHtml(name) {
+  return name ? `${techAvatarHtml(name)}${esc(name)}` : "Unassigned";
+}
+
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text || ""); }
   catch (e) { /* clipboard permission denied -- the visible msg-block is the fallback */ }
@@ -104,6 +120,7 @@ function showApp(demoMode) {
   document.getElementById("headerStatusText").textContent = demoMode
     ? "Demo -- synthetic data only, not connected to Quo or WhatsApp"
     : "Connected -- real data · manual WhatsApp bridge";
+  document.getElementById("headerDateContext").textContent = new Date().toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
   setScreen("commandcenter");
 }
 
@@ -707,14 +724,27 @@ function fmtKpiValue(kpi) {
   return kpi.value;
 }
 
-function ccKpiCardHtml(title, kpi, screenLink) {
+// One restrained tint + icon per KPI category -- distinct at a glance,
+// never fully saturated (see --kpi-*-accent/--kpi-*-bg tokens).
+const CC_KPI_CATEGORIES = {
+  new: { cls: "kpi-new", icon: "&#9737;", secondary: "Last 60 minutes" },
+  waiting: { cls: "kpi-waiting", icon: "&#8987;", secondary: "Needs assignment" },
+  active: { cls: "kpi-active", icon: "&#9679;", secondary: "With a technician" },
+  inprogress: { cls: "kpi-inprogress", icon: "&#9670;", secondary: "En route or on site" },
+  closingsdue: { cls: "kpi-closingsdue", icon: "&#36;", secondary: "Awaiting closing" },
+  completed: { cls: "kpi-completed", icon: "&#10003;", secondary: "Closed out today" },
+};
+
+function ccKpiCardHtml(title, kpi, screenLink, category) {
   const value = fmtKpiValue(kpi);
   const note = kpi.data_quality === "needs_business_definition" ? "Not trackable yet" : "";
+  const cat = CC_KPI_CATEGORIES[category] || CC_KPI_CATEGORIES.new;
   return `
-    <div class="cc-kpi-card" data-screen="${screenLink}" title="${esc(kpi.explanation || "")}">
+    <div class="cc-kpi-card ${cat.cls}" data-screen="${screenLink}" title="${esc(kpi.explanation || "")}">
+      <div class="cc-kpi-icon">${cat.icon}</div>
       <div class="cc-kpi-value">${esc(value)}</div>
       <div class="cc-kpi-label">${esc(title)}</div>
-      ${note ? `<div class="cc-kpi-note">${esc(note)}</div>` : ""}
+      <div class="cc-kpi-secondary">${note ? esc(note) : cat.secondary}</div>
     </div>`;
 }
 
@@ -749,6 +779,7 @@ function ccAttentionItemHtml(item) {
   const targetScreen = item.type === "whatsapp_observation_pending" ? "active" : "jobs";
   return `
     <div class="cc-attention-row">
+      <div class="cc-attention-marker" aria-hidden="true">&#33;</div>
       <div class="cc-attention-main">
         <span class="cc-attention-ticket">${label}</span>
         <span class="cc-attention-source">${esc(item.source || "")}</span>
@@ -773,7 +804,7 @@ function ccActiveRowHtml(j) {
       <td><strong>${esc(j.ticket || "No ref")}</strong></td>
       <td>${sourceChip(j.source)}</td>
       <td>${esc(j.city || "")}</td>
-      <td>${notRecorded(j.technician_name)}</td>
+      <td>${j.technician_name ? technicianWithAvatarHtml(j.technician_name) : "Not recorded"}</td>
       <td><span class="chip ${stage.cls}">${stage.label}</span></td>
       <td>${ageMin === null ? "--" : ageText(ageMin)}</td>
       <td>${esc(j.next_action)}</td>
@@ -868,12 +899,12 @@ function renderCommandCenterScreen(dashboard, activeEntries) {
 
   const grid = document.getElementById("ccKpiGrid");
   grid.innerHTML = [
-    ccKpiCardHtml("New jobs -- last 60 min", k.new_last_60_minutes, "jobs"),
-    ccKpiCardHtml("Waiting for assignment", k.waiting_for_assignment, "jobs"),
-    ccKpiCardHtml("Active with technician", k.active_with_technician, "active"),
-    ccKpiCardHtml("In progress", k.in_progress, "active"),
-    ccKpiCardHtml("Closings due", k.closings_due, "closings"),
-    ccKpiCardHtml("Completed today", k.completed_today, "history"),
+    ccKpiCardHtml("New jobs -- last 60 min", k.new_last_60_minutes, "jobs", "new"),
+    ccKpiCardHtml("Waiting for assignment", k.waiting_for_assignment, "jobs", "waiting"),
+    ccKpiCardHtml("Active with technician", k.active_with_technician, "active", "active"),
+    ccKpiCardHtml("In progress", k.in_progress, "active", "inprogress"),
+    ccKpiCardHtml("Closings due", k.closings_due, "closings", "closingsdue"),
+    ccKpiCardHtml("Completed today", k.completed_today, "history", "completed"),
   ].join("");
   wireScreenLinks(grid);
 
@@ -1023,7 +1054,7 @@ function renderActiveScreen() {
       <td>${sourceChip(j.source)}</td>
       <td>${esc(j.city || "")}</td>
       <td>${esc(j.description || "—")}</td>
-      <td>${esc(j.technician_name || "Unassigned")}</td>
+      <td>${technicianWithAvatarHtml(j.technician_name)}</td>
       <td><span class="chip ${stage.cls}">${stage.label}</span></td>
       <td>${esc(j.waiting_since ? j.waiting_since.slice(0, 16).replace("T", " ") : "—")}</td>
       <td>${esc(j.next_action)}</td>
@@ -1544,38 +1575,26 @@ function renderTechniciansScreen(missingDispatch, missingClosing) {
     banner.style.display = "none";
   }
 
-  const tbody = document.getElementById("techTableBody");
-  tbody.innerHTML = technicians.map(t => `
-    <tr>
-      <td><strong>${esc(t.name)}</strong></td>
-      <td>${(t.areas || []).map(esc).join(", ")}</td>
-      <td>${t.active ? "Active" : "Inactive"}</td>
-      <td>${esc(t.dispatch_group || "Not configured")} ${!t.dispatch_group ? '<span class="chip chip-warning">!</span>' : ""}</td>
-      <td>${esc(t.closing_group || "Not configured")} ${!t.closing_group ? '<span class="chip chip-warning">!</span>' : ""}</td>
-      <td><button class="btn btn-secondary" data-editid="${t.id}">Edit</button></td>
-    </tr>
-    <tr id="techEditRow-${t.id}" style="display:none;"><td colspan="6">${techEditFormHtml(t)}</td></tr>`).join("");
+  const missingConfig = t => !t.dispatch_group || !t.closing_group;
 
-  tbody.querySelectorAll("[data-editid]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const row = document.getElementById(`techEditRow-${btn.dataset.editid}`);
-      row.style.display = row.style.display === "none" ? "table-row" : "none";
-    });
-  });
-  wireTechEditForms();
-
-  const mobileList = document.getElementById("techMobileList");
-  mobileList.innerHTML = technicians.map(t => `
-    <div class="mobile-row">
-      <div class="row-top"><strong>${esc(t.name)}</strong><span class="age">${t.active ? "Active" : "Inactive"}</span></div>
-      <div class="row-bottom">${(t.areas || []).map(esc).join(", ")}</div>
-      ${!t.configured ? `<div class="chip chip-warning" style="margin-top:4px;">WhatsApp group not configured.</div>` : ""}
-      <button type="button" class="btn btn-secondary" style="margin-top:6px;" data-toggledetail="${t.id}">View details</button>
-      <div id="techMobileDetail-${t.id}" style="display:none; margin-top:6px;">${techEditFormHtml(t)}</div>
+  const grid = document.getElementById("techCardGrid");
+  grid.innerHTML = technicians.map(t => `
+    <div class="tech-card">
+      <div class="tech-card-head">
+        ${techAvatarHtml(t.name)}
+        <div class="tech-card-name-wrap">
+          <div class="tech-card-name">${esc(t.name)}</div>
+          <span class="tech-card-status ${t.active ? "is-active" : "is-inactive"}">${t.active ? "Active" : "Inactive"}</span>
+        </div>
+      </div>
+      <div class="tech-card-row"><span class="tech-card-label">Service areas</span>${(t.areas || []).map(esc).join(", ") || "—"}</div>
+      ${missingConfig(t) ? `<div class="chip chip-warning">Missing WhatsApp destination</div>` : ""}
+      <button type="button" class="btn btn-secondary btn-block tech-card-toggle" data-toggledetail="${t.id}">View details</button>
+      <div class="tech-card-detail" id="techDetail-${t.id}" style="display:none;">${techEditFormHtml(t)}</div>
     </div>`).join("");
-  mobileList.querySelectorAll("[data-toggledetail]").forEach(btn => {
+  grid.querySelectorAll("[data-toggledetail]").forEach(btn => {
     btn.addEventListener("click", () => {
-      const detail = document.getElementById(`techMobileDetail-${btn.dataset.toggledetail}`);
+      const detail = document.getElementById(`techDetail-${btn.dataset.toggledetail}`);
       detail.style.display = detail.style.display === "none" ? "block" : "none";
     });
   });

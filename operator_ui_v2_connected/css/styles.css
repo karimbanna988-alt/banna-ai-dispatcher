@@ -9,10 +9,10 @@
    no neon, no gradients beyond the one login accent. */
 :root {
   /* Surfaces */
-  --bg: #f5f6f8;              /* page background -- soft off-white */
+  --bg: #f6f5f2;              /* page background -- warm light gray */
   --surface: #ffffff;         /* cards -- white */
-  --panel-bg: #eef0f3;        /* secondary panels -- cool light gray (alias of --muted-gray) */
-  --border: #dde1e6;          /* subtle cool gray */
+  --panel-bg: #eeece7;        /* secondary panels -- warm light gray (alias of --muted-gray) */
+  --border: #e2e0da;          /* subtle warm gray */
 
   /* Text */
   --text: #1c2430;            /* primary text -- dark charcoal */
@@ -24,6 +24,7 @@
   --primary: #2955d8;         /* main accent -- professional blue (interactive elements) */
   --primary-hover: #1f43b3;
   --accent-teal: #1f7d6f;     /* secondary accent -- muted teal */
+  --accent-indigo: #5b4fc4;   /* secondary accent -- indigo, used for the "In progress" KPI */
 
   /* Status */
   --success: #1e6b3a;         /* restrained green */
@@ -35,8 +36,16 @@
   --pale-yellow-border: #e8cf7a;
   --danger: #c8323a;          /* restrained red */
   --danger-bg: #fbe7e8;
-  --muted-gray: #eef0f3;      /* inactive / historical */
-  --muted-gray-border: #cfd4db;
+  --muted-gray: #eeece7;      /* inactive / historical */
+  --muted-gray-border: #d4d1c9;
+
+  /* KPI category tints -- one per Command Center card, restrained not saturated */
+  --kpi-new-accent: #2955d8;       --kpi-new-bg: #eef2ff;
+  --kpi-waiting-accent: #d9a91a;   --kpi-waiting-bg: #fff8e6;
+  --kpi-active-accent: #1f7d6f;    --kpi-active-bg: #e9f6f3;
+  --kpi-inprogress-accent: #5b4fc4; --kpi-inprogress-bg: #f0eefb;
+  --kpi-closingsdue-accent: #b3541e; --kpi-closingsdue-bg: #fdf0e6;
+  --kpi-completed-accent: #1e6b3a; --kpi-completed-bg: #eaf7ee;
 
   --radius: 6px;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
@@ -54,52 +63,65 @@ body {
 a { color: inherit; }
 button { font-family: inherit; }
 
-/* ------------------------------------------------------------- Header --- */
+/* ------------------------------------------------------------- Header ---
+   Compact white header -- the wordmark carries the navy brand color, the
+   header itself never dominates the screen with a solid dark block. */
 .app-header {
-  background: var(--header-navy);
-  color: var(--header-navy-text);
+  background: var(--surface);
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
-  height: 48px;
+  padding: 0 16px;
+  height: 52px;
   position: sticky;
   top: 0;
   z-index: 30;
 }
 .app-header .brand {
-  font-weight: 700;
-  font-size: 14px;
+  font-weight: 800;
+  font-size: 16px;
   letter-spacing: 0.02em;
+  color: var(--header-navy);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+}
+.app-header .header-date {
+  font-size: 11px; font-weight: 600; color: var(--text-muted); border-left: 1px solid var(--border);
+  padding-left: 10px; margin-left: 2px; white-space: nowrap;
 }
 .app-header .status-dot {
-  width: 7px; height: 7px; border-radius: 50%; background: #3ecf6e; display: inline-block;
+  width: 7px; height: 7px; border-radius: 50%; background: var(--success); display: inline-block;
 }
-.app-header .status-dot.offline { background: #c8323a; }
-.app-header .status-text { font-size: 11px; color: #b9c4d6; font-weight: 400; }
+.app-header .status-dot.offline { background: var(--danger); }
+.app-header .status-text { font-size: 11px; color: var(--text-muted); font-weight: 600; }
 .app-header .header-actions { display: flex; align-items: center; gap: 6px; }
 .icon-btn {
-  background: transparent; border: 1px solid rgba(255,255,255,0.25); color: var(--header-navy-text);
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted);
   border-radius: var(--radius); width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
   cursor: pointer; font-size: 15px;
 }
-.icon-btn:hover { background: rgba(255,255,255,0.1); }
+.icon-btn:hover { background: var(--bg); color: var(--text); }
 
 /* -------------------------------------------------------------- Layout -- */
 .app-body { display: flex; min-height: calc(100vh - 48px); }
 .desktop-sidebar {
   display: none;
-  width: 176px; background: var(--surface); border-right: 1px solid var(--border);
-  flex-shrink: 0; padding: 10px 0;
+  width: 184px; background: var(--surface); border-right: 1px solid var(--border);
+  flex-shrink: 0; padding: 12px 8px;
 }
 .desktop-sidebar .nav-item {
-  display: flex; align-items: center; gap: 10px; padding: 9px 16px; color: var(--text-muted);
-  text-decoration: none; font-size: 13px; font-weight: 600; cursor: pointer; border-left: 3px solid transparent;
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin-bottom: 2px; color: var(--text-muted);
+  text-decoration: none; font-size: 13px; font-weight: 600; cursor: pointer;
+  border-left: 3px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
 }
-.desktop-sidebar .nav-item.active { color: var(--primary); background: #eef2ff; border-left-color: var(--primary); }
+.desktop-sidebar .nav-item::before {
+  content: attr(data-icon); font-size: 13px; width: 18px; text-align: center; flex-shrink: 0; color: var(--text-muted);
+}
+.desktop-sidebar .nav-item.active { color: var(--primary); background: var(--kpi-new-bg); border-left-color: var(--primary); }
+.desktop-sidebar .nav-item.active::before { color: var(--primary); }
 .desktop-sidebar .nav-item:hover:not(.active) { background: var(--bg); }
 
 .main-content { flex: 1; min-width: 0; padding: 12px 14px calc(70px + env(safe-area-inset-bottom, 0px)) 14px; }
@@ -108,7 +130,7 @@ button { font-family: inherit; }
    desktop window, and must keep the mobile bottom-nav/card layout. */
 @media (min-width: 900px) and (min-height: 500px) {
   .desktop-sidebar { display: block; }
-  .main-content { padding: 16px 20px; }
+  .main-content { padding: 20px 28px; max-width: 1360px; margin: 0 auto; }
   .mobile-bottom-nav { display: none !important; }
 }
 
@@ -155,17 +177,46 @@ button { font-family: inherit; }
 }
 
 /* -------------------------------------------------------- Desktop table - */
-.data-table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: none; }
+.data-table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: none; box-shadow: 0 1px 2px rgba(16,24,40,0.04); }
 @media (min-width: 900px) and (min-height: 500px) { .data-table { display: table; } .mobile-row-list { display: none !important; } }
 .data-table thead th {
-  text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted);
-  background: #fafbfc; padding: 8px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
+  text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted);
+  background: var(--panel-bg); padding: 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
 }
-.data-table tbody td { padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.data-table tbody td { padding: 9px 10px; border-bottom: none; font-size: 12.5px; }
 .data-table tbody tr { cursor: pointer; }
-.data-table tbody tr:hover { background: #f8f9fb; }
-.data-table tbody tr.selected { background: #eef2ff; }
-.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table tbody tr:nth-child(even) { background: var(--panel-bg); }
+.data-table tbody tr:hover { background: var(--kpi-new-bg); }
+.data-table tbody tr.selected { background: var(--kpi-new-bg); box-shadow: inset 3px 0 0 var(--primary); }
+
+/* Small colored initial badge for a technician name -- no photo upload,
+   just a deterministic color from the name so the same person always
+   gets the same badge color across screens. */
+.tech-avatar {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border-radius: 50%; font-size: 10px; font-weight: 800; color: #fff; margin-right: 6px; vertical-align: middle; flex-shrink: 0;
+}
+
+/* ------------------------------------------------------ Technician cards */
+.tech-card-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+@media (min-width: 640px) { .tech-card-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1100px) { .tech-card-grid { grid-template-columns: repeat(3, 1fr); } }
+.tech-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+  box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+}
+.tech-card-head { display: flex; align-items: center; gap: 4px; margin-bottom: 10px; }
+.tech-card-head .tech-avatar { width: 34px; height: 34px; font-size: 13px; margin-right: 10px; }
+.tech-card-name-wrap { display: flex; flex-direction: column; gap: 2px; }
+.tech-card-name { font-weight: 700; font-size: 14px; color: var(--text); }
+.tech-card-status { font-size: 11px; font-weight: 700; width: fit-content; }
+.tech-card-status.is-active { color: var(--success); }
+.tech-card-status.is-inactive { color: var(--text-muted); }
+.tech-card-row { font-size: 12.5px; color: var(--text); margin-bottom: 8px; }
+.tech-card-label { display: block; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted); margin-bottom: 2px; }
+.tech-card .chip-warning { display: inline-block; margin-bottom: 8px; }
+.tech-card-toggle { margin-top: 2px; }
+.tech-card-detail { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
 
 /* ---------------------------------------------------------- Mobile rows - */
 .mobile-row-list { display: block; }

@@ -33,9 +33,11 @@
 <header class="app-header">
   <div class="brand">
     LUXOR
-    <span class="status-text" id="headerStatusText">Connected -- real data · manual WhatsApp bridge</span>
+    <span class="header-date" id="headerDateContext"></span>
   </div>
   <div class="header-actions">
+    <span class="status-dot" id="headerStatusDot"></span>
+    <span class="status-text" id="headerStatusText">Connected -- real data · manual WhatsApp bridge</span>
     <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>
     <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
   </div>
@@ -53,11 +55,11 @@
 
 <div class="app-body">
   <nav class="desktop-sidebar" id="desktopSidebar">
-    <div class="nav-item" data-screen="commandcenter">Command Center</div>
-    <div class="nav-item" data-screen="jobs">Jobs</div>
-    <div class="nav-item" data-screen="active">Active</div>
-    <div class="nav-item" data-screen="closings">Closings</div>
-    <div class="nav-item" data-screen="history">Completed</div>
+    <div class="nav-item" data-screen="commandcenter" data-icon="&#9635;">Command Center</div>
+    <div class="nav-item" data-screen="jobs" data-icon="&#9737;">Jobs</div>
+    <div class="nav-item" data-screen="active" data-icon="&#9679;">Active</div>
+    <div class="nav-item" data-screen="closings" data-icon="&#36;">Closings</div>
+    <div class="nav-item" data-screen="history" data-icon="&#10003;">Completed</div>
   </nav>
 
   <main class="main-content">
@@ -75,8 +77,10 @@
           <div class="subsection-label">Attention now</div>
           <span id="ccAttentionViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="jobs">View all</button></span>
         </div>
-        <div id="ccAttentionList"></div>
-        <div id="ccAttentionEmpty" class="empty-state" style="display:none;">Nothing needs attention right now.</div>
+        <div class="cc-attention-section-wrap">
+          <div id="ccAttentionList"></div>
+          <div id="ccAttentionEmpty" class="empty-state" style="display:none;">Nothing needs attention right now.</div>
+        </div>
       </div>
 
       <div class="cc-section-header">
@@ -260,11 +264,7 @@
     <section class="screen" id="screen-technicians">
       <div class="section-title">Technicians <span class="count" id="techCount"></span></div>
       <div id="techMissingBanner" class="review-banner" style="display:none;"></div>
-      <table class="data-table" id="techTable">
-        <thead><tr><th>Technician</th><th>Area</th><th>Active</th><th>Dispatch group</th><th>Closing group</th><th></th></tr></thead>
-        <tbody id="techTableBody"></tbody>
-      </table>
-      <div class="mobile-row-list" id="techMobileList"></div>
+      <div class="tech-card-grid" id="techCardGrid"></div>
     </section>
 
     <!-- ================================================== LEARNING REVIEW -->
