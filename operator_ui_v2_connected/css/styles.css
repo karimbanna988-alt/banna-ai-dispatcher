@@ -1,24 +1,43 @@
 /* LUXOR Operator UI V2 -- a completely separate, ordinary small-business
    CRM visual system. Plain CSS, no framework, no dark terminal theme. */
 
+/* ---------------------------------------------------- Design token system
+   Light, professional palette. Color communicates meaning, not decoration:
+   navy/blue = normal active work, teal = a secondary/supporting accent,
+   green = completed/healthy, amber = waiting/needs attention,
+   red = genuinely urgent, gray = inactive/historical. No dark backgrounds,
+   no neon, no gradients beyond the one login accent. */
 :root {
-  --bg: #f5f6f8;
-  --surface: #ffffff;
-  --border: #dde1e6;
-  --text: #1c2430;
-  --text-muted: #667085;
-  --header-navy: #0f2a4a;
+  /* Surfaces */
+  --bg: #f5f6f8;              /* page background -- soft off-white */
+  --surface: #ffffff;         /* cards -- white */
+  --panel-bg: #eef0f3;        /* secondary panels -- cool light gray (alias of --muted-gray) */
+  --border: #dde1e6;          /* subtle cool gray */
+
+  /* Text */
+  --text: #1c2430;            /* primary text -- dark charcoal */
+  --text-muted: #667085;      /* secondary text -- slate gray */
+
+  /* Accents */
+  --header-navy: #0f2a4a;     /* main accent -- deep navy */
   --header-navy-text: #eef2f7;
-  --primary: #2955d8;
+  --primary: #2955d8;         /* main accent -- professional blue (interactive elements) */
   --primary-hover: #1f43b3;
-  --pale-yellow: #fff6d6;
-  --pale-yellow-border: #e8cf7a;
+  --accent-teal: #1f7d6f;     /* secondary accent -- muted teal */
+
+  /* Status */
+  --success: #1e6b3a;         /* restrained green */
   --pale-green: #e3f6ea;
   --pale-green-border: #9bd4ae;
-  --muted-gray: #eef0f3;
-  --muted-gray-border: #cfd4db;
-  --danger: #c8323a;
+  --warning: #8a6a10;         /* soft amber (text-safe contrast) */
+  --warning-accent: #d9a91a;  /* amber used for borders/indicators */
+  --pale-yellow: #fff6d6;
+  --pale-yellow-border: #e8cf7a;
+  --danger: #c8323a;          /* restrained red */
   --danger-bg: #fbe7e8;
+  --muted-gray: #eef0f3;      /* inactive / historical */
+  --muted-gray-border: #cfd4db;
+
   --radius: 6px;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
 }
@@ -105,11 +124,11 @@ button { font-family: inherit; }
 /* ----------------------------------------------------------- Chips/tags - */
 .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .chip-source-agn { background: #e5ecff; color: #29459e; }
-.chip-source-lucky { background: #e2f5f2; color: #1f7d6f; }
+.chip-source-lucky { background: #e2f5f2; color: var(--accent-teal); }
 .chip-source-mainleads { background: #fdeedc; color: #9a5a12; }
-.chip-needs-action { background: var(--pale-yellow); color: #7a6006; border: 1px solid var(--pale-yellow-border); }
+.chip-needs-action { background: var(--pale-yellow); color: var(--warning); border: 1px solid var(--pale-yellow-border); }
 .chip-waiting { background: var(--muted-gray); color: var(--text-muted); border: 1px solid var(--muted-gray-border); }
-.chip-settled { background: var(--pale-green); color: #1e6b3a; border: 1px solid var(--pale-green-border); }
+.chip-settled { background: var(--pale-green); color: var(--success); border: 1px solid var(--pale-green-border); }
 .chip-warning { background: var(--danger-bg); color: var(--danger); border: 1px solid #f0b4b7; font-weight: 700; }
 
 /* ------------------------------------------------------ Filters/search -- */
@@ -170,7 +189,7 @@ button { font-family: inherit; }
 .btn-secondary:hover { background: var(--bg); }
 .btn-block { width: 100%; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.checked-line { color: #1e6b3a; font-weight: 700; font-size: 12.5px; display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+.checked-line { color: var(--success); font-weight: 700; font-size: 12.5px; display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 
 /* ----------------------------------------------------------- Detail body */
 .detail-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
