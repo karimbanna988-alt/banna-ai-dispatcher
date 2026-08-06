@@ -167,8 +167,12 @@ def test_job_detail_wraps_phone_address_and_raw_message_in_collapsed_details(app
     assert "j.address" not in before_details
 
 
-def test_technician_mobile_card_hides_config_behind_view_details(app_js):
-    fn_start = app_js.index("const mobileList = document.getElementById(\"techMobileList\")")
+def test_technician_card_hides_config_behind_view_details(app_js):
+    """Superseded by the redesign's unified responsive card grid (see
+    tests/test_ui_acceptance_redesign.py) -- techMobileList/techTableBody
+    no longer exist, replaced by a single #techCardGrid used at every
+    viewport."""
+    fn_start = app_js.index('function renderTechniciansScreen(')
     fn_end = app_js.index("function techEditFormHtml")
     section = app_js[fn_start:fn_end]
     assert 'data-toggledetail' in section
