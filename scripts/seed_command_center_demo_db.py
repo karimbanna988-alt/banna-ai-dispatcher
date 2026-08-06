@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,16 +53,24 @@ def lucky_message(ticket: str, area: str = "Charlotte, NC") -> str:
 
 
 def seed(db_path: Path) -> None:
-    from dispatcher import storage
+    from dispatcher.db_safety import resolve_db_path
 
-    if db_path.resolve() == storage.DB_PATH.resolve():
-        raise ValueError(
-            f"Refusing to seed synthetic demo data into the live database ({storage.DB_PATH}). "
-            "Pass a path under a temp/demo directory instead."
-        )
+    # Fail-closed, not just fail-safe: resolve_db_path() raises unless
+    # db_path is explicit and doesn't resolve to the real database --
+    # the same shared guard operator_api.py itself uses. This script's
+    # entire purpose is demo seeding, so it forces LUXOR_DEMO_MODE and
+    # OPERATOR_API_DB_PATH in its own process environment unconditionally
+    # (not setdefault) -- a caller who forgot to set OPERATOR_API_DB_PATH
+    # in their shell before invoking this script no longer silently
+    # touches the real database; every operator_api.route_*() call this
+    # script makes below now resolves through the exact same guard.
+    db_path = resolve_db_path("demo", db_path)
+    os.environ["LUXOR_DEMO_MODE"] = "true"
+    os.environ["OPERATOR_API_DB_PATH"] = str(db_path)
 
     import operator_api as api
     import whatsapp_bridge_adapter
+    from dispatcher import storage
     from dispatcher.app_models import TechnicianUpdateCommand
     from dispatcher.rules.service_areas import load_service_areas
 

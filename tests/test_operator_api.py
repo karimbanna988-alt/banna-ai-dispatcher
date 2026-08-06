@@ -171,6 +171,45 @@ def test_session_secret_generation_is_idempotent(tmp_path, monkeypatch):
     assert secret1 == secret2
 
 
+# ===================================================== DB PATH SAFETY ====
+# operator_api.py must never silently fall back to the production
+# database in a demo or test context -- see dispatcher.db_safety and
+# docs/CURRENT_SPRINT_CHECKPOINT.md for the incident this closes.
+def test_db_mode_is_test_under_pytest():
+    assert api._current_db_mode() == "test"
+
+
+def test_get_conn_raises_when_db_path_unset_under_pytest(monkeypatch):
+    monkeypatch.delenv("OPERATOR_API_DB_PATH", raising=False)
+    with pytest.raises(api.UnsafeDatabasePathError):
+        api.get_conn()
+
+
+def test_get_conn_raises_when_db_path_points_at_the_real_database(monkeypatch):
+    monkeypatch.setenv("OPERATOR_API_DB_PATH", str(storage.DB_PATH))
+    with pytest.raises(api.UnsafeDatabasePathError):
+        api.get_conn()
+
+
+def test_get_conn_succeeds_with_a_genuine_throwaway_path(api_env):
+    conn = api.get_conn()
+    try:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_demo_mode_env_var_alone_without_db_path_still_fails_closed(monkeypatch):
+    """Even if LUXOR_DEMO_MODE=true is set (the real launcher's own
+    signal) with no OPERATOR_API_DB_PATH, this must still refuse --
+    proving the guard doesn't depend on the pytest-detection branch
+    alone."""
+    monkeypatch.delenv("OPERATOR_API_DB_PATH", raising=False)
+    monkeypatch.setenv("LUXOR_DEMO_MODE", "true")
+    with pytest.raises(api.UnsafeDatabasePathError):
+        api.get_conn()
+
+
 def test_unauthenticated_api_request_returns_401(live_server):
     r = http_request(live_server, "GET", "/api/new_jobs")
     assert r["status"] == 401

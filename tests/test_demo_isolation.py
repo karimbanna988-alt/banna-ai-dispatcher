@@ -41,8 +41,13 @@ def api_env(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------- seed script safety guard
+# seed() now delegates to the shared dispatcher.db_safety.resolve_db_path()
+# guard (see tests/test_db_safety.py for that function's own exhaustive
+# coverage) instead of a private ValueError comparison -- these two tests
+# confirm the seed script is actually wired to it, not just that the
+# guard function works in isolation.
 def test_seed_refuses_to_write_to_the_real_database_path(monkeypatch):
-    with pytest.raises(ValueError, match="live database"):
+    with pytest.raises(api.UnsafeDatabasePathError, match="production database"):
         seed_demo.seed(storage.DB_PATH)
 
 
@@ -50,7 +55,7 @@ def test_seed_refuses_the_real_database_path_even_via_a_relative_or_odd_spelling
     # storage.DB_PATH resolved through an extra ".." round-trip should
     # still be caught by the guard's use of .resolve() on both sides.
     odd_path = storage.DB_PATH.parent / ".." / storage.DB_PATH.parent.name / storage.DB_PATH.name
-    with pytest.raises(ValueError, match="live database"):
+    with pytest.raises(api.UnsafeDatabasePathError, match="production database"):
         seed_demo.seed(odd_path)
 
 

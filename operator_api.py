@@ -31,8 +31,12 @@ after logout.
 
 Run: python operator_api.py [--port 8512]
 The default DB is the real one (dispatcher.storage.connect()'s default)
--- set OPERATOR_API_DB_PATH to point at a different file (tests always
-do this, and always use a temporary path, never the real database).
+-- but that default is only ever reachable via _db_path() when running
+in "live" mode (see dispatcher.db_safety.current_mode()). Under pytest,
+or whenever LUXOR_DEMO_MODE=true, OPERATOR_API_DB_PATH becomes
+mandatory and must not resolve to the real database -- _db_path()
+raises UnsafeDatabasePathError otherwise. Tests always set it, and
+always to a temporary path.
 """
 
 from __future__ import annotations
@@ -67,6 +71,8 @@ import luxor_desk_shared  # noqa: E402
 import luxor_ops_shared as shared  # noqa: E402
 import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
+from dispatcher import db_safety  # noqa: E402
+from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.action_names import TECHNICIAN_UPDATE_TYPES  # noqa: E402
 from dispatcher.app_models import ClosingCommand, TechnicianUpdateCommand  # noqa: E402
@@ -87,9 +93,12 @@ class ApiError(Exception):
         self.message = message
 
 
+DEMO_MODE_ENV_VAR = db_safety.DEMO_MODE_ENV_VAR  # set by scripts/start_demo.ps1 only -- never set for a normal/real run
+_current_db_mode = db_safety.current_mode  # exposed under this name for tests/readability at call sites in this file
+
+
 def _db_path() -> Optional[Path]:
-    override = os.environ.get("OPERATOR_API_DB_PATH")
-    return Path(override) if override else None
+    return db_safety.resolve_db_path_from_env()
 
 
 def get_conn():
@@ -102,7 +111,6 @@ def _service(conn) -> DispatcherService:
 
 # =============================================================== AUTH ====
 PASSWORD_ENV_VAR = luxor_desk_shared.PASSWORD_ENV_VAR  # "LUXOR_DEMO_PASSWORD" -- same one password, reused, never duplicated
-DEMO_MODE_ENV_VAR = "LUXOR_DEMO_MODE"  # set by scripts/start_demo.ps1 only -- never set for a normal/real run
 SESSION_SECRET_ENV_VAR = "OPERATOR_API_SESSION_SECRET"
 SESSION_COOKIE_NAME = "operator_session"
 SESSION_TTL_SECONDS = 12 * 3600  # one dispatcher shift

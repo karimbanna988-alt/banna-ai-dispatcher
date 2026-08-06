@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from dispatcher import storage
+from dispatcher import db_safety
 
 ADAPTER_SECRET_ENV_VAR = "WHATSAPP_BRIDGE_ADAPTER_SECRET"
 ADAPTER_PORT_ENV_VAR = "WHATSAPP_BRIDGE_ADAPTER_PORT"
@@ -59,8 +60,7 @@ class AdapterError(Exception):
 
 
 def _db_path() -> Optional[Path]:
-    override = os.environ.get("OPERATOR_API_DB_PATH")
-    return Path(override) if override else None
+    return db_safety.resolve_db_path_from_env()
 
 
 def _conn():
