@@ -429,6 +429,43 @@ class DispatcherService:
             idempotent_replay=was_replay, user_message="Job completed.",
         )
 
+    # ------------------------------------------------- Technician K ack ---
+    def confirm_technician_accepted(self, job_id: int, message_id: str) -> ActionResult:
+        """A human confirms a captured WhatsApp observation represents
+        this technician accepting this job -- never automatic (see
+        dispatcher.technician_ack for the matching evidence a human
+        reviews before calling this). Does not touch jobs.status; see
+        storage.mark_technician_accepted()'s docstring."""
+        idempotency_key = compute_idempotency_key(job_id, "confirm_technician_accepted", message_id)
+        was_replay = storage.get_event_by_idempotency_key(self.conn, idempotency_key) is not None
+        try:
+            storage.mark_technician_accepted(self.conn, job_id, message_id, idempotency_key=idempotency_key)
+        except InvalidJobActionError as exc:
+            return ActionResult.failure("confirm_technician_accepted", job_id=job_id, message=str(exc))
+        storage.resolve_whatsapp_observation(self.conn, message_id, "attached", job_id=job_id)
+        return ActionResult(
+            success=True, action="confirm_technician_accepted", job_id=job_id,
+            idempotent_replay=was_replay, user_message="Technician acceptance recorded.",
+        )
+
+    def confirm_technician_declined(self, job_id: int, message_id: str, reason: str) -> ActionResult:
+        if not reason or not reason.strip():
+            return ActionResult.failure(
+                "confirm_technician_declined", job_id=job_id,
+                issues=[ValidationIssue(field="reason", problem="required to record a decline")],
+            )
+        idempotency_key = compute_idempotency_key(job_id, "confirm_technician_declined", f"{message_id}|{reason}")
+        was_replay = storage.get_event_by_idempotency_key(self.conn, idempotency_key) is not None
+        try:
+            storage.mark_technician_declined(self.conn, job_id, message_id, reason, idempotency_key=idempotency_key)
+        except InvalidJobActionError as exc:
+            return ActionResult.failure("confirm_technician_declined", job_id=job_id, message=str(exc))
+        storage.resolve_whatsapp_observation(self.conn, message_id, "attached", job_id=job_id)
+        return ActionResult(
+            success=True, action="confirm_technician_declined", job_id=job_id,
+            idempotent_replay=was_replay, user_message="Technician decline recorded.",
+        )
+
     def update_technician_destinations(
         self, technician_id: int, dispatch_group: str, closing_group: str,
     ) -> ActionResult:

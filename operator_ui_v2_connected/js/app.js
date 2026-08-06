@@ -1088,6 +1088,44 @@ const CUSTOMER_RESPONSES = ["ACCEPTED", "DECLINED", "WILL_CALL_BACK", "THINKING"
 
 const TECHNICIAN_UPDATE_TYPES = ["Going", "ETA", "No Answer", "No Show", "Not Available", "Customer Cancelled", "Completed", "Custom"];
 
+const K_CATEGORY_LABEL = { EXACT: "Exact match", STRONG: "Strong match", AMBIGUOUS: "Ambiguous" };
+
+function technicianKBlockHtml(j) {
+  const tk = j.technician_k;
+  if (!tk) return "";
+
+  if (tk.status === "accepted") {
+    return `
+      <div class="detail-section">
+        <div class="subsection-label">Technician acceptance</div>
+        <div class="checked-line">&#10003; Technician confirmed accepted (${esc((tk.accepted_at || "").slice(0, 16).replace("T", " "))})</div>
+      </div>`;
+  }
+  if (tk.status === "declined") {
+    return `
+      <div class="detail-section">
+        <div class="review-banner">Technician declined: ${esc(tk.reason || "")}</div>
+      </div>`;
+  }
+
+  const candidates = tk.candidates || [];
+  const candidateRows = candidates.length
+    ? candidates.map(c => `
+      <div class="k-candidate">
+        <div class="k-candidate-head"><span class="chip ${c.category === "EXACT" ? "chip-settled" : c.category === "AMBIGUOUS" ? "chip-waiting" : "chip-needs-action"}">${esc(K_CATEGORY_LABEL[c.category] || c.category)}</span></div>
+        <div class="detail-meta">${c.reasons.map(esc).join("; ")}</div>
+        <button type="button" class="btn btn-primary btn-block" data-activeaction="confirm_k_accepted" data-msgid="${esc(c.message_id)}" data-id="${j.id}">Confirm technician accepted</button>
+        <button type="button" class="btn btn-secondary btn-block" style="margin-top:4px;" data-activeaction="confirm_k_declined" data-msgid="${esc(c.message_id)}" data-id="${j.id}">${c.is_decline_shaped ? "Confirm technician declined" : "This is a decline, not an accept"}</button>
+      </div>`).join("")
+    : `<div class="detail-meta">No matching WhatsApp reply captured yet.</div>`;
+
+  return `
+    <div class="detail-section">
+      <div class="subsection-label">Technician acceptance -- waiting on K</div>
+      ${candidateRows}
+    </div>`;
+}
+
 function statusUpdateBlockHtml(j) {
   const owed = j.company_update_owed;
   const draft = state.statusUpdateDraft[j.id] || {};
@@ -1204,6 +1242,7 @@ function activeDetailHtml(j) {
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span></div>
     <div class="detail-meta">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")} · Status: <strong>${esc(j.status)}</strong></div>
     <div class="detail-meta">Next: <strong>${esc(j.next_action)}</strong></div>
+    ${technicianKBlockHtml(j)}
     ${statusUpdateBlockHtml(j)}
     <div class="detail-section">${interpretBlock}</div>
     <div class="detail-section" id="activeEditBlock-${j.id}">${editBlock}</div>
@@ -1214,7 +1253,7 @@ function activeDetailHtml(j) {
 function wireActiveDetailActions(j) {
   const root = isMobile() ? document.getElementById("bottomSheetContent") : document.getElementById("activeDetailPane");
   root.querySelectorAll("[data-activeaction]").forEach(el => {
-    el.addEventListener("click", () => handleActiveAction(el.dataset.activeaction, parseInt(el.dataset.id, 10)));
+    el.addEventListener("click", () => handleActiveAction(el.dataset.activeaction, parseInt(el.dataset.id, 10), el.dataset.msgid));
   });
   const typeSelect = document.getElementById(`statusUpdateType-${j.id}`);
   const etaWrap = document.getElementById(`statusUpdateEtaWrap-${j.id}`);
@@ -1225,7 +1264,7 @@ function wireActiveDetailActions(j) {
   }
 }
 
-async function handleActiveAction(action, id) {
+async function handleActiveAction(action, id, msgId) {
   try {
     if (action === "interpret") {
       const text = document.getElementById(`pasteText-${id}`).value;
@@ -1287,6 +1326,16 @@ async function handleActiveAction(action, id) {
       const r = await callOrHandleAuth(() => Api.confirmCompanyUpdateSent(id, prepared.text));
       if (!r) return;
       delete state.statusUpdatePrepared[id];
+      await loadActive();
+    } else if (action === "confirm_k_accepted") {
+      const r = await callOrHandleAuth(() => Api.confirmTechnicianAccepted(id, msgId));
+      if (!r) return;
+      await loadActive();
+    } else if (action === "confirm_k_declined") {
+      const reason = window.prompt("Why did the technician decline? (required)");
+      if (!reason || !reason.trim()) return;
+      const r = await callOrHandleAuth(() => Api.confirmTechnicianDeclined(id, msgId, reason.trim()));
+      if (!r) return;
       await loadActive();
     }
   } catch (e) {

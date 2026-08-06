@@ -43,6 +43,8 @@ class ActionName(str, Enum):
     COMPANY_CLOSING_PREPARED = "Company Closing Prepared"
     COMPANY_CLOSING_SENT_MANUALLY = "Company Closing Sent Manually"
     JOB_COMPLETED = "Job Completed"
+    TECHNICIAN_ACCEPTED = "Technician Accepted"
+    TECHNICIAN_DECLINED = "Technician Declined"
 
     # Technician-roster configuration change (not job-scoped -- the
     # associated events row carries job_id=NULL). See

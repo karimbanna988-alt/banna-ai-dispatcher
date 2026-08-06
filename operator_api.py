@@ -80,6 +80,7 @@ from dispatcher.application import DispatcherService  # noqa: E402
 from dispatcher.closing import ClosingInput, render_closing_from_persisted_fields  # noqa: E402
 from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
+from dispatcher import technician_ack  # noqa: E402
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
@@ -513,6 +514,45 @@ def _active_next_action_label(conn, job: dict) -> str:
     return "Prepare company reply"
 
 
+def _technician_k_dto(conn, job: dict, all_jobs: list) -> Optional[dict]:
+    """None means "not applicable right now": no technician assigned, or
+    the job has already moved past the awaiting-K stage (a technician
+    update has already been recorded). Otherwise returns either the
+    already-confirmed accept/decline fact, or -- while still waiting --
+    the classified candidate observations a human can act on. Every
+    candidate's category/reasons come from dispatcher.technician_ack,
+    never invented here."""
+    technician_name = job.get("assigned_technician_name")
+    if job.get("status") != "Approved" or not technician_name:
+        return None
+    if not storage.technician_acceptance_schema_present(conn):
+        return None
+    ta = storage.get_technician_acceptance(conn, job["id"])
+    if ta["accepted_at"]:
+        return {"status": "accepted", "accepted_at": ta["accepted_at"], "via_message_id": ta["accepted_via_message_id"]}
+    if ta["declined_at"]:
+        return {"status": "declined", "declined_at": ta["declined_at"], "reason": ta["decline_reason"]}
+
+    # rm.get_active_jobs_detailed()'s SQL joins in the technician's name/
+    # dispatch_group already (fetch_jobs() never selects the raw
+    # assigned_technician_id column) -- build the minimal shape
+    # classify_candidates() actually needs from those, rather than a
+    # second lookup keyed by an id this dict doesn't carry.
+    technician = {"name": technician_name, "dispatch_group": job.get("assigned_technician_dispatch_group")}
+    pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+    other_waiting = [
+        other["ticket_number"] for other in all_jobs
+        if other["id"] != job["id"] and other.get("assigned_technician_name") == technician_name
+        and other.get("status") == "Approved"
+    ]
+    matches = technician_ack.classify_candidates(job, technician, pending_observations, other_waiting_ticket_numbers=other_waiting)
+    candidates = [
+        {"message_id": m.message_id, "category": m.category, "is_decline_shaped": m.is_decline_shaped, "reasons": m.reasons}
+        for m in matches if m.category != technician_ack.CATEGORY_UNMATCHED
+    ]
+    return {"status": "waiting", "candidates": candidates}
+
+
 def route_active(handler: "Handler", match: dict, body: dict) -> dict:
     conn = get_conn()
     try:
@@ -535,8 +575,38 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "waiting_since": j.get("last_event_at") or j.get("updated_at"),
                 "shadow_episode": _episode_summary(episode) if episode else None,
                 "company_update_owed": _company_update_owed_dto(conn, j),
+                "technician_k": _technician_k_dto(conn, j, jobs),
             })
         return {"entries": entries}
+    finally:
+        conn.close()
+
+
+def route_technician_k_confirm_accepted(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    message_id = _require(body, "message_id")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.confirm_technician_accepted(job_id, message_id)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not confirm technician acceptance.")
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
+def route_technician_k_confirm_declined(handler: "Handler", match: dict, body: dict) -> dict:
+    job_id = int(match["id"])
+    message_id = _require(body, "message_id")
+    reason = _require(body, "reason")
+    conn = get_conn()
+    try:
+        service = _service(conn)
+        result = service.confirm_technician_declined(job_id, message_id, reason)
+        if not result.success:
+            raise ApiError(400, result.user_message or "Could not confirm technician decline.")
+        return _action_result_dto(result)
     finally:
         conn.close()
 
@@ -1267,6 +1337,8 @@ ROUTES = [
     ("POST", r"^/api/job/(?P<id>\d+)/technician_update$", route_technician_update_record, {}),
     ("POST", r"^/api/job/(?P<id>\d+)/company_update/prepare$", route_company_update_prepare, {}),
     ("POST", r"^/api/job/(?P<id>\d+)/company_update/confirm_sent$", route_company_update_confirm_sent, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/technician_acceptance/confirm_accepted$", route_technician_k_confirm_accepted, {}),
+    ("POST", r"^/api/job/(?P<id>\d+)/technician_acceptance/confirm_declined$", route_technician_k_confirm_declined, {}),
     ("GET", r"^/api/technicians$", route_technicians, {}),
     ("POST", r"^/api/technicians/(?P<id>\d+)/destinations$", route_update_destinations, {}),
     ("GET", r"^/api/job/(?P<id>\d+)$", route_job_workspace, {}),

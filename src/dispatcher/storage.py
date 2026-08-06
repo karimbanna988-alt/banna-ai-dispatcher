@@ -356,6 +356,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_dispatch_tracking_support(conn)
     _add_console_activation_support(conn)
     _add_whatsapp_pending_observations_support(conn)
+    _add_technician_acceptance_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -1260,6 +1261,137 @@ def resolve_whatsapp_observation(conn: sqlite3.Connection, message_id: str, stat
         )
     conn.commit()
     return get_whatsapp_observation(conn, message_id)
+
+
+def _add_technician_acceptance_support(conn: sqlite3.Connection) -> None:
+    """Additive only, same pattern as every other migration in this
+    module. Job-keyed (not message_id-keyed like dispatch_tracking)
+    because a job outlives the pending message that created it, and
+    technician acceptance is a fact about the job, not about one Quo
+    message. Deliberately does NOT touch jobs.status -- "did the
+    technician accept" is orthogonal to the deterministic job-status
+    state machine (derive_job_status()), exactly like reconciliation_state
+    is orthogonal to status. See docs/END_TO_END_WORKFLOW_AUDIT.md step 6
+    for why this table didn't exist before this sprint."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS technician_acceptance (
+            job_id INTEGER PRIMARY KEY,
+            accepted_at TEXT,
+            accepted_via_message_id TEXT,
+            declined_at TEXT,
+            declined_via_message_id TEXT,
+            decline_reason TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def technician_acceptance_schema_present(conn: sqlite3.Connection) -> bool:
+    """Read-only, independent of check_schema_status()/require_current_schema(),
+    same reasoning as shadow_schema_present(): this table is additive
+    and optional, not part of the blanket schema-upgrade gate every
+    existing write-capable page already enforces, so a real database
+    that hasn't yet run this migration doesn't suddenly show "Database
+    upgrade required" for functionality that has nothing to do with
+    technician acceptance. Callers degrade gracefully (treat as "not
+    tracked yet") instead."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='technician_acceptance'"
+    ).fetchone()
+    return row is not None
+
+
+def get_technician_acceptance(conn: sqlite3.Connection, job_id: int) -> dict:
+    """Always returns a dict -- never raises for a job with no row yet
+    (the common case before a technician has replied at all), and never
+    raises on a database that hasn't run this migration (returns the
+    same all-None shape, per technician_acceptance_schema_present())."""
+    if not technician_acceptance_schema_present(conn):
+        return {"job_id": job_id, "accepted_at": None, "accepted_via_message_id": None,
+                "declined_at": None, "declined_via_message_id": None, "decline_reason": None}
+    row = conn.execute(
+        "SELECT accepted_at, accepted_via_message_id, declined_at, declined_via_message_id, decline_reason "
+        "FROM technician_acceptance WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    columns = ("accepted_at", "accepted_via_message_id", "declined_at", "declined_via_message_id", "decline_reason")
+    if row is None:
+        return {"job_id": job_id, **{c: None for c in columns}}
+    return {"job_id": job_id, **dict(zip(columns, row))}
+
+
+def mark_technician_accepted(
+    conn: sqlite3.Connection, job_id: int, message_id: str, idempotency_key: Optional[str] = None,
+) -> dict:
+    """Set-once, same COALESCE 'first write wins' contract as
+    _touch_dispatch_tracking -- a second confirm (double-click, replay)
+    is a safe no-op that preserves the original timestamp/message_id.
+    Also records a full audit-trail event (unlike dispatch_tracking's
+    silent milestones) -- technician acceptance is a fact worth showing
+    in the job's history, not just an internal UI-progress marker."""
+    if not technician_acceptance_schema_present(conn):
+        raise InvalidJobActionError(
+            "This database has not run the technician-acceptance migration yet -- "
+            "see docs/SCHEMA_MIGRATION_RUNBOOK.md."
+        )
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO technician_acceptance (job_id, accepted_at, accepted_via_message_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            accepted_at = COALESCE(technician_acceptance.accepted_at, excluded.accepted_at),
+            accepted_via_message_id = COALESCE(technician_acceptance.accepted_via_message_id, excluded.accepted_via_message_id),
+            updated_at = excluded.updated_at
+        """,
+        (job_id, now, message_id, now),
+    )
+    conn.commit()
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.TECHNICIAN_ACCEPTED.value,
+        raw_message=f"Confirmed accepted via WhatsApp message {message_id}", idempotency_key=idempotency_key,
+    )
+    return get_technician_acceptance(conn, job_id)
+
+
+def mark_technician_declined(
+    conn: sqlite3.Connection, job_id: int, message_id: str, reason: str, idempotency_key: Optional[str] = None,
+) -> dict:
+    if not technician_acceptance_schema_present(conn):
+        raise InvalidJobActionError(
+            "This database has not run the technician-acceptance migration yet -- "
+            "see docs/SCHEMA_MIGRATION_RUNBOOK.md."
+        )
+    job = get_job_by_id(conn, job_id)
+    if job is None:
+        raise ValueError(f"No job with id {job_id}")
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO technician_acceptance (job_id, declined_at, declined_via_message_id, decline_reason, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            declined_at = COALESCE(technician_acceptance.declined_at, excluded.declined_at),
+            declined_via_message_id = COALESCE(technician_acceptance.declined_via_message_id, excluded.declined_via_message_id),
+            decline_reason = COALESCE(technician_acceptance.decline_reason, excluded.decline_reason),
+            updated_at = excluded.updated_at
+        """,
+        (job_id, now, message_id, reason, now),
+    )
+    conn.commit()
+    _insert_operational_event(
+        conn, job_id=job_id, source=job["source"], ticket_number=job["ticket_number"],
+        message_type=MessageType.OPERATIONAL_NOTE.value, final_action=ActionName.TECHNICIAN_DECLINED.value,
+        raw_message=f"Confirmed declined via WhatsApp message {message_id}: {reason}", idempotency_key=idempotency_key,
+    )
+    return get_technician_acceptance(conn, job_id)
 
 
 # Module-level clock, swappable only by tests (production always uses

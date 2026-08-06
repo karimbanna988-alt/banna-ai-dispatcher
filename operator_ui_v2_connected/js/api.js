@@ -96,6 +96,13 @@ const Api = {
     return this._call("POST", `/api/job/${jobId}/company_update/confirm_sent`, { prepared_text: preparedText });
   },
 
+  confirmTechnicianAccepted(jobId, messageId) {
+    return this._call("POST", `/api/job/${jobId}/technician_acceptance/confirm_accepted`, { message_id: messageId });
+  },
+  confirmTechnicianDeclined(jobId, messageId, reason) {
+    return this._call("POST", `/api/job/${jobId}/technician_acceptance/confirm_declined`, { message_id: messageId, reason });
+  },
+
   getClosings() { return this._call("GET", "/api/closings"); },
   recordClosing(jobId, fields) { return this._call("POST", `/api/closings/${jobId}/record`, fields); },
   prepareClosing(jobId) { return this._call("POST", `/api/closings/${jobId}/prepare`, {}); },
