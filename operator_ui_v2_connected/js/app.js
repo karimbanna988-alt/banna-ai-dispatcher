@@ -97,9 +97,10 @@ function showLogin(message) {
   document.getElementById("loginPassword").focus();
 }
 
-function showApp() {
+function showApp(demoMode) {
   document.getElementById("loginScreen").style.display = "none";
   document.getElementById("appShell").style.display = "block";
+  document.getElementById("demoModeBanner").style.display = demoMode ? "block" : "none";
   setScreen("commandcenter");
 }
 
@@ -134,8 +135,8 @@ async function attemptLogin() {
   btn.disabled = true;
   label.textContent = "Logging in...";
   try {
-    await Api.login(password);
-    showApp();
+    const result = await Api.login(password);
+    showApp(result && result.demo_mode);
   } catch (e) {
     // Distinguish "the server said no" (a real, specific message like
     // "Invalid password.") from "we couldn't reach the server at all"
@@ -168,12 +169,12 @@ document.getElementById("settingsLogoutItem").addEventListener("click", () => { 
 
 (async function boot() {
   try {
-    await Api.checkSession();
+    const me = await Api.checkSession();
     // Session cookie is valid, but this fresh page load has no CSRF
     // token in memory yet (it is never persisted) -- re-establish one
     // by treating this as "needs login" only if a mutating action later
     // 401s; reads work immediately since GET routes need no CSRF token.
-    showApp();
+    showApp(me && me.demo_mode);
   } catch (e) {
     showLogin();
   }

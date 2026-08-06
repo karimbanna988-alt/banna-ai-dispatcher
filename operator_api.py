@@ -100,6 +100,7 @@ def _service(conn) -> DispatcherService:
 
 # =============================================================== AUTH ====
 PASSWORD_ENV_VAR = luxor_desk_shared.PASSWORD_ENV_VAR  # "LUXOR_DEMO_PASSWORD" -- same one password, reused, never duplicated
+DEMO_MODE_ENV_VAR = "LUXOR_DEMO_MODE"  # set by scripts/start_demo.ps1 only -- never set for a normal/real run
 SESSION_SECRET_ENV_VAR = "OPERATOR_API_SESSION_SECRET"
 SESSION_COOKIE_NAME = "operator_session"
 SESSION_TTL_SECONDS = 12 * 3600  # one dispatcher shift
@@ -337,7 +338,7 @@ def route_login(handler: "Handler", match: dict, body: dict) -> dict:
     token = make_session_token()
     if handler:
         handler.set_session_cookie(token)
-    return {"success": True, "csrf_token": csrf_token_for(token)}
+    return {"success": True, "csrf_token": csrf_token_for(token), "demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true"}
 
 
 def route_logout(handler: "Handler", match: dict, body: dict) -> dict:
@@ -348,7 +349,7 @@ def route_logout(handler: "Handler", match: dict, body: dict) -> dict:
 
 
 def route_me(handler: "Handler", match: dict, body: dict) -> dict:
-    return {"authenticated": True}
+    return {"authenticated": True, "demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true"}
 
 
 # --------------------------------------------------------- Route handlers -

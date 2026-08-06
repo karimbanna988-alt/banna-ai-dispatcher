@@ -45,9 +45,16 @@ def main_leads_message(ticket: str, area: str = "Savannah, GA 31401") -> str:
 
 
 def seed(db_path: Path) -> None:
+    from dispatcher import storage
+
+    if db_path.resolve() == storage.DB_PATH.resolve():
+        raise ValueError(
+            f"Refusing to seed synthetic demo data into the live database ({storage.DB_PATH}). "
+            "Pass a path under a temp/demo directory instead."
+        )
+
     import operator_api as api
     import whatsapp_bridge_adapter
-    from dispatcher import storage
     from dispatcher.app_models import TechnicianUpdateCommand
     from dispatcher.rules.service_areas import load_service_areas
 
@@ -196,6 +203,20 @@ def seed(db_path: Path) -> None:
         "text": "job done, customer paid cash",
     })
 
+    # Job 6: dispatched, then cancelled -- through the same real
+    # DispatcherService.pass_or_cancel_job() path the CRM itself calls
+    # (operator_api.py currently has no HTTP route wired to this method
+    # for an already-dispatched job -- see docs/KNOWN_LIMITATIONS.md --
+    # so it's invoked directly here exactly like technician_update()
+    # already is above, not a hand-built row).
+    job6 = seed_and_dispatch("demo-m6", agn_message("D600"))
+    conn = api.get_conn()
+    try:
+        service = api._service(conn)
+        service.pass_or_cancel_job(job6, "Cancel", "Customer found another locksmith before we arrived (demo fixture).")
+    finally:
+        conn.close()
+
     # 30 extra raw historical messages, direct inserts (never through the
     # route pipeline -- these deliberately never become jobs), purely to
     # give Archive / Inbox Review real pagination to demonstrate. Ages
@@ -217,7 +238,7 @@ def seed(db_path: Path) -> None:
 
     print(
         f"Seeded demo DB at {db_path}: "
-        f"jobs {job1}, {job2}, {job3}, {job4}, {jobF1}, {jobF2}, {jobF3}, {jobF4}, {jobF5}; "
+        f"jobs {job1}, {job2}, {job3}, {job4}, {job6}, {jobF1}, {jobF2}, {jobF3}, {jobF4}, {jobF5}; "
         f"technicians {tech_a} (Ashraf), {tech_b} (Sebai), {tech_c} (Marcus); 30 archive messages.\n"
         f"Active-board fixtures: F100={jobF1} (assigned, awaiting technician), "
         f"F200={jobF2} (assigned, recent ETA update), F300={jobF3} (In Progress, Going update), "
