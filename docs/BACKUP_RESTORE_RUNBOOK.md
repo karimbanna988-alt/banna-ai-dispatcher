@@ -14,6 +14,21 @@ this project's established convention) as
 size, sha256 checksum, schema revision, integrity result, and row
 counts — **never row content**.
 
+## Retention
+
+Every `backup_database.py` run also applies retention in the same
+destination directory: it keeps the most recent **30** backups of that
+exact source database (matched only by the `<db-name>.pre-*.bak` naming
+pattern — it never touches any other file) and deletes older ones.
+Override with `--retain-count N`; pass `--retain-count 0` to disable
+retention entirely for that run (nothing is deleted). 30 was chosen as a
+conservative default — enough for roughly a month of daily backups
+without unbounded disk growth.
+
+```bash
+python scripts/backup_database.py --db data/dispatcher.db --retain-count 30
+```
+
 ## Verify a backup independently
 
 ```bash

@@ -93,6 +93,60 @@ def test_describe_backup_reports_no_row_content_keys(tmp_path, vehicle_rules):
     assert info["integrity_check"] == "ok"
 
 
+# -------------------------------------------------------------- retention
+def test_retention_keeps_only_the_most_recent_n_backups(tmp_path, vehicle_rules):
+    source = _seeded_db(tmp_path, vehicle_rules)
+    dest_dir = tmp_path / "backups"
+    paths = []
+    for i in range(5):
+        p = backup_database.backup_database(source, dest_dir=dest_dir, label=f"run{i}")
+        paths.append(p)
+        # Force distinct mtimes so retention's oldest-first ordering is unambiguous
+        # even when two backups land in the same UTC second.
+        import os
+        os.utime(p, (p.stat().st_atime, p.stat().st_mtime + i))
+    deleted = backup_database.apply_retention(dest_dir, source.name, keep=2)
+    remaining = sorted(dest_dir.glob(f"{source.name}.pre-*.bak"))
+    assert len(remaining) == 2
+    assert len(deleted) == 3
+    assert set(remaining) == {paths[3], paths[4]}
+
+
+def test_retention_keep_zero_deletes_nothing(tmp_path, vehicle_rules):
+    source = _seeded_db(tmp_path, vehicle_rules)
+    dest_dir = tmp_path / "backups"
+    for i in range(3):
+        backup_database.backup_database(source, dest_dir=dest_dir, label=f"run{i}")
+    deleted = backup_database.apply_retention(dest_dir, source.name, keep=0)
+    assert deleted == []
+    assert len(list(dest_dir.glob(f"{source.name}.pre-*.bak"))) == 3
+
+
+def test_retention_never_touches_files_from_a_different_source_db(tmp_path, vehicle_rules):
+    source = _seeded_db(tmp_path, vehicle_rules)
+    other_source = tmp_path / "other.db"
+    other_source.write_bytes(b"not a real db, just a distinct filename")
+    dest_dir = tmp_path / "backups"
+    dest_dir.mkdir()
+    unrelated = dest_dir / f"{other_source.name}.pre-manual-19990101T000000Z.bak"
+    unrelated.write_bytes(b"unrelated backup, must survive")
+    for i in range(3):
+        backup_database.backup_database(source, dest_dir=dest_dir, label=f"run{i}")
+    backup_database.apply_retention(dest_dir, source.name, keep=1)
+    assert unrelated.exists()
+
+
+def test_main_cli_applies_retention_by_default(tmp_path, vehicle_rules, capsys):
+    source = _seeded_db(tmp_path, vehicle_rules)
+    dest_dir = tmp_path / "backups"
+    for i in range(3):
+        backup_database.main(["--db", str(source), "--dest-dir", str(dest_dir), "--label", f"run{i}", "--retain-count", "1"])
+    remaining = list(dest_dir.glob(f"{source.name}.pre-*.bak"))
+    assert len(remaining) == 1
+    captured = capsys.readouterr()
+    assert "retention:" in captured.out
+
+
 # --------------------------------------------------------- verify_backup
 def test_verify_backup_passes_for_a_healthy_backup(tmp_path, vehicle_rules, capsys):
     source = _seeded_db(tmp_path, vehicle_rules)

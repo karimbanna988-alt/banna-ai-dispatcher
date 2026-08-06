@@ -26,6 +26,12 @@ from dispatcher import storage
 
 DEFAULT_BACKUP_DIR = Path(__file__).resolve().parents[2] / "ai-dispatcher-db-backups"
 
+# Conservative default: keep a lot of history rather than risk deleting a
+# backup someone still needs. Retention only ever touches files matching
+# this exact "<source db name>.pre-*-*.bak" pattern in the destination
+# directory -- it never looks at, counts, or deletes anything else there.
+DEFAULT_RETENTION_COUNT = 30
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -64,6 +70,23 @@ def backup_database(source_path: Path, dest_dir: Path = None, label: str = "manu
     return dest_path
 
 
+def apply_retention(dest_dir: Path, source_name: str, keep: int = DEFAULT_RETENTION_COUNT) -> list[Path]:
+    """Deletes the oldest backups of `source_name` in `dest_dir` beyond
+    the most recent `keep`. Only ever considers files matching this
+    project's own "<source_name>.pre-<label>-<timestamp>.bak" naming
+    convention -- never touches any other file. `keep <= 0` disables
+    retention (nothing is deleted). Returns the list of deleted paths."""
+    if keep <= 0:
+        return []
+    candidates = sorted(dest_dir.glob(f"{source_name}.pre-*.bak"), key=lambda p: p.stat().st_mtime)
+    excess = candidates[:-keep] if len(candidates) > keep else []
+    deleted = []
+    for path in excess:
+        path.unlink()
+        deleted.append(path)
+    return deleted
+
+
 def describe_backup(backup_path: Path) -> dict:
     """Read-only metadata about a backup -- never row content."""
     conn = sqlite3.connect(f"file:{backup_path.as_posix()}?mode=ro", uri=True)
@@ -98,12 +121,24 @@ def main(argv=None) -> int:
     parser.add_argument("--db", type=Path, default=storage.DB_PATH)
     parser.add_argument("--dest-dir", type=Path, default=None)
     parser.add_argument("--label", default="manual")
+    parser.add_argument(
+        "--retain-count", type=int, default=DEFAULT_RETENTION_COUNT,
+        help=f"Keep only the most recent N backups of this database in --dest-dir (default {DEFAULT_RETENTION_COUNT}). "
+             "0 disables retention -- nothing is ever deleted.",
+    )
     args = parser.parse_args(argv)
 
     backup_path = backup_database(args.db, args.dest_dir, args.label)
     info = describe_backup(backup_path)
     for key, value in info.items():
         print(f"{key}: {value}")
+
+    deleted = apply_retention(backup_path.parent, args.db.name, args.retain_count)
+    if deleted:
+        print(f"retention: removed {len(deleted)} backup(s) older than the most recent {args.retain_count}")
+    else:
+        print("retention: nothing removed")
+
     return 0 if info["integrity_check"] == "ok" and info["foreign_key_violations"] == 0 else 1
 
 
