@@ -30,11 +30,17 @@ needs an official external integration this product does not have.
 classification → dispatcher approve/edit/reject → technician
 assignment → status updates → closing → audit trail, all wired through
 `DispatcherService` (`src/dispatcher/application.py`) and exposed via
-`operator_api.py` + `operator_ui_v2_connected/`.
+`operator_api.py` + `operator_ui_v2_connected/`. The technician
+status-update → company-reply leg (record technician status, prepare
+the deterministic company reply, mark it sent manually) was completed
+this sprint — it existed at the service layer, tested, but had no HTTP
+route or UI before; see `docs/END_TO_END_WORKFLOW_AUDIT.md` steps 7-8.
 
-**Evidence:** `tests/test_operator_api.py`, `tests/test_application_*`,
-the seeded demo walkthrough (`docs/DEMO_RUNBOOK.md`) covering New →
-Assigned → In Progress → Closing needed → Closed → Cancelled.
+**Evidence:** `tests/test_operator_api.py` (including the new
+`test_technician_update_*`/`test_company_update_*` tests),
+`tests/test_application_*`, the seeded demo walkthrough
+(`docs/DEMO_RUNBOOK.md`) covering New → Assigned → In Progress →
+Closing needed → Closed → Cancelled.
 
 **Sellability status: PILOT READY (B).** The mechanics are real and
 tested; only real dispatcher usage under real call volume will surface

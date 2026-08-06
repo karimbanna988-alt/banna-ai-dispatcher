@@ -19,6 +19,19 @@ single place to check.
   `whatsapp_shadow_bridge/test/no-send-static-check.test.js`, not just
   a policy.
 
+## Technician acceptance ("K") is not tracked
+
+There is no schema concept anywhere of "the technician accepted this
+job." A bare "K"/"ok"/"👍" reply captured by the WhatsApp bridge is
+explicitly flagged for human review rather than auto-interpreted as
+acceptance (`whatsapp_bridge_adapter.py`'s `_ACKNOWLEDGEMENT_ONLY_TEXTS`
+handling). A dispatcher must read the WhatsApp Pending queue and
+manually confirm a technician accepted a job — nothing in the product
+tracks or gates on this today. See
+`docs/END_TO_END_WORKFLOW_AUDIT.md` step 6. Building deterministic
+match evidence (allowlisted group, quoted-message ID, ticket/PDL,
+timestamp proximity, confidence category) is scoped, not started.
+
 ## Human review requirement
 
 Every AI-extracted job field must be approved, edited, or rejected by a
