@@ -686,7 +686,7 @@ function dispatchAreaHtml(j) {
     <div class="detail-meta">Send to: <strong>${esc(j.destination)}</strong></div>
     <pre class="msg-block">${esc(j.luxor_message)}</pre>
     <button class="btn btn-primary btn-block" data-jobaction="open_whatsapp" data-mid="${esc(j.message_id)}">Open WhatsApp</button>
-    <button class="btn btn-primary btn-block" style="margin-top:6px;" data-jobaction="confirm_prompt" data-mid="${esc(j.message_id)}">Confirm sent manually</button>`;
+    <button class="btn btn-primary btn-block" style="margin-top:6px;" data-jobaction="confirm_prompt" data-mid="${esc(j.message_id)}">Mark sent manually</button>`;
 }
 
 function wireJobDetailActions(j) {
@@ -1279,7 +1279,7 @@ function statusUpdateBlockHtml(j) {
     actionBlock = `
       <pre class="msg-block">${esc(prepared.text)}</pre>
       <button type="button" class="btn btn-secondary btn-block" data-activeaction="copy_status_reply" data-id="${j.id}">Copy reply</button>
-      <button type="button" class="btn btn-primary btn-block" style="margin-top:6px;" data-activeaction="confirm_status_update_sent" data-id="${j.id}">I sent this reply manually</button>`;
+      <button type="button" class="btn btn-primary btn-block" style="margin-top:6px;" data-activeaction="confirm_status_update_sent" data-id="${j.id}">Mark sent manually</button>`;
   } else if (owed.confirmed) {
     actionBlock = `
       <pre class="msg-block">${esc(owed.suggested_reply)}</pre>
@@ -1342,8 +1342,8 @@ function activeDetailHtml(j) {
       <div class="detail-section">
         <div class="subsection-label">Prepared company reply</div>
         <pre class="msg-block">${esc(preview.preparedText)}</pre>
-        <button class="btn btn-secondary btn-block" data-activeaction="copy_reply" data-id="${j.id}">Copy response</button>
-        <button class="btn btn-primary btn-block" style="margin-top:6px;" data-activeaction="confirm_reply" data-id="${j.id}">Confirm company response sent manually</button>
+        <button class="btn btn-secondary btn-block" data-activeaction="copy_reply" data-id="${j.id}">Copy reply</button>
+        <button class="btn btn-primary btn-block" style="margin-top:6px;" data-activeaction="confirm_reply" data-id="${j.id}">Mark sent manually</button>
       </div>`;
   } else if (preview && preview.saved && !preview.preparedText) {
     replyBlock = `<div class="review-banner">No deterministic company reply available -- please review before continuing.</div>`;
@@ -1574,8 +1574,8 @@ function closingDetailHtml(c) {
       <div class="checked-line">&#10003; Payment method: ${esc(c.payment_method)}</div>
       <div class="subsection-title">5. Company closing (send manually in Quo -- this business never uses WhatsApp for company closings)</div>
       <pre class="msg-block">${esc(c.prepared_text)}</pre>
-      <button class="btn btn-secondary btn-block" data-closingaction="prepare" data-id="${c.id}">Copy closing / mark prepared</button>
-      <button class="btn btn-primary btn-block" style="margin-top:6px;" data-closingaction="confirm_sent" data-id="${c.id}">I sent this closing manually</button>`;
+      <button class="btn btn-secondary btn-block" data-closingaction="prepare" data-id="${c.id}">Copy closing</button>
+      <button class="btn btn-primary btn-block" style="margin-top:6px;" data-closingaction="confirm_sent" data-id="${c.id}">Mark sent manually</button>`;
   } else {
     step = `
       <div class="checked-line">&#10003; Sent manually in Quo</div>
@@ -2097,5 +2097,62 @@ function perfBossViewHtml(dash) {
     <div class="detail-meta">AI correction rate: <strong>${esc(fmtKpi(dash.ai_quality.correction_rate, "%"))}</strong></div>
     <div class="detail-meta">Data trustworthy enough? <strong>${dash.summary.jobs_received.data_quality === "insufficient_data" ? "Not yet -- too little history" : "Reasonable for the KPIs marked Good above"}</strong></div>`;
 }
+
+/* ============================================================ KEYBOARD ===
+   Safe, low-risk shortcuts only -- a desktop enhancement, never required
+   (mobile has no keyboard and must stay fully usable without any of
+   this). Explicitly NOT bound to a key: mark sent, assign technician,
+   accept/decline technician, closing confirmation, complete, or any
+   other external/irreversible action -- those stay click-only, always.
+   "/" (focus search) is intentionally not bound yet -- there is no
+   global search feature built in this version to focus. */
+function _currentListAndSelection() {
+  if (state.screen === "jobs") return { list: newJobsLive, key: "message_id", selected: state.jobsSelected, select: selectJob };
+  if (state.screen === "active") return { list: activeJobs, key: "id", selected: state.activeSelected, select: selectActive };
+  if (state.screen === "closings") return { list: closingsEntries, key: "id", selected: state.closingsSelected, select: selectClosing };
+  return null;
+}
+
+function _moveSelection(direction) {
+  const ctx = _currentListAndSelection();
+  if (!ctx || !ctx.list.length) return;
+  const idx = ctx.list.findIndex(item => item[ctx.key] === ctx.selected);
+  const nextIdx = idx === -1 ? 0 : Math.min(ctx.list.length - 1, Math.max(0, idx + direction));
+  ctx.select(ctx.list[nextIdx][ctx.key]);
+}
+
+// "C" only fires when exactly one copy-a-prepared-message action exists
+// on the currently open detail/sheet -- ambiguous (zero or multiple
+// candidates) means it does nothing, per the brief's explicit rule that
+// this shortcut must never guess which of several things to copy.
+function _copyShortcutTarget() {
+  const root = isMobile() ? document.getElementById("bottomSheetContent") : document;
+  if (!root) return null;
+  const candidates = root.querySelectorAll(
+    '[data-jobaction="reveal_k"], [data-jobaction="copy_only"], [data-jobaction="prepare"], ' +
+    '[data-activeaction="copy_reply"], [data-activeaction="copy_status_reply"], [data-closingaction="prepare"]'
+  );
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeSheet(); hideConfirmModal(); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return; // never fight the browser's/OS's own shortcuts
+  const tag = (document.activeElement && document.activeElement.tagName) || "";
+  const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (document.activeElement && document.activeElement.isContentEditable);
+  if (typing) return;
+  if (e.key === "j" || e.key === "J") { e.preventDefault(); _moveSelection(1); }
+  else if (e.key === "k" || e.key === "K") { e.preventDefault(); _moveSelection(-1); }
+  else if (e.key === "Enter" && isMobile()) {
+    // Desktop already shows the detail pane the instant J/K changes the
+    // selection -- Enter only does something extra on mobile, where
+    // selection alone doesn't open the bottom sheet.
+    const ctx = _currentListAndSelection();
+    if (ctx && ctx.selected != null) ctx.select(ctx.selected);
+  } else if (e.key === "c" || e.key === "C") {
+    const target = _copyShortcutTarget();
+    if (target) { e.preventDefault(); target.click(); }
+  }
+});
 
 window.addEventListener("resize", () => { if (!isMobile()) closeSheet(); });
