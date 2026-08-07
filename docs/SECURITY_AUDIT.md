@@ -222,12 +222,55 @@ successful login.
 
 **No fix needed.**
 
-### 13. Backup permissions/documentation — not reviewed this pass
+### 13. Backup permissions/documentation (LOW — reviewed, documented, one CONFIGURATION gap)
 
-`scripts/backup_database.py` was not audited for file permissions on
-the produced backup (e.g., whether it's created world-readable on a
-multi-user machine). Out of scope for this pass; flagged for a future
-one.
+**Reviewed this pass** (Operator Speed Implementation Sprint, Priority
+11): `scripts/backup_database.py`, `scripts/restore_database.py`,
+`scripts/verify_backup.py`, and `docs/BACKUP_RESTORE_RUNBOOK.md`.
+
+**Mechanism — audited, no code finding:**
+- `backup_database.py` uses `sqlite3.Connection.backup()` (a consistent
+  online snapshot, not a raw file copy that could catch a half-written
+  page).
+- `--db` defaults to `storage.DB_PATH` (the real database, a hardcoded
+  constant, not env-var-routed) -- backing up a demo/test database
+  requires an explicit `--db <path>` override, so the safe choice is
+  the default, not something the operator has to remember to opt into.
+- The destination directory (`../ai-dispatcher-db-backups/`, sibling to
+  the repo) is outside the repo, so backups are never accidentally
+  committed to git.
+- Retention (`apply_retention`) only ever matches
+  `<source-db-filename>.pre-*.bak` in the destination directory -- a
+  demo database backed up into the same directory would get its own
+  distinctly-named files (`demo_x.db.pre-*.bak`), never mixed with or
+  deleted alongside real `dispatcher.db.pre-*.bak` backups.
+- `restore_database.py` structurally refuses to write to
+  `storage.DB_PATH` (`_reject_live_target()`, checked before any copy)
+  -- restoring over the live database is a deliberate manual procedure,
+  never something a script can automate. It also refuses an existing
+  target path and a source==target collision, then independently
+  verifies the restored copy (integrity, FK, row counts, a read-only
+  open).
+- No secret is ever included in a backup -- session/API secrets live in
+  `.env`, never in the SQLite database itself, and `describe_backup()`
+  only ever reports byte size/checksum/schema revision/row *counts*,
+  never row content.
+
+**Finding (CONFIGURATION, not a code defect):** the backup destination
+directory is created with `Path.mkdir()` and inherits whatever default
+Windows ACLs apply to its parent -- this script does not itself harden
+permissions (e.g. restricting to the running user account). On a
+single-user machine this is very low risk; on a shared/multi-user
+Windows machine, a customer/operator running a real pilot should
+independently confirm the backup directory's NTFS permissions restrict
+access to the account the CRM runs under. This is a deployment/hosting
+decision, not something this script should silently assume or
+override.
+
+**Verify:** `tests/test_system_readiness.py`'s existing backup
+destination tests (writability), `docs/BACKUP_RESTORE_RUNBOOK.md` for
+the full documented procedure (already existed prior to this sprint,
+re-verified accurate against the actual script behavior this pass).
 
 ### 14. Duplicate `OPERATOR_API_SESSION_SECRET` in `.env` — explicitly out of scope this sprint
 
@@ -251,7 +294,7 @@ session-secret issue" — not touched, not re-investigated.
 | 10 | X-Forwarded-Proto trust | LOW | Documented, negligible impact |
 | 11 | Demo/test isolation | — | Re-verified, already solid |
 | 12 | Secret log exposure | — | Audited, no finding |
-| 13 | Backup file permissions | — | Not reviewed |
+| 13 | Backup file permissions | LOW | Reviewed (Operator Speed sprint) — mechanism clean, one CONFIGURATION gap documented |
 | 14 | Duplicate session secret | — | Explicitly out of scope |
 
 Two genuine, safely-scoped fixes shipped this pass (#1, #2). One real
@@ -262,4 +305,9 @@ changes live server startup behavior.
 safely-scoped fix shipped — #5's reload-loses-CSRF-token bug, found
 while live-testing unrelated speed changes and fixed in the same
 sprint rather than left for later, since a broken write path after any
-page reload directly undermines that sprint's entire goal.
+page reload directly undermines that sprint's entire goal. #13 (backup
+permissions) reviewed and documented this same sprint. `tools/system_readiness.py`
+gained structural regression checks for several items on this list
+(#9 bind address, Quo GET-only, WhatsApp no-send, demo/test DB
+isolation) so they're re-verified automatically on every readiness run,
+not only readable in this document.

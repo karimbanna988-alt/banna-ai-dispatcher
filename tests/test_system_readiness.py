@@ -288,6 +288,90 @@ def test_startup_scripts_check_against_the_real_repo_reports_the_known_gap():
     assert "windows_launcher" in result.detail
 
 
+# -------------------------------------------------------- technician mappings
+def test_technician_mappings_pass_when_all_configured(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    conn = storage.connect(db_path)
+    storage.add_technician(conn, name="Complete Tech", areas=["Charlotte"], skills=[],
+                            dispatch_group="Dispatch Grp", closing_group="Closing Grp")
+    conn.close()
+    result = sr.check_technician_mappings(db_path)
+    assert result.level == "PASS"
+
+
+def test_technician_mappings_action_required_when_missing_a_group(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    conn = storage.connect(db_path)
+    storage.add_technician(conn, name="Incomplete Tech", areas=["Charlotte"], skills=[])
+    conn.close()
+    result = sr.check_technician_mappings(db_path)
+    assert result.level == "ACTION REQUIRED"
+    assert result.category == "CONFIGURATION"
+
+
+def test_technician_mappings_action_required_when_none_configured(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    result = sr.check_technician_mappings(db_path)
+    assert result.level == "ACTION REQUIRED"
+
+
+# --------------------------------------------------------- service areas
+def test_service_area_mappings_pass_against_the_real_repo():
+    result = sr.check_service_area_mappings()
+    assert result.level == "PASS"
+
+
+# ---------------------------------------------------------- structural checks
+def test_quo_read_only_pass_against_the_real_repo():
+    """Regression companion to docs/SECURITY_AUDIT.md's manual finding --
+    fails loudly if a write-capable call is ever added to quo_client.py."""
+    result = sr.check_quo_read_only()
+    assert result.level == "PASS"
+
+
+def test_quo_read_only_fails_when_a_write_call_is_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "REPO_ROOT", tmp_path)
+    quo_dir = tmp_path / "src" / "dispatcher"
+    quo_dir.mkdir(parents=True)
+    (quo_dir / "quo_client.py").write_text("requests.post(url)\n", encoding="utf-8")
+    result = sr.check_quo_read_only()
+    assert result.level == "FAIL"
+
+
+def test_whatsapp_no_send_pass_against_the_real_repo():
+    result = sr.check_whatsapp_no_send()
+    assert result.level == "PASS"
+
+
+def test_whatsapp_no_send_fails_when_a_send_call_is_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "REPO_ROOT", tmp_path)
+    bridge_dir = tmp_path / "whatsapp_shadow_bridge" / "src"
+    bridge_dir.mkdir(parents=True)
+    (bridge_dir / "client.js").write_text("client.sendMessage(chatId, text)\n", encoding="utf-8")
+    result = sr.check_whatsapp_no_send()
+    assert result.level == "FAIL"
+
+
+def test_bind_address_warns_against_the_real_repo():
+    """Documents the known finding (docs/SECURITY_AUDIT.md #9) rather
+    than silently passing -- confirms the check actually detects it."""
+    result = sr.check_bind_address()
+    assert result.level == "WARNING"
+    assert result.category == "CONFIGURATION"
+
+
+def test_bind_address_pass_when_loopback_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "REPO_ROOT", tmp_path)
+    (tmp_path / "operator_api.py").write_text('ThreadingHTTPServer(("127.0.0.1", port), Handler)\n', encoding="utf-8")
+    result = sr.check_bind_address()
+    assert result.level == "PASS"
+
+
+def test_demo_test_isolation_guard_passes_against_the_real_repo():
+    result = sr.check_demo_test_isolation()
+    assert result.level == "PASS"
+
+
 # --------------------------------------------------------------------- main
 def test_main_exit_code_1_when_any_check_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(sr, "run_all_checks", lambda db_path: [sr.Check("x", "FAIL", "bad")])

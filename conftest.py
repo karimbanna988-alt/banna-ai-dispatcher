@@ -35,6 +35,33 @@ def _real_database_untouched_tripwire():
 
 
 @pytest.fixture(autouse=True)
+def _reset_operator_api_rate_limit_state():
+    """operator_api.py's _LOGIN_ATTEMPTS/_ACTIVE_SESSIONS are deliberately
+    in-memory, module-level state (a server restart is meant to act as
+    "log everyone out" -- see their own comments in operator_api.py) --
+    but that means they silently persist across tests within the same
+    pytest process, making test order matter when it shouldn't. Observed
+    once as a real flake: test_post_without_csrf_token_rejected passed
+    every time in isolation but failed intermittently as part of the
+    full suite, traced to a nearby test exhausting the login rate limit
+    for the same client_ip within the same LOGIN_WINDOW_SECONDS window.
+    Clearing both before and after every test makes the suite
+    order-independent without weakening the real runtime throttling
+    itself (a real running server's state still accumulates normally;
+    only the test suite's shared process state is reset)."""
+    try:
+        import operator_api
+    except ImportError:
+        yield
+        return
+    operator_api._LOGIN_ATTEMPTS.clear()
+    operator_api._ACTIVE_SESSIONS.clear()
+    yield
+    operator_api._LOGIN_ATTEMPTS.clear()
+    operator_api._ACTIVE_SESSIONS.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_ambient_quo_api_key(monkeypatch):
     """Fail-closed by construction, not by convention: no test may rely
     on QUO_API_KEY being absent from the environment -- it must be

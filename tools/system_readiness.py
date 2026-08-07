@@ -19,6 +19,18 @@ Checks, in order:
  11. WhatsApp pending observations are stored durably (SQLite-backed
      table present, not the old in-memory list)
  12. No duplicate WhatsApp observation message_id values exist
+ 13. Every active technician has both a dispatch_group and closing_group
+ 14. rules/service_areas.yaml has at least one configured area
+ 15. Quo client has no write-capable (POST/PUT/PATCH/DELETE) method
+ 16. WhatsApp bridge has no send-capable method
+ 17. Server bind address (flags 0.0.0.0, does not change it)
+ 18. Demo/test database fail-closed guard is importable and raises
+     correctly against the real database path
+
+Each check also reports a category: CODE (a real defect fixable in this
+repo), CONFIGURATION (needs an operator/owner action, not a bug), or
+EXTERNAL INTEGRATION (this product doesn't have that capability by
+design -- never reported as a software failure).
 
 This script is READ-ONLY end to end:
   - the real database is opened with SQLite's own `mode=ro` URI flag,
@@ -76,6 +88,15 @@ class Check:
     name: str
     level: str  # "PASS" | "WARNING" | "FAIL" | "ACTION REQUIRED"
     detail: str
+    # What kind of fix (if any) this check's failure needs -- distinguishes
+    # a real code defect from something only the operator/owner can act on,
+    # so a WARNING here is never mistaken for "the software is broken."
+    # "CODE": fixable in this repo with no further input.
+    # "CONFIGURATION": needs an operator/owner action (secrets, .env,
+    #   technician setup, service areas) -- not a software bug.
+    # "EXTERNAL INTEGRATION": requires a capability this product does not
+    #   have (e.g. a Quo write API) -- never reported as a software failure.
+    category: str = "CODE"
 
 
 def _fingerprint(value: str) -> str:
@@ -111,7 +132,7 @@ def check_crm_port() -> Check:
         status, _ = _http_get_json("http://127.0.0.1:8512/api/me")
     except (urllib.error.URLError, OSError):
         return Check("CRM (operator_api.py, port 8512)", "WARNING",
-                      "Not running. Start with scripts\\start_crm.ps1.")
+                      "Not running. Start with scripts\\start_crm.ps1.", category="CONFIGURATION")
     if status in (200, 401):
         return Check("CRM (operator_api.py, port 8512)", "PASS",
                       f"Listening and responding (HTTP {status}).")
@@ -124,7 +145,8 @@ def check_python_adapter_port() -> Check:
         status, payload = _http_get_json("http://127.0.0.1:8513/health")
     except (urllib.error.URLError, OSError):
         return Check("Python bridge adapter (port 8513)", "WARNING",
-                      "Not running -- normal if the CRM (operator_api.py) is not running, since it starts this adapter.")
+                      "Not running -- normal if the CRM (operator_api.py) is not running, since it starts this adapter.",
+                      category="CONFIGURATION")
     if status == 200 and isinstance(payload, dict) and payload.get("status") == "ok":
         return Check("Python bridge adapter (port 8513)", "PASS", "Listening and healthy.")
     return Check("Python bridge adapter (port 8513)", "FAIL", f"Unexpected response (HTTP {status}).")
@@ -136,8 +158,9 @@ def check_whatsapp_bridge_port() -> tuple:
         status, payload = _http_get_json("http://127.0.0.1:8514/health")
     except (urllib.error.URLError, OSError):
         bridge = Check("WhatsApp Shadow Bridge (port 8514)", "WARNING",
-                        "Not running. Start with scripts\\start_boss_demo.ps1 or whatsapp_shadow_bridge\\scripts\\start_normal.ps1.")
-        allowlist = Check("WhatsApp allowlist", "WARNING", "Bridge not reachable -- allowlist size unknown.")
+                        "Not running. Start with scripts\\start_boss_demo.ps1 or whatsapp_shadow_bridge\\scripts\\start_normal.ps1.",
+                        category="CONFIGURATION")
+        allowlist = Check("WhatsApp allowlist", "WARNING", "Bridge not reachable -- allowlist size unknown.", category="CONFIGURATION")
         return bridge, allowlist
 
     if status != 200 or not isinstance(payload, dict):
@@ -244,21 +267,21 @@ def check_required_secrets() -> list:
                                  f"non-empty, {len(value)} chars, fingerprint {_fingerprint(value)}"))
         else:
             missing_required.append(name)
-            checks.append(Check(f"Secret present: {name}", "ACTION REQUIRED", "missing or empty"))
+            checks.append(Check(f"Secret present: {name}", "ACTION REQUIRED", "missing or empty", category="CONFIGURATION"))
     for name in OPTIONAL_SECRET_VARS:
         value = os.environ.get(name, "")
         if value:
             checks.append(Check(f"Secret present: {name}", "PASS",
                                  f"non-empty, {len(value)} chars, fingerprint {_fingerprint(value)}"))
         else:
-            checks.append(Check(f"Secret present: {name}", "WARNING", "missing or empty (optional -- only needed for the Quo Inbox (Live) tab)"))
+            checks.append(Check(f"Secret present: {name}", "WARNING", "missing or empty (optional -- only needed for the Quo Inbox (Live) tab)", category="CONFIGURATION"))
 
     bridge_secret = os.environ.get("WHATSAPP_BRIDGE_ADAPTER_SECRET", "")
     shadow_env_path = REPO_ROOT / "whatsapp_shadow_bridge" / ".env"
     shadow_secret = _read_env_var_from_file(shadow_env_path, "WHATSAPP_SHADOW_ADAPTER_SECRET")
     if not bridge_secret or not shadow_secret:
         checks.append(Check("Bridge secret fingerprint match", "WARNING",
-                             "Cannot compare -- one or both secrets are not set."))
+                             "Cannot compare -- one or both secrets are not set.", category="CONFIGURATION"))
     elif _fingerprint(bridge_secret) == _fingerprint(shadow_secret):
         checks.append(Check("Bridge secret fingerprint match", "PASS",
                              "Python adapter and Node bridge secrets match (compared as fingerprints only)."))
@@ -313,6 +336,118 @@ def check_startup_scripts_current() -> Check:
                  "scripts/start_crm.ps1 references operator_api.py.")
 
 
+def check_technician_mappings(db_path: Path) -> Check:
+    """Every technician needs both a dispatch_group and a closing_group
+    (the WhatsApp destinations a real dispatch/closing gets copied to) --
+    a technician missing either is set up incompletely, not a code
+    defect. Read-only against the same db_path every other check uses."""
+    if not db_path.exists():
+        return Check("Technician mappings", "WARNING", "Database not found -- skipped.", category="CONFIGURATION")
+    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT name, dispatch_group, closing_group FROM technicians WHERE active = 1").fetchall()
+    except sqlite3.OperationalError as exc:
+        return Check("Technician mappings", "WARNING", f"Could not read technicians table: {exc}", category="CONFIGURATION")
+    finally:
+        conn.close()
+    if not rows:
+        return Check("Technician mappings", "ACTION REQUIRED", "No active technicians configured.", category="CONFIGURATION")
+    incomplete = sum(1 for _name, dg, cg in rows if not (dg or "").strip() or not (cg or "").strip())
+    if incomplete:
+        return Check("Technician mappings", "ACTION REQUIRED",
+                      f"{incomplete} of {len(rows)} active technician(s) missing a dispatch_group and/or closing_group.",
+                      category="CONFIGURATION")
+    return Check("Technician mappings", "PASS", f"All {len(rows)} active technician(s) have both destinations configured.")
+
+
+def check_service_area_mappings() -> Check:
+    """rules/service_areas.yaml must exist and define at least one area,
+    or every job would resolve to "not_found" regardless of technician
+    setup."""
+    try:
+        from dispatcher.rules.service_areas import load_service_areas
+        areas = load_service_areas()
+    except Exception as exc:
+        return Check("Service area mappings", "FAIL", f"Could not load rules/service_areas.yaml: {exc}")
+    if not areas:
+        return Check("Service area mappings", "ACTION REQUIRED", "rules/service_areas.yaml has no entries.", category="CONFIGURATION")
+    return Check("Service area mappings", "PASS", f"{len(areas)} service area(s) configured.")
+
+
+def check_quo_read_only() -> Check:
+    """Structural, not behavioral: confirms no method in quo_client.py is
+    capable of a non-GET HTTP call, matching docs/SECURITY_AUDIT.md's
+    manual finding -- Quo write capability would be an EXTERNAL
+    INTEGRATION this product deliberately does not have, not a bug to
+    fix in this repo."""
+    quo_client = REPO_ROOT / "src" / "dispatcher" / "quo_client.py"
+    if not quo_client.exists():
+        return Check("Quo GET-only", "WARNING", "src/dispatcher/quo_client.py not found.")
+    text = quo_client.read_text(encoding="utf-8", errors="ignore")
+    write_markers = ["requests.post", "requests.put", "requests.patch", "requests.delete",
+                      "session.post", "session.put", "session.patch", "session.delete"]
+    found = [m for m in write_markers if m in text]
+    if found:
+        return Check("Quo GET-only", "FAIL", f"Found write-capable call(s): {', '.join(found)}.")
+    return Check("Quo GET-only", "PASS", "No POST/PUT/PATCH/DELETE call found in quo_client.py.")
+
+
+def check_whatsapp_no_send() -> Check:
+    """Structural: confirms no send-capable whatsapp-web.js-style method
+    is imported anywhere in whatsapp_shadow_bridge/src -- real WhatsApp
+    sending is an EXTERNAL INTEGRATION this product deliberately does
+    not have."""
+    bridge_src = REPO_ROOT / "whatsapp_shadow_bridge" / "src"
+    if not bridge_src.exists():
+        return Check("WhatsApp no-send", "WARNING", "whatsapp_shadow_bridge/src not found.")
+    send_markers = ["sendMessage", "sendText", "sendMedia", "sendImage"]
+    hits = []
+    for f in bridge_src.glob("*.js"):
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        for marker in send_markers:
+            if marker in text:
+                hits.append(f"{f.name}:{marker}")
+    if hits:
+        return Check("WhatsApp no-send", "FAIL", f"Found send-capable reference(s): {', '.join(hits)}.")
+    return Check("WhatsApp no-send", "PASS", "No send-capable method found in whatsapp_shadow_bridge/src.")
+
+
+def check_bind_address() -> Check:
+    """docs/SECURITY_AUDIT.md finding #9, re-surfaced here so it isn't
+    only discoverable by reading that doc: operator_api.py binds
+    0.0.0.0 (all interfaces), not just loopback. Not auto-fixed --
+    needs the owner to confirm whether LAN access was ever intended."""
+    operator_api_path = REPO_ROOT / "operator_api.py"
+    if not operator_api_path.exists():
+        return Check("Server bind address", "WARNING", "operator_api.py not found.")
+    text = operator_api_path.read_text(encoding="utf-8", errors="ignore")
+    if '"0.0.0.0"' in text:
+        return Check("Server bind address", "WARNING",
+                      "operator_api.py binds 0.0.0.0 (all network interfaces). If only the Cloudflare tunnel should "
+                      "reach this server, confirm with the owner whether to change this to 127.0.0.1 "
+                      "(see docs/SECURITY_AUDIT.md finding #9). Not changed automatically.",
+                      category="CONFIGURATION")
+    return Check("Server bind address", "PASS", "No 0.0.0.0 bind found.")
+
+
+def check_demo_test_isolation() -> Check:
+    """Structural: confirms dispatcher.db_safety's fail-closed guard
+    (demo/test modes reject any path resolving to the real database)
+    is present and importable -- the actual enforcement is exercised by
+    every test run's own tripwire fixtures, not re-tested here."""
+    try:
+        from dispatcher.db_safety import resolve_db_path, UnsafeDatabasePathError
+    except ImportError as exc:
+        return Check("Demo/test DB isolation guard", "FAIL", f"Could not import dispatcher.db_safety: {exc}")
+    try:
+        resolve_db_path("demo", storage.DB_PATH)
+    except UnsafeDatabasePathError:
+        return Check("Demo/test DB isolation guard", "PASS",
+                      "resolve_db_path('demo', <real db path>) correctly raises UnsafeDatabasePathError.")
+    return Check("Demo/test DB isolation guard", "FAIL",
+                 "resolve_db_path('demo', <real db path>) did NOT raise -- fail-closed guard may be broken.")
+
+
 def run_all_checks(db_path: Path) -> list:
     checks = []
     checks.append(check_crm_port())
@@ -324,6 +459,12 @@ def run_all_checks(db_path: Path) -> list:
     checks.append(check_backup_destination_writable())
     checks.extend(check_required_secrets())
     checks.append(check_startup_scripts_current())
+    checks.append(check_technician_mappings(db_path))
+    checks.append(check_service_area_mappings())
+    checks.append(check_quo_read_only())
+    checks.append(check_whatsapp_no_send())
+    checks.append(check_bind_address())
+    checks.append(check_demo_test_isolation())
     return checks
 
 
@@ -338,12 +479,16 @@ def main(argv=None) -> int:
 
     width = max(len(c.name) for c in checks)
     for c in checks:
-        print(f"[{c.level:15}] {c.name.ljust(width)}  {c.detail}")
+        cat = "" if c.level == "PASS" else f" ({c.category})"
+        print(f"[{c.level:15}] {c.name.ljust(width)}  {c.detail}{cat}")
 
     fail_count = sum(1 for c in checks if c.level in ("FAIL", "ACTION REQUIRED"))
     warn_count = sum(1 for c in checks if c.level == "WARNING")
     pass_count = sum(1 for c in checks if c.level == "PASS")
+    code_issues = sum(1 for c in checks if c.level != "PASS" and c.category == "CODE")
     print(f"\nSummary: {pass_count} pass, {warn_count} warning, {fail_count} fail/action-required, {len(checks)} total.")
+    print(f"Of the non-pass results, {code_issues} need a code fix in this repo; the rest need operator "
+          f"configuration or are outside this product's supported integrations.")
 
     return 1 if fail_count else 0
 
