@@ -77,13 +77,13 @@ function openWhatsApp() {
   }, 900);
 }
 
-function showTransientError(message) {
-  console.error(message);
+function showTransientMessage(message, kind) {
+  if (kind !== "info") console.error(message);
   const existing = document.getElementById("transientError");
   if (existing) existing.remove();
   const el = document.createElement("div");
   el.id = "transientError";
-  el.className = "detail-warning";
+  el.className = kind === "info" ? "checked-line" : "detail-warning";
   el.style.position = "fixed";
   el.style.bottom = isMobile() ? "60px" : "10px";
   el.style.right = "10px";
@@ -93,6 +93,7 @@ function showTransientError(message) {
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 4000);
 }
+function showTransientError(message) { showTransientMessage(message, "error"); }
 
 async function callOrHandleAuth(fn) {
   try {
@@ -358,21 +359,17 @@ function renderActionCenterScreen(groups) {
       </div>`;
   }).join("");
   root.querySelectorAll("[data-acscreen]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const targetScreen = btn.dataset.acscreen;
-      const kind = btn.dataset.ackind;
-      const id = btn.dataset.acid;
-      setScreen(targetScreen);
-      // Explicit await, not setTimeout(0) racing setScreen's own
-      // fire-and-forget refreshAll() -- that race was real: refreshAll's
-      // load can finish after the timeout and silently overwrite this
-      // selection with its own default-first-job fallback. Found and
-      // fixed while building global search's equivalent open-result flow.
-      // A job's own "screen" (operator_api.py's _job_target_screen) can
-      // now be active/closings/history depending on its real status --
-      // "Open" must land wherever the job actually lives, not always Active.
-      if (kind === "job" && targetScreen === "active") { await loadActive(); selectActive(parseInt(id, 10)); }
-      else if (kind === "job" && targetScreen === "closings") { await loadClosings(); selectClosing(parseInt(id, 10)); }
+    btn.addEventListener("click", () => {
+      // navigateToItem (defined in the SEARCH section below -- function
+      // declarations are hoisted, so this forward reference is safe)
+      // is the one shared "go to this item's Fast Path context"
+      // implementation, also used by search results and Next Actionable
+      // Job, so all three agree on where a job actually lives.
+      navigateToItem({
+        entity_type: btn.dataset.ackind === "job" ? "JOB" : "INCOMING_MESSAGE",
+        entity_id: btn.dataset.ackind === "job" ? parseInt(btn.dataset.acid, 10) : btn.dataset.acid,
+        screen: btn.dataset.acscreen,
+      });
     });
   });
 }
@@ -1375,12 +1372,23 @@ function activeDetailHtml(j) {
       <button type="button" class="btn btn-primary btn-block" data-activeaction="go_to_closing" data-id="${j.id}">Go to Closing &rarr;</button>
     </div>` : "";
 
+  // Priority 4: when this job's own next step is passively waiting on
+  // someone else (nothing the operator can actually do to it right
+  // now), say so plainly and offer a way to keep moving instead of
+  // leaving them staring at a job with no action available.
+  const waitingBlock = j.technician_k && j.technician_k.status === "waiting" ? `
+    <div class="detail-section">
+      <span class="chip chip-priority-waiting">Waiting on technician</span>
+      <button type="button" class="btn btn-secondary btn-block" style="margin-top:6px;" data-nextactionable="1" data-exclude="${j.id}">Next actionable job &rarr;</button>
+    </div>` : "";
+
   return `
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span></div>
     <div class="detail-meta">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")} · Status: <strong>${esc(j.status)}</strong></div>
     <div class="detail-meta">Next: <strong>${esc(j.next_action)}</strong></div>
     ${j.workflow ? lifecycleStepperHtml(j.workflow.steps, j.workflow.delivery_mode) : ""}
     ${goToClosingBlock}
+    ${waitingBlock}
     ${technicianKBlockHtml(j)}
     ${statusUpdateBlockHtml(j)}
     <div class="detail-section">${interpretBlock}</div>
@@ -2152,26 +2160,51 @@ async function runSearch(q) {
   renderSearchResults();
 }
 
+// Shared by search-result-open, Action Center's "Open" buttons, and
+// "Next actionable job" -- one normalized item shape
+// (entity_type/entity_id/screen, exactly what operator_api.py's
+// _normalize_action_center_item / search results already produce),
+// one navigation implementation. Deliberately awaits its own explicit
+// load rather than racing setScreen's fire-and-forget refreshAll() with
+// a setTimeout(0) -- that race is real (refreshAll's own load can
+// finish after the timeout and overwrite the selection with its own
+// default fallback). "history" has no per-job selection API yet, so
+// that one case only gets the screen change (still far faster than
+// manually filtering a completed-jobs table).
+async function navigateToItem(item) {
+  setScreen(item.screen);
+  if (item.entity_type === "JOB") {
+    if (item.screen === "active") { await loadActive(); selectActive(item.entity_id); }
+    else if (item.screen === "closings") { await loadClosings(); selectClosing(item.entity_id); }
+  } else if (item.entity_type === "INCOMING_MESSAGE") {
+    await loadJobs(); selectJob(item.entity_id);
+  }
+}
+
 async function openSearchResult(idx) {
   const r = searchState.results[idx];
   if (!r) return;
   closeSearchResults();
   closeMobileSearch();
-  setScreen(r.screen);
-  // Deliberately awaits its own explicit load rather than racing
-  // setScreen's fire-and-forget refreshAll() with a setTimeout(0) --
-  // that race is real (refreshAll's own load can finish after the
-  // timeout and overwrite the selection with its own default fallback).
-  // "history" has no per-job selection API yet, so that one case only
-  // gets the screen change (still far faster than manually filtering a
-  // completed-jobs table).
-  if (r.entity_type === "JOB") {
-    if (r.screen === "active") { await loadActive(); selectActive(r.entity_id); }
-    else if (r.screen === "closings") { await loadClosings(); selectClosing(r.entity_id); }
-  } else if (r.entity_type === "INCOMING_MESSAGE") {
-    await loadJobs(); selectJob(r.entity_id);
-  }
+  await navigateToItem(r);
 }
+
+async function goToNextActionableJob(excludeEntityId) {
+  const data = await callOrHandleAuth(() => Api.getNextActionableJob(excludeEntityId));
+  if (!data) return;
+  if (!data.found) { showTransientMessage("Nothing actionable right now -- you're caught up.", "info"); return; }
+  await navigateToItem(data.item);
+}
+document.getElementById("nextActionableJobBtn").addEventListener("click", () => goToNextActionableJob());
+// Delegated: [data-nextactionable] can be rendered inside any dynamically
+// re-rendered detail pane (e.g. the "waiting on technician" block in
+// activeDetailHtml), so a direct addEventListener at render time would
+// need re-wiring on every rerender -- one delegated listener covers all
+// of them without that.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-nextactionable]");
+  if (btn) goToNextActionableJob(btn.dataset.exclude);
+});
 
 function closeSearchResults() {
   document.querySelectorAll(".header-search-results").forEach(p => { p.style.display = "none"; p.innerHTML = ""; });
