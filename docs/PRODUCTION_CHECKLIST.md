@@ -125,3 +125,17 @@ against — nothing here is a vague aspiration.
       accepted, in writing, the unofficial-WhatsApp-dependency risk and
       the local-deployment model — both are real, ongoing, and not
       something a future code change resolves on its own.
+
+## Operator Speed Implementation Sprint — relevant to this checklist
+
+- [ ] If this pilot's session was live before this sprint, have the
+      operator do one full logout/login after upgrading — a real bug
+      (fixed this sprint, `docs/SECURITY_AUDIT.md` finding #5) meant a
+      session that was already open before the fix would not itself
+      pick up the corrected CSRF-token-on-reload behavior mid-session;
+      a fresh login clears this cleanly, same as any other code
+      upgrade to an already-running server.
+- [ ] `route_active`/`route_action_center` now run measurably faster at
+      volume (see `docs/WORKFLOW_SPEED_AUDIT.md`); no new infrastructure
+      (cache, queue, etc.) was added, so no new operational dependency
+      needs to be understood or monitored for this pilot.

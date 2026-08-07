@@ -385,3 +385,22 @@ three that are inherent deployment/legal/proof-of-value realities no
 amount of further coding resolves) — appropriate for a first paid pilot
 with an informed customer, not yet appropriate for unsupervised
 multi-customer sales.
+
+## Addendum — Operator Speed Implementation Sprint
+
+Category 4 (CRM usability) gained real, tested, live-verified
+improvements this sprint: a Fast Path that auto-navigates the operator
+to the right screen with the right job pre-selected at two of the
+workflow's screen-transition points (dispatch confirm -> Active,
+technician-completed -> Closings), a 3-group Action Center presentation
+with a deterministic priority label, consistent Copy/Mark-sent button
+wording across all four prepared-outbound-message flows, and safe
+desktop keyboard shortcuts. Full before/after quantification (11.5%
+modeled effort reduction for a full Scenario A job, measured
+route_active/route_action_center latency improvements of up to ~48% at
+volume) is in `docs/WORKFLOW_SPEED_AUDIT.md`. This does not change
+category 4's PILOT READY status — the underlying mechanics were already
+real and tested; this sprint made using them faster, not fundamentally
+different in kind. A real, evidenced reload-loses-CSRF-token bug
+(category 13, user authentication) was also found and fixed in the same
+sprint — see `docs/SECURITY_AUDIT.md` finding #5's update.
