@@ -32,3 +32,20 @@ def _real_database_untouched_tripwire():
         "data/dispatcher.db changed during this test session -- some test wrote to the real "
         "database. This must never happen; find and fix the offending test before merging."
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_quo_api_key(monkeypatch):
+    """Fail-closed by construction, not by convention: no test may rely
+    on QUO_API_KEY being absent from the environment -- it must be
+    guaranteed absent. Discovered the hard way: a test whose only
+    guarantee was a code comment ("fails with 400 in this test env (no
+    QUO_API_KEY)") started making a real, ~15-30s-timeout network call
+    to api.quo.com using a real key, the moment that key happened to be
+    set in the ambient shell (e.g. inherited from a real .env-backed
+    environment) -- indistinguishable from a flaky test until traced to
+    the root cause. Any test that genuinely needs QUO_API_KEY set can
+    still call monkeypatch.setenv("QUO_API_KEY", ...) itself -- that
+    happens after this fixture's delenv in the same test's teardown
+    stack, so it is not blocked, just no longer accidentally inherited."""
+    monkeypatch.delenv("QUO_API_KEY", raising=False)
