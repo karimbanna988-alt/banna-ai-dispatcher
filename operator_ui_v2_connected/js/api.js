@@ -42,7 +42,15 @@ const Api = {
   async logout() {
     try { await this._call("POST", "/api/logout", {}); } finally { this._csrfToken = null; }
   },
-  checkSession() { return this._call("GET", "/api/me"); },
+  async checkSession() {
+    const result = await this._call("GET", "/api/me");
+    // A reload with a still-valid session cookie skips login() entirely
+    // -- without also picking up the token here, every mutating action
+    // would 403 ("Missing or invalid CSRF token") until an explicit
+    // logout/login, even though the session itself is fine.
+    if (result && result.csrf_token) this._csrfToken = result.csrf_token;
+    return result;
+  },
   getDemoStatus() { return this._call("GET", "/api/demo_status"); },
 
   getCommandCenter(chartPeriod) {

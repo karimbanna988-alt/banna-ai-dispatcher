@@ -277,6 +277,33 @@ def test_post_with_valid_csrf_token_reaches_the_route(live_server):
     assert r["status"] != 403
 
 
+def test_api_me_returns_a_working_csrf_token_for_an_already_valid_session(live_server):
+    """Regression for a real bug found while testing the Fast Path work
+    in this sprint: app.js's boot() calls checkSession() (GET /api/me),
+    never login(), whenever the session cookie is already valid (e.g.
+    after a plain page reload) -- so the frontend's in-memory CSRF token
+    stayed null and every write 403'd with "Missing or invalid CSRF
+    token" until an explicit logout/login. This proves the fix
+    end-to-end: a token obtained from /api/me alone (never from
+    /api/login in this test) is a real, working token."""
+    cookie, _csrf_from_login = _login(live_server)
+    me = http_request(live_server, "GET", "/api/me", headers={"Cookie": cookie})
+    assert me["status"] == 200
+    csrf_from_me = me["json"]["csrf_token"]
+    assert csrf_from_me
+    r = http_request(live_server, "POST", "/api/sync", {}, headers={"Cookie": cookie, "X-CSRF-Token": csrf_from_me})
+    assert r["status"] != 403
+
+
+def test_api_me_csrf_token_matches_the_one_login_issued(live_server):
+    """csrf_token_for() is a pure function of the session token -- /api/me
+    and /api/login must derive the identical value for the same session,
+    not two different tokens that happen to both work."""
+    cookie, csrf_from_login = _login(live_server)
+    me = http_request(live_server, "GET", "/api/me", headers={"Cookie": cookie})
+    assert me["json"]["csrf_token"] == csrf_from_login
+
+
 def test_logout_invalidates_session_not_just_clears_cookie(live_server):
     """The captured cookie value itself must stop authenticating after
     logout -- not merely have the browser told to discard it. Proves
@@ -1171,6 +1198,86 @@ def test_action_center_returns_all_ten_sections(api_env):
     assert set(result["sections"].keys()) == expected
     for section in result["sections"].values():
         assert "items" in section and "total" in section and "title" in section
+
+
+def test_action_center_groups_repartition_every_item_with_no_loss_or_duplication(api_env):
+    """`groups` (ACTION NOW / WAITING / NEEDS REVIEW) is a presentation
+    view over the same 10 sections, not a second independent query --
+    every item counted in `sections` must be counted exactly once across
+    `groups`, and vice versa."""
+    _seed_active_job_with_technician(api_env)  # -> waiting_technician_k
+    seed_pending(api_env, "m-new", agn_message("A970"))  # left un-acknowledged -> new_jobs_to_review
+    seed_pending(api_env, "m-review", agn_message("A950"))
+    api.route_handle_manually(None, {"message_id": "m-review"}, {})  # -> human_review_required
+
+    result = api.route_action_center(None, {}, {})
+    assert {g["key"] for g in result["groups"]} == {"action_now", "waiting", "needs_review"}
+    sections_total = sum(s["total"] for s in result["sections"].values())
+    groups_total = sum(g["total"] for g in result["groups"])
+    assert groups_total == sections_total
+
+    by_key = {g["key"]: g for g in result["groups"]}
+    assert by_key["waiting"]["total"] >= 1
+    assert by_key["needs_review"]["total"] >= 1
+    assert by_key["action_now"]["total"] >= 1
+
+
+def test_action_center_human_review_items_are_urgent_priority(api_env):
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m-hr", agn_message("A951"))
+    result = api.route_handle_manually(None, {"message_id": "m-hr"}, {})
+    ac = api.route_action_center(None, {}, {})
+    item = next(i for i in ac["sections"]["human_review_required"]["items"] if i["id"] == result["job_id"])
+    assert item["priority"] == "URGENT"
+
+
+def test_action_center_fresh_waiting_technician_k_item_defaults_to_waiting_priority(api_env):
+    _seed_active_job_with_technician(api_env)
+    ac = api.route_action_center(None, {}, {})
+    items = ac["sections"]["waiting_technician_k"]["items"]
+    assert items and all(i["priority"] == "WAITING" for i in items)
+
+
+def test_action_center_priority_escalates_a_stale_waiting_technician_k_item(api_env):
+    """A technician who has not replied to K in a long time should stop
+    reading as passive WAITING and surface as something the operator
+    should follow up on -- the 'technician response age' factor."""
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat().replace("+00:00", "Z")
+        conn.execute("UPDATE jobs SET last_event_at = ? WHERE id = ?", (stale, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+    ac = api.route_action_center(None, {}, {})
+    item = next(i for i in ac["sections"]["waiting_technician_k"]["items"] if i["id"] == job_id)
+    assert item["priority"] == "DUE"
+
+
+def test_action_center_group_ordering_is_deterministic_oldest_urgent_first(api_env):
+    """Within one priority bucket, older items sort first -- proven by
+    directly backdating one of two otherwise-identical human-review
+    items and asserting the older one always lands first, independent
+    of insertion order."""
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m-old", agn_message("A960"))
+    seed_pending(api_env, "m-new", agn_message("A961"))
+    old_result = api.route_handle_manually(None, {"message_id": "m-old"}, {})
+    new_result = api.route_handle_manually(None, {"message_id": "m-new"}, {})
+    conn = storage.connect(api_env)
+    try:
+        older = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat().replace("+00:00", "Z")
+        newer = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        conn.execute("UPDATE jobs SET last_event_at = ? WHERE id = ?", (older, old_result["job_id"]))
+        conn.execute("UPDATE jobs SET last_event_at = ? WHERE id = ?", (newer, new_result["job_id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    ac = api.route_action_center(None, {}, {})
+    needs_review = next(g for g in ac["groups"] if g["key"] == "needs_review")
+    ids_in_order = [i["id"] for i in needs_review["items"]]
+    assert ids_in_order.index(old_result["job_id"]) < ids_in_order.index(new_result["job_id"])
 
 
 def test_action_center_lists_a_job_missing_technician_assignment(api_env):

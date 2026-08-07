@@ -200,11 +200,11 @@ Api.getDemoStatus().then(status => {
 
 (async function boot() {
   try {
+    // checkSession() also re-establishes the CSRF token for this fresh
+    // page load (see Api.checkSession's comment) -- reads would have
+    // worked either way since GET routes need no CSRF token, but writes
+    // need this.
     const me = await Api.checkSession();
-    // Session cookie is valid, but this fresh page load has no CSRF
-    // token in memory yet (it is never persisted) -- re-establish one
-    // by treating this as "needs login" only if a mutating action later
-    // 401s; reads work immediately since GET routes need no CSRF token.
     showApp(me && me.demo_mode);
   } catch (e) {
     showLogin();
@@ -282,34 +282,53 @@ async function refreshAll() {
   else if (state.screen === "performance") await loadPerformance();
 }
 
-const ACTION_CENTER_SECTIONS = [
-  { key: "new_jobs_to_review", title: "New jobs to review", empty: "No new jobs waiting on review." },
-  { key: "company_k_owed", title: "Company K acknowledgments owed", empty: "Nothing owed." },
-  { key: "ready_for_dispatch", title: "Ready for technician dispatch", empty: "Nothing ready to dispatch." },
-  { key: "assign_technician", title: "Assign a technician", empty: "Every approved job has a technician assigned." },
-  { key: "waiting_technician_k", title: "Waiting for technician K", empty: "Nothing waiting on a technician reply." },
-  { key: "technician_updates_to_review", title: "Technician updates to review", empty: "Nothing to review." },
-  { key: "company_updates_owed", title: "Company updates owed", empty: "Nothing owed." },
-  { key: "closings_to_review", title: "Closings to review", empty: "No incomplete closings." },
-  { key: "closings_ready_to_send", title: "Closings ready to send", empty: "Nothing ready to send." },
-  { key: "human_review_required", title: "Human review required", empty: "Nothing needs manual review." },
-];
+// The 10 workflow-stage sections are still the API/test source of truth
+// (operator_api.py's _ACTION_CENTER_SECTIONS) -- this is only the label
+// text for each stage chip shown on an item within a group.
+const ACTION_CENTER_STAGE_LABELS = {
+  new_jobs_to_review: "New job", company_k_owed: "Company K owed", assign_technician: "Assign technician",
+  ready_to_dispatch: "Ready to dispatch", waiting_technician_k: "Waiting on technician K",
+  technician_updates_to_review: "Technician update", company_updates_owed: "Company update owed",
+  closings_to_review: "Closing to review", closings_ready_to_send: "Closing ready to send",
+  human_review_required: "Human review",
+};
+// operator_api.py's _ACTION_CENTER_SECTIONS, needed here only to map an
+// item's next_action code back to a stage label above.
+const ACTION_CENTER_NEXT_ACTION_TO_SECTION = {
+  REVIEW_NEW_JOB: "new_jobs_to_review", ACK_COMPANY_K: "company_k_owed", ASSIGN_TECHNICIAN: "assign_technician",
+  SEND_JOB_TO_TECHNICIAN: "ready_to_dispatch", WAIT_TECHNICIAN_K: "waiting_technician_k",
+  REVIEW_TECHNICIAN_UPDATE: "technician_updates_to_review", UPDATE_COMPANY: "company_updates_owed",
+  REVIEW_CLOSING: "closings_to_review", SEND_CLOSING_TO_COMPANY: "closings_ready_to_send",
+  HUMAN_REVIEW_NEEDED: "human_review_required",
+};
+const ACTION_CENTER_GROUP_META = {
+  action_now: { empty: "Nothing needs action right now." },
+  waiting: { empty: "Not waiting on anyone." },
+  needs_review: { empty: "Nothing needs manual review." },
+};
+const ACTION_CENTER_PRIORITY_LABELS = { URGENT: "Urgent", DUE: "Due", NORMAL: "Normal", WAITING: "Waiting" };
 
 async function loadActionCenter() {
   const data = await callOrHandleAuth(() => Api.getActionCenter());
   if (!data) return;
-  renderActionCenterScreen(data.sections);
+  renderActionCenterScreen(data.groups || []);
 }
 
 function actionCenterItemHtml(item) {
   const label = `#${esc(item.ticket || "No ref")}`;
   const age = item.waiting_since ? ageText(minutesSince(item.waiting_since)) : (item.age_minutes != null ? ageText(item.age_minutes) : "");
+  const stageKey = ACTION_CENTER_NEXT_ACTION_TO_SECTION[item.next_action];
+  const stageLabel = stageKey ? ACTION_CENTER_STAGE_LABELS[stageKey] : "";
+  const priorityCls = `chip-priority-${(item.priority || "normal").toLowerCase()}`;
+  const priorityLabel = ACTION_CENTER_PRIORITY_LABELS[item.priority] || item.priority;
   return `
     <div class="cc-attention-row">
       <div class="cc-attention-marker" aria-hidden="true">&#33;</div>
       <div class="cc-attention-main">
+        <span class="chip ${priorityCls}">${esc(priorityLabel)}</span>
         <span class="cc-attention-ticket">${label}</span>
         <span class="cc-attention-source">${esc(item.source || "")}${item.technician_name ? " &middot; " + esc(item.technician_name) : ""}</span>
+        ${stageLabel ? `<span class="cc-attention-source">${esc(stageLabel)}</span>` : ""}
         ${age ? `<span class="cc-attention-age">${esc(age)}</span>` : ""}
       </div>
       <div class="cc-attention-reason">${esc(item.blocking_reason || "")}</div>
@@ -317,18 +336,23 @@ function actionCenterItemHtml(item) {
     </div>`;
 }
 
-function renderActionCenterScreen(sections) {
+function renderActionCenterScreen(groups) {
   const root = document.getElementById("actionCenterSections");
-  root.innerHTML = ACTION_CENTER_SECTIONS.map(meta => {
-    const section = sections[meta.key] || { items: [], total: 0 };
-    const rows = section.items.length
-      ? section.items.map(actionCenterItemHtml).join("")
+  const groupTotal = groups.reduce((sum, g) => sum + g.total, 0);
+  if (!groups.length || !groupTotal) {
+    root.innerHTML = `<div class="empty-state">Nothing needs your attention right now.</div>`;
+    return;
+  }
+  root.innerHTML = groups.map(g => {
+    const meta = ACTION_CENTER_GROUP_META[g.key] || { empty: "Nothing here." };
+    const rows = g.items.length
+      ? g.items.map(actionCenterItemHtml).join("")
       : `<div class="empty-state">${esc(meta.empty)}</div>`;
-    const overflow = section.total > section.items.length
-      ? `<div class="detail-meta">Showing ${section.items.length} of ${section.total}.</div>` : "";
+    const overflow = g.total > g.items.length
+      ? `<div class="detail-meta">Showing ${g.items.length} of ${g.total} -- open a specific stage to see the rest.</div>` : "";
     return `
-      <div class="cc-attention-section-wrap" style="margin-bottom:14px;">
-        <div class="subsection-label">${esc(meta.title)} <span class="count">(${section.total})</span></div>
+      <div class="cc-attention-section-wrap" style="margin-bottom:18px;">
+        <div class="subsection-label">${esc(g.title)} <span class="count">(${g.total})</span></div>
         ${rows}
         ${overflow}
       </div>`;
@@ -729,6 +753,16 @@ function wireConfirmModal(j) {
       const r = await callOrHandleAuth(() => Api.confirmDispatch(j.message_id)); if (!r) return;
       hideConfirmModal();
       await loadJobs();
+      // Fast Path: confirming dispatch is exactly the moment this job
+      // leaves the Jobs queue and becomes an Active job -- take the
+      // operator straight there instead of leaving them on the Jobs
+      // screen to navigate and re-find it themselves
+      // (docs/WORKFLOW_SPEED_AUDIT.md's stage 6 friction).
+      if (r.job_id) {
+        setScreen("active");
+        await loadActive();
+        selectActive(r.job_id);
+      }
     } catch (e) { showTransientError(e.message); }
   });
   if (copyAgain) copyAgain.addEventListener("click", () => copyText(j.luxor_message));
@@ -1323,11 +1357,23 @@ function activeDetailHtml(j) {
       <div class="shadow-row"><span class="shadow-label">Sent:</span> ${episode.reply_sent_at ? `${esc(episode.reply_sent_at)} via ${esc(episode.reply_sent_channel)}` : "Not yet confirmed sent"}</div>
     </div>` : "";
 
+  // Fast Path: once the technician has reported the job Completed and
+  // there's no company update still owed for it, the only thing left to
+  // do with this job is go record the closing -- on a different screen.
+  // Surface that as the one dominant primary action here instead of
+  // making the operator remember to navigate to Closings and find this
+  // job again themselves (docs/WORKFLOW_SPEED_AUDIT.md's stage 9 friction).
+  const goToClosingBlock = j.next_action === "Record closing" ? `
+    <div class="detail-section fast-path-primary">
+      <button type="button" class="btn btn-primary btn-block" data-activeaction="go_to_closing" data-id="${j.id}">Go to Closing &rarr;</button>
+    </div>` : "";
+
   return `
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span></div>
     <div class="detail-meta">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")} · Status: <strong>${esc(j.status)}</strong></div>
     <div class="detail-meta">Next: <strong>${esc(j.next_action)}</strong></div>
     ${j.workflow ? lifecycleStepperHtml(j.workflow.steps, j.workflow.delivery_mode) : ""}
+    ${goToClosingBlock}
     ${technicianKBlockHtml(j)}
     ${statusUpdateBlockHtml(j)}
     <div class="detail-section">${interpretBlock}</div>
@@ -1423,6 +1469,12 @@ async function handleActiveAction(action, id, msgId) {
       const r = await callOrHandleAuth(() => Api.confirmTechnicianDeclined(id, msgId, reason.trim()));
       if (!r) return;
       await loadActive();
+    } else if (action === "go_to_closing") {
+      // Fast Path: stay on this same job, just switch screens for it --
+      // no separate "find it in the Closings list" step.
+      setScreen("closings");
+      await loadClosings();
+      selectClosing(id);
     }
   } catch (e) {
     showTransientError(e.message);

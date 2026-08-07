@@ -52,6 +52,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -368,7 +369,23 @@ def route_logout(handler: "Handler", match: dict, body: dict) -> dict:
 
 
 def route_me(handler: "Handler", match: dict, body: dict) -> dict:
-    return {"authenticated": True, "demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true"}
+    """Also returns a fresh csrf_token, same as route_login -- both are
+    just csrf_token_for(session_token), a pure function of the session
+    token this request already proved possession of via its (already
+    authenticated) cookie, so re-deriving it here creates no new secret
+    and no new capability. Without this, a page reload with a still-valid
+    session cookie left the frontend's in-memory CSRF token empty
+    (app.js's boot() calls checkSession(), not login()) -- every
+    mutating action would then 403 with "Missing or invalid CSRF token"
+    until the operator explicitly logged out and back in. Found while
+    testing the Fast Path changes in this same sprint; fixed here rather
+    than worked around, since a broken write path after any browser
+    reload is a direct hit to dispatch speed, not a cosmetic issue."""
+    token = handler._session_token() if handler else None
+    return {
+        "authenticated": True, "demo_mode": os.environ.get(DEMO_MODE_ENV_VAR, "").lower() == "true",
+        "csrf_token": csrf_token_for(token) if token else None,
+    }
 
 
 def route_demo_status(handler: "Handler", match: dict, body: dict) -> dict:
@@ -768,6 +785,23 @@ _ACTION_CENTER_SECTIONS = (
     ("human_review_required", "Human review required", "HUMAN_REVIEW_NEEDED"),
 )
 
+# Presentation-only grouping on top of the exact 10 sections above -- the
+# 10 remain the source of truth for the API's `sections` key, for filters,
+# and for every existing test; `groups` is an additional view for the
+# operator so scanning isn't "10 equally-weighted buckets" when 8 of them
+# are all "you have something to do right now," 1 is "you're waiting on
+# someone else," and 1 is "this is blocked and needs a decision."
+_ACTION_CENTER_GROUP_MAX = 10
+_ACTION_CENTER_GROUPS = (
+    ("action_now", "Action now", (
+        "new_jobs_to_review", "company_k_owed", "assign_technician", "ready_to_dispatch",
+        "technician_updates_to_review", "company_updates_owed", "closings_to_review", "closings_ready_to_send",
+    )),
+    ("waiting", "Waiting on someone else", ("waiting_technician_k",)),
+    ("needs_review", "Needs review", ("human_review_required",)),
+)
+_SECTION_NEXT_ACTION = {key: code for key, _title, code in _ACTION_CENTER_SECTIONS}
+
 # Every action-generating next_action always resolves to exactly one
 # delivery mode in this build: a human copies text and explicitly
 # confirms it was sent -- there is no code path capable of an automatic
@@ -780,6 +814,70 @@ _ACTION_CENTER_SECTIONS = (
 _DELIVERY_MODE = "MANUAL COPY"
 
 
+# ---------------------------------------------------- deterministic priority
+# Transparent, integer-bucket priority -- never an AI/model judgment call,
+# never a raw decimal score exposed to the UI. Every input is either a
+# fact the projection functions already computed (human_review_needed,
+# next_action) or a trivially-derivable age from an already-stored
+# timestamp -- no urgency is invented, no appointment-time guess is made
+# (this codebase has no reliably-parsed appointment time to use).
+PRIORITY_URGENT = "URGENT"
+PRIORITY_DUE = "DUE"
+PRIORITY_NORMAL = "NORMAL"
+PRIORITY_WAITING = "WAITING"
+_PRIORITY_RANK = {PRIORITY_URGENT: 0, PRIORITY_DUE: 1, PRIORITY_NORMAL: 2, PRIORITY_WAITING: 3}
+
+# Age thresholds in whole minutes. Chosen to roughly track this
+# dispatch business's own existing operational target -- the same
+# "not dispatched within target" framing kpi_read_model.get_command_center()
+# already uses for its attention-needed KPI -- not a new invented notion
+# of urgency.
+_PRIORITY_URGENT_AGE_MINUTES = 60
+_PRIORITY_DUE_AGE_MINUTES = 20
+# A job waiting on the technician to reply to K only escalates out of
+# WAITING once the wait itself has gone on long enough that a human
+# should probably follow up -- the "technician response age" factor,
+# not a prediction of whether/when the technician will actually answer.
+_PRIORITY_WAITING_ESCALATE_AGE_MINUTES = 30
+
+
+def _item_age_minutes(entity_type: str, age_source) -> Optional[int]:
+    """Age in minutes for priority-bucket purposes only (display
+    formatting stays the frontend's job, unchanged). Message items
+    already carry a precomputed age_minutes int. Job items carry an ISO
+    timestamp needing parsing -- same real-wall-clock comparison
+    luxor_desk_read_model.py's age_seconds already uses for the New Jobs
+    queue, not a new mechanism."""
+    if entity_type == "INCOMING_MESSAGE":
+        return age_source
+    if not age_source:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(age_source).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - dt).total_seconds() // 60))
+
+
+def _priority_bucket(*, entity_type: str, age_source, human_review_needed: bool, next_action: str) -> str:
+    if human_review_needed:
+        return PRIORITY_URGENT
+    age = _item_age_minutes(entity_type, age_source)
+    if next_action == "WAIT_TECHNICIAN_K":
+        if age is not None and age >= _PRIORITY_WAITING_ESCALATE_AGE_MINUTES:
+            return PRIORITY_DUE
+        return PRIORITY_WAITING
+    if age is None:
+        return PRIORITY_NORMAL
+    if age >= _PRIORITY_URGENT_AGE_MINUTES:
+        return PRIORITY_URGENT
+    if age >= _PRIORITY_DUE_AGE_MINUTES:
+        return PRIORITY_DUE
+    return PRIORITY_NORMAL
+
+
 def _normalize_action_center_item(
     *, entity_type: str, entity_id, ticket: Optional[str], source: Optional[str],
     technician: Optional[str], age_source: Optional[str], projection, destination: Optional[str], screen: str,
@@ -790,12 +888,16 @@ def _normalize_action_center_item(
     (job items) or a pre-computed minutes-ago string (message items,
     which only ever carry an age in minutes, not a timestamp) -- the
     frontend's ageText()/minutesSince() helpers already handle both."""
+    priority = _priority_bucket(
+        entity_type=entity_type, age_source=age_source,
+        human_review_needed=projection.human_review_needed, next_action=projection.next_action,
+    )
     return {
         "entity_type": entity_type, "entity_id": entity_id, "ticket": ticket, "source": source,
         "technician": technician, "stage": projection.next_action, "next_action": projection.next_action,
         "blocking_reason": projection.blocking_reason, "age": age_source,
         "human_review_needed": projection.human_review_needed, "destination": destination,
-        "delivery_mode": _DELIVERY_MODE, "screen": screen,
+        "delivery_mode": _DELIVERY_MODE, "screen": screen, "priority": priority,
         # Back-compat aliases for the current frontend (operator_ui_v2_connected/js/app.js
         # reads "id"/"kind"/"waiting_since"/"age_minutes" today) -- both the
         # normalized and legacy names are populated from the same values,
@@ -862,7 +964,28 @@ def route_action_center(handler: "Handler", match: dict, body: dict) -> dict:
         for section_key, title, next_action_code in _ACTION_CENTER_SECTIONS:
             items = by_next_action.get(next_action_code, [])
             sections[section_key] = {"title": title, "items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
-        return {"sections": sections}
+
+        groups = []
+        for group_key, group_title, section_keys in _ACTION_CENTER_GROUPS:
+            group_items = [
+                item for sk in section_keys for item in by_next_action.get(_SECTION_NEXT_ACTION[sk], [])
+            ]
+            # Deterministic ordering only: priority bucket rank first
+            # (URGENT before DUE before NORMAL before WAITING), then
+            # oldest first within the same bucket. No AI ranking, no
+            # decimal score -- ties are broken by insertion order, which
+            # is itself deterministic (section order, then discovery
+            # order within a section).
+            group_items.sort(key=lambda i: (
+                _PRIORITY_RANK.get(i["priority"], 2),
+                -(_item_age_minutes(i["entity_type"], i["age"]) or 0),
+            ))
+            groups.append({
+                "key": group_key, "title": group_title,
+                "items": group_items[:_ACTION_CENTER_GROUP_MAX], "total": len(group_items),
+            })
+
+        return {"sections": sections, "groups": groups}
     finally:
         conn.close()
 

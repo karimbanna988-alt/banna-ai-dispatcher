@@ -152,6 +152,19 @@ button { font-family: inherit; }
 .chip-waiting { background: var(--muted-gray); color: var(--text-muted); border: 1px solid var(--muted-gray-border); }
 .chip-settled { background: var(--pale-green); color: var(--success); border: 1px solid var(--pale-green-border); }
 .chip-warning { background: var(--danger-bg); color: var(--danger); border: 1px solid #f0b4b7; font-weight: 700; }
+/* Deterministic Action Center priority buckets (operator_api.py's
+   _priority_bucket) -- color semantics: red = blocked/needs a decision,
+   amber = due/attention, blue = normal actionable, gray = passively
+   waiting on someone else. Never a 5th color, never a numeric score. */
+.chip-priority-urgent { background: var(--danger-bg); color: var(--danger); border: 1px solid #f0b4b7; font-weight: 700; }
+.chip-priority-due { background: var(--pale-yellow); color: var(--warning); border: 1px solid var(--pale-yellow-border); }
+.chip-priority-normal { background: #e5ecff; color: var(--primary); border: 1px solid #c7d4f7; }
+.chip-priority-waiting { background: var(--muted-gray); color: var(--text-muted); border: 1px solid var(--muted-gray-border); }
+
+/* Fast Path "go to the next screen for this job" call-out -- visually
+   distinct from the ordinary secondary detail sections around it so it
+   reads as THE one thing to do next, not just another block on the page. */
+.fast-path-primary { background: #e5ecff; border: 1px solid #c7d4f7; border-radius: var(--radius); padding: 10px; }
 
 /* ------------------------------------------------------ Filters/search -- */
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
