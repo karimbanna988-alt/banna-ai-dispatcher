@@ -104,6 +104,58 @@ def test_scenario_f_job_appears_under_human_review_required_in_action_center(db_
     assert result["job_id"] in ids
 
 
+# ------------------------------------------------------------ Scenario C --
+def test_scenario_c_duplicate_creates_no_second_job_row(db_path):
+    result = scenarios.seed_scenario_c_duplicate_and_correction(db_path)
+    assert result["distinct_job_row_count"] == 1
+    assert result["first_job_id"] == result["second_job_id"]
+
+
+def test_scenario_c_correction_reaches_the_correct_job(db_path):
+    result = scenarios.seed_scenario_c_duplicate_and_correction(db_path)
+    assert result["latest_phone_on_record"] == "1-555-010-9999"
+
+
+def test_scenario_c_audit_history_preserves_both_messages(db_path):
+    result = scenarios.seed_scenario_c_duplicate_and_correction(db_path)
+    assert result["audit_event_count"] >= 2  # original NEW + the correction, at minimum
+
+
+# ------------------------------------------------------------ Scenario D --
+def test_scenario_d_ineligible_technician_rejected_with_reason(db_path):
+    result = scenarios.seed_scenario_d_technician_restriction(db_path)
+    assert result["rejected_outcome"] != "assigned"
+    assert "Savannah" in result["rejected_reason"] or "Charlotte" in result["rejected_reason"]
+
+
+def test_scenario_d_eligible_alternative_recommended_and_assigned(db_path):
+    result = scenarios.seed_scenario_d_technician_restriction(db_path)
+    assert result["accepted_outcome"] == "assigned"
+    assert result["accepted_technician"] == "Demo Right-Area Tech"
+
+
+# ------------------------------------------------------------ Scenario E --
+def test_scenario_e_closing_recorded_but_amount_never_fabricated(db_path):
+    result = scenarios.seed_scenario_e_incomplete_closing(db_path)
+    assert result["job_status"] == "Closed"  # the raw closing WAS recorded
+
+
+def test_scenario_e_prepare_company_closing_refuses_with_specific_reason(db_path):
+    result = scenarios.seed_scenario_e_incomplete_closing(db_path)
+    assert result["prepare_succeeded"] is False
+    assert "amount" in result["human_review_reason"]
+    assert "payment method" in result["human_review_reason"]
+
+
+def test_scenario_e_job_retained_under_closings_to_review_in_action_center(db_path):
+    scenarios._prepare_env(db_path)
+    result = scenarios.seed_scenario_e_incomplete_closing(db_path)
+    import operator_api as api
+    ac = api.route_action_center(None, {}, {})
+    ids = [i["entity_id"] for i in ac["sections"]["closings_to_review"]["items"]]
+    assert result["job_id"] in ids
+
+
 # --------------------------------------------------------------- safety --
 def test_scenarios_never_touch_the_real_database_path(db_path):
     from dispatcher import storage

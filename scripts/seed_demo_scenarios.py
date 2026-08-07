@@ -9,6 +9,15 @@ data/dispatcher.db -- pass a path under a temp/demo directory.
 Scenarios:
   A -- Happy path: AGN job all the way through to COMPLETE.
   B -- Human review: no eligible technician for the job's area/service.
+  C -- Duplicate/correction: a second message for the same ticket
+       updates the existing job (upsert by source+ticket), never
+       creates a second row.
+  D -- Technician restriction: an ineligible technician is rejected
+       with a visible reason; a genuinely eligible one is still
+       assignable right after.
+  E -- Incomplete closing: a closing recorded without a structured
+       amount never reaches "ready to send" -- prepare_company_closing()
+       refuses with a specific missing-fields message.
   F -- Technician decline: a captured "declined" reply is confirmed,
        moving the job to HUMAN_REVIEW_NEEDED (needs reassignment).
 
@@ -286,6 +295,188 @@ def seed_scenario_f_technician_decline(db_path: Path, ticket: str = "SCEN-F") ->
     }
 
 
+def seed_scenario_c_duplicate_and_correction(db_path: Path, ticket: str = "SCEN-C") -> dict:
+    """A second raw message for the same (source, ticket) arrives after
+    the job is already dispatched -- must update the existing job row,
+    never create a second one (storage.save_audit_entry()'s
+    ON CONFLICT(source, ticket_number) upsert is the real mechanism
+    this proves, not a hand-rolled dedup check here)."""
+    db_path = _prepare_env(db_path)
+    import operator_api as api
+    import luxor_ops_shared as shared
+    from dispatcher import storage
+    from dispatcher.rules.service_areas import load_service_areas
+
+    conn = storage.connect(db_path)
+    conn.execute(
+        "INSERT OR IGNORE INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)",
+        ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    tech_id = storage.add_technician(
+        conn, name="Demo Dup Tech", areas=["Charlotte"], skills=["car lockout"],
+        dispatch_group="Demo Dup Dispatch", closing_group="Demo Dup Closings",
+    )
+    conn.close()
+
+    # First arrival -- dispatched normally.
+    message_id_1 = f"scen-c-{ticket}-1"
+    storage.save_pending_and_mark_processed(
+        storage.connect(db_path), message_id=message_id_1, conversation_id=f"c-{message_id_1}",
+        group_label="AGN", raw_text=agn_message(ticket), from_number="+15550109910", received_at=future_ts(1),
+    )
+    shared.clear_pending_caches()
+    api.route_acknowledge(None, {"message_id": message_id_1}, {})
+    api.route_prepare_dispatch(None, {"message_id": message_id_1}, {})
+    first_job_id = api.route_confirm_dispatch(None, {"message_id": message_id_1}, {})["job_id"]
+    conn = storage.connect(db_path)
+    storage.assign_technician(conn, first_job_id, tech_id, load_service_areas())
+    conn.close()
+
+    # Second arrival, same ticket, a corrected phone number -- a
+    # genuine "correction" message, not a byte-identical retry. Goes
+    # through the exact same NEW-message pipeline; the upsert-by-ticket
+    # key is what keeps this from becoming a second job.
+    message_id_2 = f"scen-c-{ticket}-2"
+    corrected_text = agn_message(ticket).replace("1-555-010-3000", "1-555-010-9999")
+    storage.save_pending_and_mark_processed(
+        storage.connect(db_path), message_id=message_id_2, conversation_id=f"c-{message_id_2}",
+        group_label="AGN", raw_text=corrected_text, from_number="+15550109910", received_at=future_ts(2),
+    )
+    shared.clear_pending_caches()
+    # This second message re-enters at the New Jobs review stage (a
+    # fresh NEW-type classification for the same ticket) -- approve it
+    # the same way a dispatcher reviewing a correction would.
+    ack2 = api.route_acknowledge(None, {"message_id": message_id_2}, {})
+    api.route_prepare_dispatch(None, {"message_id": message_id_2}, {})
+    second_result = api.route_confirm_dispatch(None, {"message_id": message_id_2}, {})
+    second_job_id = second_result["job_id"]
+
+    conn = storage.connect(db_path)
+    all_jobs_with_ticket = conn.execute(
+        "SELECT id FROM jobs WHERE source = 'AGN' AND ticket_number = ?", (ticket,)
+    ).fetchall()
+    history = storage.get_audit_timeline_by_job_id(conn, first_job_id)
+    latest_job = storage.get_job_by_id(conn, first_job_id)
+    conn.close()
+
+    return {
+        "ticket": ticket, "first_job_id": first_job_id, "second_job_id": second_job_id,
+        "distinct_job_row_count": len(all_jobs_with_ticket), "audit_event_count": len(history),
+        "latest_phone_on_record": latest_job["fields"].get("phone"),
+    }
+
+
+def seed_scenario_d_technician_restriction(db_path: Path, ticket: str = "SCEN-D") -> dict:
+    """The first technician configured is deliberately ineligible for
+    this job's area -- assign_technician() must reject them with a
+    visible reason (never silently succeed), and a second, genuinely
+    eligible technician must still be assignable right after."""
+    db_path = _prepare_env(db_path)
+    import operator_api as api
+    from dispatcher import storage
+    from dispatcher.rules.service_areas import load_service_areas
+
+    conn = storage.connect(db_path)
+    conn.execute(
+        "INSERT OR IGNORE INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)",
+        ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    wrong_tech_id = storage.add_technician(
+        conn, name="Demo Wrong-Area Tech", areas=["Savannah"], skills=["car lockout"],
+        dispatch_group="Demo Wrong Dispatch", closing_group="Demo Wrong Closings",
+    )
+    right_tech_id = storage.add_technician(
+        conn, name="Demo Right-Area Tech", areas=["Charlotte"], skills=["car lockout"],
+        dispatch_group="Demo Right Dispatch", closing_group="Demo Right Closings",
+    )
+    conn.close()
+
+    message_id = f"scen-d-{ticket}"
+    storage.save_pending_and_mark_processed(
+        storage.connect(db_path), message_id=message_id, conversation_id=f"c-{message_id}",
+        group_label="AGN", raw_text=agn_message(ticket, area="Charlotte, NC"), from_number="+15550109911", received_at=future_ts(1),
+    )
+    import luxor_ops_shared as shared
+    shared.clear_pending_caches()
+    api.route_acknowledge(None, {"message_id": message_id}, {})
+    api.route_prepare_dispatch(None, {"message_id": message_id}, {})
+    job_id = api.route_confirm_dispatch(None, {"message_id": message_id}, {})["job_id"]
+
+    service_areas = load_service_areas()
+    conn = storage.connect(db_path)
+    rejected = storage.assign_technician(conn, job_id, wrong_tech_id, service_areas)
+    conn.close()
+
+    conn = storage.connect(db_path)
+    accepted = storage.assign_technician(conn, job_id, right_tech_id, service_areas)
+    conn.close()
+
+    return {
+        "job_id": job_id, "ticket": ticket,
+        "rejected_outcome": rejected.outcome, "rejected_reason": rejected.reason,
+        "accepted_outcome": accepted.outcome, "accepted_technician": accepted.technician_name,
+    }
+
+
+def seed_scenario_e_incomplete_closing(db_path: Path, ticket: str = "SCEN-E") -> dict:
+    """A closing is recorded with the technician's raw text but no
+    structured final amount -- prepare_company_closing() (the real gate
+    on the "send to company" step) must refuse with a clear, specific
+    "missing: amount, payment method" message rather than fabricate
+    either. The job stays Closed (a real closing WAS recorded) but never
+    reaches "ready to send.\""""
+    db_path = _prepare_env(db_path)
+    import operator_api as api
+    import luxor_ops_shared as shared
+    from dispatcher import storage
+    from dispatcher.app_models import ClosingCommand
+    from dispatcher.rules.service_areas import load_service_areas
+
+    conn = storage.connect(db_path)
+    conn.execute(
+        "INSERT OR IGNORE INTO console_activation_state (id, live_queue_started_at, updated_at) VALUES (1, ?, ?)",
+        ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    tech_id = storage.add_technician(
+        conn, name="Demo Incomplete Tech", areas=["Charlotte"], skills=["car lockout"],
+        dispatch_group="Demo Incomplete Dispatch", closing_group="Demo Incomplete Closings",
+    )
+    conn.close()
+
+    message_id = f"scen-e-{ticket}"
+    storage.save_pending_and_mark_processed(
+        storage.connect(db_path), message_id=message_id, conversation_id=f"c-{message_id}",
+        group_label="AGN", raw_text=agn_message(ticket), from_number="+15550109912", received_at=future_ts(1),
+    )
+    shared.clear_pending_caches()
+    api.route_acknowledge(None, {"message_id": message_id}, {})
+    api.route_prepare_dispatch(None, {"message_id": message_id}, {})
+    job_id = api.route_confirm_dispatch(None, {"message_id": message_id}, {})["job_id"]
+    conn = storage.connect(db_path)
+    storage.assign_technician(conn, job_id, tech_id, load_service_areas())
+    conn.close()
+
+    conn = storage.connect(db_path)
+    service = api._service(conn)
+    # The technician's actual message is recorded verbatim -- final_amount
+    # and payment_method are deliberately omitted, never invented.
+    closing_result = service.record_closing(
+        ClosingCommand(job_id=job_id, raw_closing="Done, will confirm the amount later", final_amount=None, payment_method=None)
+    )
+    assert closing_result.success, closing_result
+    prepare_result = service.prepare_company_closing(job_id)
+    job = storage.get_job_by_id(conn, job_id)
+    conn.close()
+
+    return {
+        "job_id": job_id, "ticket": ticket, "job_status": job["status"],
+        "prepare_succeeded": prepare_result.success, "human_review_reason": prepare_result.human_review_reason.detail if prepare_result.human_review_reason else None,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
@@ -293,7 +484,13 @@ if __name__ == "__main__":
     p = Path(args.db_path)
     result_a = seed_scenario_a_happy_path(p)
     result_b = seed_scenario_b_human_review(p)
+    result_c = seed_scenario_c_duplicate_and_correction(p)
+    result_d = seed_scenario_d_technician_restriction(p)
+    result_e = seed_scenario_e_incomplete_closing(p)
     result_f = seed_scenario_f_technician_decline(p)
     print(f"Scenario A (happy path): {result_a}")
     print(f"Scenario B (human review): {result_b}")
+    print(f"Scenario C (duplicate/correction): {result_c}")
+    print(f"Scenario D (technician restriction): {result_d}")
+    print(f"Scenario E (incomplete closing): {result_e}")
     print(f"Scenario F (technician decline): {result_f}")
