@@ -232,3 +232,97 @@ def derive_next_action(ctx: dict) -> WorkflowProjection:
         return WorkflowProjection("COMPLETE", "Closing sent -- ready to mark complete.", False, False)
 
     return WorkflowProjection("WAIT_TECHNICIAN_K", "Waiting for the next technician update.", False, False)
+
+
+# ============================================================== LIFECYCLE
+LIFECYCLE_STEPS = (
+    "Received", "Reviewed", "Company acknowledged", "Technician assigned",
+    "Sent to technician", "Technician accepted", "Work/update", "Company updated",
+    "Closing received", "Closing sent", "Complete",
+)
+
+STEP_COMPLETED = "completed"
+STEP_CURRENT = "current"
+STEP_BLOCKED = "blocked"
+STEP_PENDING = "pending"
+
+
+def derive_lifecycle_steps(ctx: dict) -> list:
+    """Renders the same 11-step lifecycle for either an incoming message
+    or a committed job, from facts already gathered elsewhere -- never a
+    second, independent calculation (see this module's own precedence
+    functions, which supply most of the same `ctx`). Frontends must call
+    this (via operator_api's normalized item) rather than infer step
+    completion in JavaScript.
+
+    `ctx` keys (all optional -- whichever half doesn't apply for a given
+    entity_type is simply absent):
+
+      entity_type          -- "INCOMING_MESSAGE" or "JOB" (default "JOB")
+      needs_review, k_required, k_sent, eligible_count, dispatched
+                            -- pending-message facts (see derive_pending_message_next_action)
+      technician_name, technician_k, latest_technician_update,
+      company_update_owed, closing, status, reconciliation_state
+                            -- committed-job facts (see derive_next_action)
+      human_review_needed  -- the already-computed next_action's flag,
+                              so this function never re-derives precedence
+
+    Returns exactly 11 {"step": 1-11, "label": ..., "status": one of
+    completed/current/blocked/pending} entries. At most one step is ever
+    "current" or "blocked" -- the first not-yet-completed step in order;
+    everything before it is "completed", everything after is "pending".
+    A dead-terminal job (Cancelled/Rejected) never gets a "current" step
+    -- nothing is actionable anymore, so every remaining incomplete step
+    is "pending", not "current".
+    """
+    entity_type = ctx.get("entity_type", "JOB")
+    status = ctx.get("status")
+    technician_k = ctx.get("technician_k")
+    tk_status = technician_k.get("status") if technician_k else None
+    latest_update = ctx.get("latest_technician_update")
+    closing = ctx.get("closing")
+
+    completed = [False] * 11
+    completed[0] = True  # Received -- an item exists.
+
+    if entity_type == "INCOMING_MESSAGE":
+        completed[1] = not ctx.get("needs_review", False)
+        completed[2] = (not ctx.get("k_required")) or bool(ctx.get("k_sent"))
+        completed[3] = bool(ctx.get("eligible_count"))
+        completed[4] = bool(ctx.get("dispatched"))
+    else:
+        completed[1] = status not in (None, "New", "Needs Review")
+        completed[2] = True  # already true by construction post-commit -- see module docstring
+        completed[3] = bool(ctx.get("technician_name"))
+        completed[4] = True  # job exists -> confirm_whatsapp_dispatch already ran
+
+    completed[5] = tk_status == "accepted"
+    completed[6] = bool(latest_update)
+    completed[7] = bool(latest_update) and not ctx.get("company_update_owed")
+    completed[8] = status == "Closed"
+    completed[9] = bool(closing and closing.get("sent_confirmed"))
+    completed[10] = status in ("Cancelled", "Rejected") or (status == "Closed" and ctx.get("reconciliation_state") == "Settled")
+
+    dead_terminal = status in ("Cancelled", "Rejected")
+    human_review_needed = bool(ctx.get("human_review_needed"))
+    tk_declined = tk_status == "declined"
+
+    steps = []
+    current_assigned = False
+    for i, label in enumerate(LIFECYCLE_STEPS):
+        if completed[i]:
+            step_status = STEP_COMPLETED
+        elif dead_terminal:
+            step_status = STEP_PENDING
+        elif not current_assigned:
+            if i == 5 and tk_declined:
+                step_status = STEP_BLOCKED
+            elif human_review_needed:
+                step_status = STEP_BLOCKED
+            else:
+                step_status = STEP_CURRENT
+            current_assigned = True
+        else:
+            step_status = STEP_PENDING
+        steps.append({"step": i + 1, "label": label, "status": step_status})
+    return steps

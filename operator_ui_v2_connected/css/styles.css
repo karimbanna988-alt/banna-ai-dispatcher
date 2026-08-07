@@ -244,6 +244,20 @@ button { font-family: inherit; }
 .k-candidate { background: var(--panel-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 8px; }
 .k-candidate-head { margin-bottom: 4px; }
 
+/* --------------------------------------------------------- Lifecycle stepper */
+.lifecycle-stepper { background: var(--panel-bg); border-radius: var(--radius); padding: 8px 10px; }
+.lifecycle-step-list { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; }
+.lifecycle-step { display: flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 0; }
+.lifecycle-step-icon { font-size: 11px; width: 14px; text-align: center; flex-shrink: 0; }
+.lifecycle-step-completed { color: var(--success); }
+.lifecycle-step-completed .lifecycle-step-icon { color: var(--success); }
+.lifecycle-step-current { color: var(--text); font-weight: 700; }
+.lifecycle-step-current .lifecycle-step-icon { color: var(--primary); }
+.lifecycle-step-blocked { color: var(--danger); font-weight: 700; }
+.lifecycle-step-blocked .lifecycle-step-icon { color: var(--danger); }
+.lifecycle-step-pending { color: var(--text-muted); }
+.lifecycle-step-pending .lifecycle-step-icon { color: var(--text-muted); }
+
 /* ----------------------------------------------------------- Detail body */
 .detail-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
 .detail-ticket { font-weight: 800; font-size: 15px; }

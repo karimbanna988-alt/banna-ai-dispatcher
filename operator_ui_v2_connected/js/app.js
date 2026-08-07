@@ -598,6 +598,7 @@ function jobDetailHtml(j) {
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span><span class="detail-age">${j.age_minutes}m</span></div>
     <div class="detail-meta">${esc(j.service || "Unclear")} · ${esc(j.city || "")}${j.state ? ", " + esc(j.state) : ""}</div>
     <div class="detail-meta">${techLine} · ${destLine}</div>
+    ${lifecycleStepperHtml(j.steps, j.delivery_mode)}
     ${warn}
     ${body}
     <div class="detail-section">
@@ -1155,6 +1156,25 @@ const TECHNICIAN_UPDATE_TYPES = ["Going", "ETA", "No Answer", "No Show", "Not Av
 
 const K_CATEGORY_LABEL = { EXACT: "Exact match", STRONG: "Strong match", AMBIGUOUS: "Ambiguous" };
 
+// Renders the backend-computed lifecycle (dispatcher.workflow_projection.derive_lifecycle_steps) --
+// this function only maps a step's already-decided status to markup; it
+// never decides completed/current/blocked/pending itself.
+function lifecycleStepperHtml(steps, deliveryMode) {
+  if (!steps || !steps.length) return "";
+  const rows = steps.map(s => {
+    const icon = s.status === "completed" ? "&#10003;" : s.status === "blocked" ? "&#33;" : s.status === "current" ? "&#9679;" : "&#9675;";
+    return `<div class="lifecycle-step lifecycle-step-${s.status}">
+      <span class="lifecycle-step-icon" aria-hidden="true">${icon}</span>
+      <span class="lifecycle-step-label">${s.step}. ${esc(s.label)}</span>
+    </div>`;
+  }).join("");
+  return `
+    <div class="detail-section lifecycle-stepper">
+      <div class="subsection-label">Lifecycle ${deliveryMode ? `<span class="chip chip-waiting" style="margin-left:6px;">${esc(deliveryMode)}</span>` : ""}</div>
+      <div class="lifecycle-step-list">${rows}</div>
+    </div>`;
+}
+
 function technicianKBlockHtml(j) {
   const tk = j.technician_k;
   if (!tk) return "";
@@ -1307,6 +1327,7 @@ function activeDetailHtml(j) {
     <div class="detail-header">${sourceChip(j.source)}<span class="detail-ticket">${esc(j.ticket || "No ref")}</span></div>
     <div class="detail-meta">${esc(j.technician_name || "Unassigned")} · ${esc(j.city || "")} · Status: <strong>${esc(j.status)}</strong></div>
     <div class="detail-meta">Next: <strong>${esc(j.next_action)}</strong></div>
+    ${j.workflow ? lifecycleStepperHtml(j.workflow.steps, j.workflow.delivery_mode) : ""}
     ${technicianKBlockHtml(j)}
     ${statusUpdateBlockHtml(j)}
     <div class="detail-section">${interpretBlock}</div>

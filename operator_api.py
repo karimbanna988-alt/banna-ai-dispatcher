@@ -82,7 +82,7 @@ from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
 from dispatcher.workflow_projection import (  # noqa: E402
-    WorkflowProjection, derive_next_action, derive_pending_message_next_action,
+    WorkflowProjection, derive_lifecycle_steps, derive_next_action, derive_pending_message_next_action,
 )
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
@@ -286,6 +286,11 @@ def _new_job_dto(conn, entry) -> dict:
         "notes": job.notes.value,
         "market_label": market_label,
         "canonical_area": resolution.canonical_area,
+        "steps": derive_lifecycle_steps({
+            "entity_type": "INCOMING_MESSAGE", "needs_review": needs_review, "k_required": k_required,
+            "k_sent": k_sent, "eligible_count": len(eligible), "dispatched": tracking["dispatched_manually_at"] is not None,
+        }),
+        "delivery_mode": _DELIVERY_MODE,
     }
 
 
@@ -677,12 +682,15 @@ def _build_workflow_context(conn, service: DispatcherService, job: dict, all_job
 
 
 def _workflow_projection_dto(conn, service: DispatcherService, job: dict, all_jobs: list) -> dict:
-    projection = derive_next_action(_build_workflow_context(conn, service, job, all_jobs))
+    ctx = _build_workflow_context(conn, service, job, all_jobs)
+    projection = derive_next_action(ctx)
     return {
         "next_action": projection.next_action,
         "blocking_reason": projection.blocking_reason,
         "human_review_needed": projection.human_review_needed,
         "terminal": projection.terminal,
+        "steps": derive_lifecycle_steps({**ctx, "entity_type": "JOB", "human_review_needed": projection.human_review_needed}),
+        "delivery_mode": _DELIVERY_MODE,
     }
 
 

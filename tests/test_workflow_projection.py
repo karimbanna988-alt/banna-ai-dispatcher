@@ -6,7 +6,10 @@ own test. See tests/test_operator_api.py for the route-level wiring
 
 from __future__ import annotations
 
-from dispatcher.workflow_projection import NEXT_ACTIONS, derive_next_action, derive_pending_message_next_action
+from dispatcher.workflow_projection import (
+    LIFECYCLE_STEPS, NEXT_ACTIONS, STEP_BLOCKED, STEP_COMPLETED, STEP_CURRENT, STEP_PENDING,
+    derive_lifecycle_steps, derive_next_action, derive_pending_message_next_action,
+)
 
 
 def ctx(**overrides):
@@ -258,3 +261,113 @@ def test_pending_projection_next_actions_stay_in_the_fixed_vocabulary():
     ]
     for c in scenarios:
         assert derive_pending_message_next_action(c).next_action in NEXT_ACTIONS
+
+
+# --------------------------------------------------------- lifecycle steps
+def test_lifecycle_steps_always_returns_exactly_eleven_entries():
+    steps = derive_lifecycle_steps({"entity_type": "JOB", "status": "Approved"})
+    assert len(steps) == 11
+    assert [s["label"] for s in steps] == list(LIFECYCLE_STEPS)
+
+
+def test_lifecycle_brand_new_message_only_received_is_completed():
+    steps = derive_lifecycle_steps({"entity_type": "INCOMING_MESSAGE", "needs_review": True})
+    assert steps[0]["status"] == STEP_COMPLETED  # Received
+    assert steps[1]["status"] == STEP_CURRENT    # Reviewed -- needs review
+
+
+def test_lifecycle_reviewed_message_k_owed_is_current_at_ack_step():
+    steps = derive_lifecycle_steps({
+        "entity_type": "INCOMING_MESSAGE", "needs_review": False, "k_required": True, "k_sent": False,
+    })
+    assert steps[1]["status"] == STEP_COMPLETED  # Reviewed
+    assert steps[2]["status"] == STEP_CURRENT    # Company acknowledged
+
+
+def test_lifecycle_committed_job_company_ack_step_always_completed():
+    """Committed jobs never show "current" at step 3 -- see the module
+    docstring on why K is always already resolved by commit time."""
+    steps = derive_lifecycle_steps({"entity_type": "JOB", "status": "Approved", "technician_name": None})
+    assert steps[2]["status"] == STEP_COMPLETED  # Company acknowledged
+    assert steps[3]["status"] == STEP_CURRENT    # Technician assigned -- none yet
+
+
+def test_lifecycle_committed_job_dispatch_step_always_completed():
+    steps = derive_lifecycle_steps({"entity_type": "JOB", "status": "Approved", "technician_name": "Demo Ashraf"})
+    assert steps[4]["status"] == STEP_COMPLETED  # Sent to technician
+
+
+def test_lifecycle_waiting_on_k_is_current_at_accepted_step():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "Approved", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "waiting", "candidates": []},
+    })
+    assert steps[5]["status"] == STEP_CURRENT  # Technician accepted
+
+
+def test_lifecycle_declined_k_is_blocked_at_accepted_step():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "Approved", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "declined"}, "human_review_needed": True,
+    })
+    assert steps[5]["status"] == STEP_BLOCKED  # Technician accepted
+
+
+def test_lifecycle_accepted_moves_current_to_work_update():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "Approved", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "accepted"},
+    })
+    assert steps[5]["status"] == STEP_COMPLETED  # Technician accepted
+    assert steps[6]["status"] == STEP_CURRENT    # Work/update
+
+
+def test_lifecycle_technician_update_recorded_moves_current_to_company_update():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "In Progress", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "accepted"}, "latest_technician_update": {"update_type": "Going"},
+        "company_update_owed": {"suggested_reply": "Going"},
+    })
+    assert steps[6]["status"] == STEP_COMPLETED  # Work/update
+    assert steps[7]["status"] == STEP_CURRENT    # Company updated
+
+
+def test_lifecycle_closed_job_closing_received_is_completed():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "Closed", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "accepted"}, "latest_technician_update": {"update_type": "Completed"},
+        "closing": {"missing": [], "supported": True, "sent_confirmed": False},
+    })
+    assert steps[8]["status"] == STEP_COMPLETED  # Closing received
+    assert steps[9]["status"] == STEP_CURRENT    # Closing sent
+
+
+def test_lifecycle_settled_job_every_step_completed():
+    steps = derive_lifecycle_steps({
+        "entity_type": "JOB", "status": "Closed", "reconciliation_state": "Settled", "technician_name": "Demo Ashraf",
+        "technician_k": {"status": "accepted"}, "latest_technician_update": {"update_type": "Completed"},
+        "closing": {"missing": [], "supported": True, "sent_confirmed": True},
+    })
+    assert all(s["status"] == STEP_COMPLETED for s in steps)
+
+
+def test_lifecycle_at_most_one_step_is_current_or_blocked():
+    scenarios_ctx = [
+        {"entity_type": "INCOMING_MESSAGE", "needs_review": True},
+        {"entity_type": "INCOMING_MESSAGE", "k_required": True, "k_sent": False},
+        {"entity_type": "JOB", "status": "Approved", "technician_name": None},
+        {"entity_type": "JOB", "status": "Approved", "technician_name": "Demo Ashraf", "technician_k": {"status": "declined"}, "human_review_needed": True},
+        {"entity_type": "JOB", "status": "Cancelled"},
+        {"entity_type": "JOB", "status": "Closed", "reconciliation_state": "Settled"},
+    ]
+    for c in scenarios_ctx:
+        steps = derive_lifecycle_steps(c)
+        active = [s for s in steps if s["status"] in (STEP_CURRENT, STEP_BLOCKED)]
+        assert len(active) <= 1, f"more than one active step for {c}: {steps}"
+
+
+def test_lifecycle_cancelled_job_has_no_current_step():
+    steps = derive_lifecycle_steps({"entity_type": "JOB", "status": "Cancelled", "technician_name": None})
+    assert not any(s["status"] == STEP_CURRENT for s in steps)
+    assert steps[10]["status"] == STEP_COMPLETED  # Complete
+    assert steps[3]["status"] == STEP_PENDING     # Technician assigned -- never happened, but not "current" either
