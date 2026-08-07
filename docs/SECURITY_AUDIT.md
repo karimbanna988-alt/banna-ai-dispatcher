@@ -83,17 +83,45 @@ parameterized `?` placeholders. Neither is an injection vector.
 
 **No fix needed.**
 
-### 5. Session/CSRF/cookie handling — audited, no finding
+### 5. Session/CSRF/cookie handling — mechanism audited clean; one real usability/reliability bug found and fixed (MEDIUM — fixed)
 
-**Evidence:** `HttpOnly`, `SameSite=Lax`, and conditional `Secure` (when
-`X-Forwarded-Proto: https`) on the session cookie; CSRF enforced via a
-per-session HMAC token checked with `hmac.compare_digest` on every
-non-GET, non-`skip_csrf` route; the login password itself is compared
-with `hmac.compare_digest` (constant-time); session tokens are
-invalidated server-side on logout (not just cookie-cleared — see
-`test_logout_invalidates_session_not_just_clears_cookie`, pre-existing).
+**Evidence (mechanism, unchanged):** `HttpOnly`, `SameSite=Lax`, and
+conditional `Secure` (when `X-Forwarded-Proto: https`) on the session
+cookie; CSRF enforced via a per-session HMAC token checked with
+`hmac.compare_digest` on every non-GET, non-`skip_csrf` route; the login
+password itself is compared with `hmac.compare_digest` (constant-time);
+session tokens are invalidated server-side on logout (not just
+cookie-cleared — see `test_logout_invalidates_session_not_just_clears_cookie`,
+pre-existing). None of this changed and none of it was wrong.
 
-**No fix needed.**
+**Bug found in a later sprint (Operator Speed Implementation), while
+live-testing unrelated Fast Path changes in the browser:** `app.js`'s
+`boot()` calls `Api.checkSession()` (`GET /api/me`), never `Api.login()`,
+whenever the session cookie is already valid — the common case on an
+ordinary page reload. `checkSession()` never populated the frontend's
+in-memory CSRF token (only `login()` did), so on that path every
+mutating request 403'd with "Missing or invalid CSRF token" until the
+operator explicitly logged out and back in. This is not an
+authentication bypass or a CSRF *weakness* — the gate itself was working
+exactly as designed, correctly rejecting requests with no valid token —
+it's the opposite failure mode: a reliability bug that silently broke
+every write path after any browser reload, which is a direct hit to
+dispatch speed (the entire point of that sprint) and confusing enough
+in practice (a cryptic technical error toast, not a clear "please log in
+again") that it's worth tracking here alongside the CSRF mechanism it's
+adjacent to.
+
+**Fix:** `route_me` now also returns `csrf_token_for(session_token)` —
+the identical pure function `route_login` already used, re-derived from
+a session token this request already proved possession of via its
+cookie, so this creates no new secret and no new capability. `checkSession()`
+stores it exactly like `login()` does.
+
+**Verify:** `tests/test_operator_api.py::test_api_me_returns_a_working_csrf_token_for_an_already_valid_session`,
+`::test_api_me_csrf_token_matches_the_one_login_issued`. Live-verified in
+the browser: simulated a fresh reload (cleared the in-memory token,
+called `checkSession()`, confirmed a subsequent write succeeded using
+only the token that call returned).
 
 ### 6. Login brute-force throttling — audited, no finding
 
@@ -215,7 +243,7 @@ session-secret issue" — not touched, not re-investigated.
 | 2 | No CSP header | LOW/MEDIUM | Fixed (defense in depth) |
 | 3 | XSS escaping | — | Audited, no finding |
 | 4 | SQL parameterization | — | Audited, no finding |
-| 5 | Session/CSRF/cookies | — | Audited, no finding |
+| 5 | Session/CSRF/cookies | MEDIUM | Mechanism clean; reload-loses-CSRF-token bug found & fixed (Operator Speed sprint) |
 | 6 | Login throttling | — | Audited, no finding |
 | 7 | Path traversal | — | Audited, no finding |
 | 8 | Route authorization | — | Audited, no finding |
@@ -229,3 +257,9 @@ session-secret issue" — not touched, not re-investigated.
 Two genuine, safely-scoped fixes shipped this pass (#1, #2). One real
 finding (#9) documented but deliberately not auto-fixed because it
 changes live server startup behavior.
+
+**Update (Operator Speed Implementation sprint):** a third real,
+safely-scoped fix shipped — #5's reload-loses-CSRF-token bug, found
+while live-testing unrelated speed changes and fixed in the same
+sprint rather than left for later, since a broken write path after any
+page reload directly undermines that sprint's entire goal.
