@@ -1142,16 +1142,16 @@ def test_technician_k_routes_never_touch_quo_or_whatsapp_adapters():
 
 
 # ===================================== WORKFLOW PROJECTION / ACTION CENTER
-def test_action_center_returns_all_nine_sections(api_env):
+def test_action_center_returns_all_ten_sections(api_env):
     result = api.route_action_center(None, {}, {})
     expected = {
-        "new_jobs_to_review", "company_k_owed", "ready_for_dispatch", "assign_technician",
+        "new_jobs_to_review", "company_k_owed", "assign_technician", "ready_to_dispatch",
         "waiting_technician_k", "technician_updates_to_review", "company_updates_owed",
         "closings_to_review", "closings_ready_to_send", "human_review_required",
     }
-    assert expected <= set(result["sections"].keys())
+    assert set(result["sections"].keys()) == expected
     for section in result["sections"].values():
-        assert "items" in section and "total" in section
+        assert "items" in section and "total" in section and "title" in section
 
 
 def test_action_center_lists_a_job_missing_technician_assignment(api_env):
@@ -1214,6 +1214,65 @@ def test_action_center_items_never_include_phone_or_address(api_env):
     combined = json.dumps(result)
     assert "phone" not in combined.lower()
     assert "555-010" not in combined  # the fixture's own fake phone number
+
+
+def test_action_center_ack_company_k_reachable_through_real_workflow_state(api_env):
+    """Integration-level proof (not just the pure-function test in
+    tests/test_workflow_projection.py) that ACK_COMPANY_K genuinely
+    surfaces from real pending-message state: AGN requires K per
+    policy.py, and a freshly-arrived, needs-no-correction AGN message
+    has not been acknowledged yet."""
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "m1", agn_message("A700"))
+    result = api.route_action_center(None, {}, {})
+    items = result["sections"]["company_k_owed"]["items"]
+    assert any(i["ticket"] == "A700" for i in items)
+    matched = next(i for i in items if i["ticket"] == "A700")
+    assert matched["next_action"] == "ACK_COMPANY_K"
+    assert matched["entity_type"] == "INCOMING_MESSAGE"
+
+
+def test_action_center_send_job_to_technician_reachable_through_real_workflow_state(api_env):
+    """Integration-level proof that SEND_JOB_TO_TECHNICIAN genuinely
+    surfaces: Main Leads requires no K (policy.py), so a reviewed Main
+    Leads message with a configured, eligible technician is
+    immediately ready to dispatch."""
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "m1", main_leads_message("ML700"))
+    result = api.route_action_center(None, {}, {})
+    items = result["sections"]["ready_to_dispatch"]["items"]
+    assert any(i["ticket"] == "ML700" for i in items)
+    matched = next(i for i in items if i["ticket"] == "ML700")
+    assert matched["next_action"] == "SEND_JOB_TO_TECHNICIAN"
+
+
+def test_action_center_ack_company_k_disappears_once_acknowledged(api_env):
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "m1", agn_message("A701"))
+    api.route_acknowledge(None, {"message_id": "m1"}, {})
+    result = api.route_action_center(None, {}, {})
+    ack_owed = [i["ticket"] for i in result["sections"]["company_k_owed"]["items"]]
+    ready = [i["ticket"] for i in result["sections"]["ready_to_dispatch"]["items"]]
+    assert "A701" not in ack_owed
+    assert "A701" in ready
+
+
+def test_action_center_normalized_item_schema_fields(api_env):
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "m1", agn_message("A702"))
+    result = api.route_action_center(None, {}, {})
+    item = result["sections"]["company_k_owed"]["items"][0]
+    required = {
+        "entity_type", "entity_id", "ticket", "source", "technician", "stage", "next_action",
+        "blocking_reason", "age", "human_review_needed", "destination", "delivery_mode",
+    }
+    assert required <= set(item.keys())
+    assert item["entity_type"] in ("JOB", "INCOMING_MESSAGE")
+    assert item["delivery_mode"] == "MANUAL COPY"
 
 
 def test_action_center_never_touches_quo_or_whatsapp_adapters():

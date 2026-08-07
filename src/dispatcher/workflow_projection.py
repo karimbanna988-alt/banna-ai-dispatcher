@@ -1,35 +1,44 @@
 """Single source of truth for "what does the operator need to do about
-this job right now" -- one pure function, explicit precedence, the
-fixed next_action vocabulary the product spec requires. Every CRM
-screen that shows a next-action label (Active, Closings, the Action
-Center) must call derive_next_action() instead of computing its own
-signal, so there is exactly one place this logic lives.
+this [message|job] right now" -- two pure functions covering the whole
+real lifecycle (pre-commit and post-commit), sharing one fixed
+next_action vocabulary. Every CRM screen that shows a next-action label
+(Active, Closings, New Jobs, the Action Center) must call one of these
+instead of computing its own signal, so there is exactly one place this
+logic lives, for either half of the lifecycle.
 
-This function is pure: it takes a plain dict of already-gathered facts
-about one job (never a live DB connection) and returns a
-WorkflowProjection. Gathering that input dict is operator_api.py's
-_build_workflow_context(), which reuses the exact same per-job DTOs
-every existing screen already computes (_technician_k_dto,
-_company_update_owed_dto, _closing_dto) -- this module adds no new
-database queries of its own.
+Both functions are pure: each takes a plain dict of already-gathered
+facts and returns a WorkflowProjection -- neither touches a database.
 
-Two architectural notes on why 2 of the 11 allowed next_action values
-can never actually be *returned* by this function for an
-already-committed job (both stay in NEXT_ACTIONS because the vocabulary
-is shared with New Jobs' pending-message review, a different,
-message-keyed code path this function's "committed jobs only" contract
-does not cover):
+Why two functions instead of one: a raw incoming message and a
+committed job are genuinely different entities with different
+persisted state (quo_pending_messages + dispatch_tracking vs. jobs +
+events), and forcing pre-commit facts into jobs.status was explicitly
+out of scope. What they share is the *vocabulary* (NEXT_ACTIONS below)
+and the *contract* (WorkflowProjection) -- Action Center normalizes
+both into one item schema (see operator_api.py's
+_normalize_action_center_item()) without either function needing to
+know about the other.
 
-- ACK_COMPANY_K: acknowledge_job_manually() runs against a *pending
-  message*, strictly before confirm_whatsapp_dispatch() commits the
-  job. By the time a jobs row exists, the acknowledgment question (for
-  sources that require one) has already been resolved one way or the
-  other -- there is no "K still owed" state left to detect on a
-  committed job in this schema.
-- SEND_JOB_TO_TECHNICIAN: confirm_whatsapp_dispatch() -- the action
-  that creates the job row in the first place -- IS the "sent to
-  technician" milestone. What can still be open post-commit is *which*
-  technician (ASSIGN_TECHNICIAN), never whether dispatch happened.
+  derive_pending_message_next_action(ctx) -- covers REVIEW_NEW_JOB,
+    ACK_COMPANY_K, SEND_JOB_TO_TECHNICIAN: everything from "message
+    arrived" through "dispatched to technician" (the action that
+    creates the job row -- see below).
+
+  derive_next_action(ctx) -- covers ASSIGN_TECHNICIAN through COMPLETE:
+    everything from "job exists" onward. ASSIGN_TECHNICIAN stays here
+    (not pre-commit) because re-assigning a technician on an existing
+    job is storage.assign_technician(), a distinct, later, committed-job
+    action, unrelated to the technician auto-suggested at dispatch time.
+
+Earlier revisions of this module claimed ACK_COMPANY_K and
+SEND_JOB_TO_TECHNICIAN were structurally unreachable. That was wrong,
+not architectural: both are real, reachable pre-commit steps
+(acknowledge_job_manually() / prepare_technician_dispatch() +
+confirm_whatsapp_dispatch(), both keyed by quo_pending_messages'
+message_id) -- they just weren't covered by derive_next_action()'s
+committed-job-only contract. derive_pending_message_next_action() below
+closes that gap. See tests/test_workflow_projection.py for the
+reachability proof.
 
 See docs/END_TO_END_WORKFLOW_AUDIT.md for the fuller architecture
 writeup this derives from.
@@ -68,6 +77,50 @@ def _technician_k_all_ambiguous(technician_k: dict) -> bool:
     return bool(candidates) and all(c.get("category") == "AMBIGUOUS" for c in candidates)
 
 
+def derive_pending_message_next_action(ctx: dict) -> WorkflowProjection:
+    """`ctx` keys (from operator_api._new_job_dto's shape -- see that
+    function for exactly how each is computed):
+
+      needs_review    -- bool, missing/conflicting required fields
+      k_required      -- bool, this source (AGN/Lucky) requires a "K"
+                          acknowledgment before dispatch (policy.py)
+      k_sent          -- bool, dispatch_tracking.acknowledged_at is set
+      eligible_count   -- int, how many technicians are eligible for
+                          this job's area/service (routing.py) -- 0
+                          means the system cannot safely suggest one
+      dispatched      -- bool, dispatch_tracking.dispatched_manually_at
+                          is set (in practice always False for anything
+                          this function is called on: a dispatched
+                          message is marked "actioned" and no longer
+                          appears in the live queue this data comes
+                          from -- kept as an explicit check for honesty,
+                          not because it's expected to ever be True here)
+
+    Precedence:
+      1. REVIEW_NEW_JOB -- needs_review: missing/conflicting fields, a
+         human must resolve before anything else is safe to decide.
+      2. ACK_COMPANY_K -- k_required and not k_sent.
+      3. HUMAN_REVIEW_NEEDED -- eligible_count == 0: no technician can
+         be safely suggested; never guessed.
+      4. SEND_JOB_TO_TECHNICIAN -- reviewed, K resolved (or not
+         required), a technician is eligible, not yet dispatched: ready
+         to prepare and confirm the WhatsApp handoff.
+      5. Fallback (dispatched already -- see the `dispatched` note
+         above): COMPLETE/terminal for *this* projection, meaning this
+         message has graduated into a committed job; the caller should
+         be using derive_next_action() for it instead by this point.
+    """
+    if ctx.get("needs_review"):
+        return WorkflowProjection("REVIEW_NEW_JOB", "Needs dispatcher review.", False, False)
+    if ctx.get("k_required") and not ctx.get("k_sent"):
+        return WorkflowProjection("ACK_COMPANY_K", "Company acknowledgment (K) required before dispatch.", False, False)
+    if not ctx.get("eligible_count"):
+        return WorkflowProjection("HUMAN_REVIEW_NEEDED", "No eligible technician found for this job's area/service.", True, False)
+    if not ctx.get("dispatched"):
+        return WorkflowProjection("SEND_JOB_TO_TECHNICIAN", "Ready to dispatch to technician.", False, False)
+    return WorkflowProjection("COMPLETE", "Already dispatched -- now tracked as a committed job.", False, True)
+
+
 def derive_next_action(ctx: dict) -> WorkflowProjection:
     """`ctx` keys (all optional except `status`):
 
@@ -99,9 +152,9 @@ def derive_next_action(ctx: dict) -> WorkflowProjection:
          later rung because none of them are safe to act on until a
          person resolves these.
       2. REVIEW_NEW_JOB -- status == "Needs Review".
-      3. (ACK_COMPANY_K -- see module docstring: unreachable here.)
+      3. (ACK_COMPANY_K -- pre-commit only; see derive_pending_message_next_action().)
       4. ASSIGN_TECHNICIAN -- Approved, no technician assigned yet.
-      5. (SEND_JOB_TO_TECHNICIAN -- see module docstring: unreachable here.)
+      5. (SEND_JOB_TO_TECHNICIAN -- pre-commit only; see derive_pending_message_next_action().)
       6. WAIT_TECHNICIAN_K -- Approved, technician assigned, no
          technician status update recorded yet (covers both "still
          waiting on the K reply" and, once K is confirmed accepted,

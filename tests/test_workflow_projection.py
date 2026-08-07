@@ -6,7 +6,7 @@ own test. See tests/test_operator_api.py for the route-level wiring
 
 from __future__ import annotations
 
-from dispatcher.workflow_projection import NEXT_ACTIONS, derive_next_action
+from dispatcher.workflow_projection import NEXT_ACTIONS, derive_next_action, derive_pending_message_next_action
 
 
 def ctx(**overrides):
@@ -169,11 +169,13 @@ def test_every_returned_next_action_is_in_the_fixed_vocabulary():
         assert r.next_action in NEXT_ACTIONS, f"{r.next_action!r} not in fixed vocabulary for {c}"
 
 
-def test_ack_company_k_and_send_job_to_technician_are_never_returned():
-    """Documented architectural fact, not an oversight -- see the
-    module docstring. This test pins that these two vocabulary values
-    are structurally unreachable for a committed job."""
-    unreachable = {"ACK_COMPANY_K", "SEND_JOB_TO_TECHNICIAN"}
+def test_ack_company_k_and_send_job_to_technician_never_returned_by_the_committed_job_function():
+    """ACK_COMPANY_K and SEND_JOB_TO_TECHNICIAN are real, reachable
+    steps -- just not through derive_next_action() (the committed-job
+    half). See derive_pending_message_next_action() below for where
+    they actually live, and the module docstring for why the lifecycle
+    is split this way."""
+    unreachable_here = {"ACK_COMPANY_K", "SEND_JOB_TO_TECHNICIAN"}
     scenarios = [
         ctx(status=s, technician_name=name, latest_technician_update=upd, closing=cl)
         for s in ("New", "Needs Review", "Approved", "Handle Manually", "In Progress", "Closed", "Cancelled", "Rejected")
@@ -182,4 +184,77 @@ def test_ack_company_k_and_send_job_to_technician_are_never_returned():
         for cl in (None, {"missing": [], "supported": True, "sent_confirmed": True})
     ]
     for c in scenarios:
-        assert derive_next_action(c).next_action not in unreachable
+        assert derive_next_action(c).next_action not in unreachable_here
+
+
+# ---------------------------------------- pending-message projection ------
+def pctx(**overrides):
+    base = {"needs_review": False, "k_required": False, "k_sent": False, "eligible_count": 1, "dispatched": False}
+    base.update(overrides)
+    return base
+
+
+def test_pending_needs_review_is_review_new_job():
+    r = derive_pending_message_next_action(pctx(needs_review=True))
+    assert r.next_action == "REVIEW_NEW_JOB"
+
+
+def test_pending_k_required_and_not_sent_is_ack_company_k():
+    r = derive_pending_message_next_action(pctx(k_required=True, k_sent=False))
+    assert r.next_action == "ACK_COMPANY_K"
+
+
+def test_ack_company_k_is_genuinely_reachable():
+    """The gap flagged in the prior report -- proven fixed, not just
+    asserted."""
+    r = derive_pending_message_next_action(pctx(k_required=True, k_sent=False))
+    assert r.next_action == "ACK_COMPANY_K"
+    assert r.human_review_needed is False
+    assert r.terminal is False
+
+
+def test_pending_k_required_but_already_sent_moves_past_ack():
+    r = derive_pending_message_next_action(pctx(k_required=True, k_sent=True))
+    assert r.next_action != "ACK_COMPANY_K"
+
+
+def test_pending_no_eligible_technician_is_human_review():
+    r = derive_pending_message_next_action(pctx(eligible_count=0))
+    assert r.next_action == "HUMAN_REVIEW_NEEDED"
+    assert r.human_review_needed is True
+
+
+def test_pending_reviewed_k_resolved_eligible_not_dispatched_is_send_job_to_technician():
+    r = derive_pending_message_next_action(pctx())
+    assert r.next_action == "SEND_JOB_TO_TECHNICIAN"
+
+
+def test_send_job_to_technician_is_genuinely_reachable():
+    """The other half of the gap flagged in the prior report -- proven
+    fixed, not just asserted."""
+    r = derive_pending_message_next_action(pctx(needs_review=False, k_required=False, eligible_count=2, dispatched=False))
+    assert r.next_action == "SEND_JOB_TO_TECHNICIAN"
+
+
+def test_pending_already_dispatched_is_terminal_for_this_projection():
+    r = derive_pending_message_next_action(pctx(dispatched=True))
+    assert r.terminal is True
+
+
+def test_pending_review_new_job_outranks_ack_company_k():
+    r = derive_pending_message_next_action(pctx(needs_review=True, k_required=True, k_sent=False))
+    assert r.next_action == "REVIEW_NEW_JOB"
+
+
+def test_pending_ack_company_k_outranks_no_eligible_technician():
+    r = derive_pending_message_next_action(pctx(k_required=True, k_sent=False, eligible_count=0))
+    assert r.next_action == "ACK_COMPANY_K"
+
+
+def test_pending_projection_next_actions_stay_in_the_fixed_vocabulary():
+    scenarios = [
+        pctx(needs_review=True), pctx(k_required=True, k_sent=False), pctx(eligible_count=0),
+        pctx(), pctx(dispatched=True),
+    ]
+    for c in scenarios:
+        assert derive_pending_message_next_action(c).next_action in NEXT_ACTIONS

@@ -81,7 +81,9 @@ from dispatcher.closing import ClosingInput, render_closing_from_persisted_field
 from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
-from dispatcher.workflow_projection import derive_next_action  # noqa: E402
+from dispatcher.workflow_projection import (  # noqa: E402
+    WorkflowProjection, derive_next_action, derive_pending_message_next_action,
+)
 
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
@@ -685,36 +687,96 @@ def _workflow_projection_dto(conn, service: DispatcherService, job: dict, all_jo
 
 
 # ============================================================ ACTION CENTER
-# The one operational "what needs a human right now" surface, grouped
-# purely from dispatcher.workflow_projection -- no section here computes
-# its own next-action signal. Two of the nine sections (new jobs to
-# review, company K owed) necessarily draw from the *pending message*
-# queue (route_new_jobs' own data), not the committed-job projection --
-# see workflow_projection's module docstring for exactly why REVIEW_NEW_JOB
-# (as "not yet a job at all") and ACK_COMPANY_K are pre-commit concepts
-# in this architecture. The other seven sections are 100% projection-driven.
+# The one operational "what needs a human right now" surface. Exactly
+# ten sections, each 100% derived from dispatcher.workflow_projection --
+# no section computes its own next-action signal. The first three draw
+# from the pre-commit pending-message projection
+# (derive_pending_message_next_action); the other seven draw from the
+# committed-job projection (derive_next_action). Both projections emit
+# the same normalized item shape via _normalize_action_center_item(), so
+# Action Center itself never branches on "message vs. job" business
+# logic -- only on which projection function produced the item.
 _ACTION_CENTER_SECTION_MAX = 5
 
-_ACTION_CENTER_JOB_SECTIONS = (
-    ("assign_technician", "ASSIGN_TECHNICIAN"),
-    ("waiting_technician_k", "WAIT_TECHNICIAN_K"),
-    ("technician_updates_to_review", "REVIEW_TECHNICIAN_UPDATE"),
-    ("company_updates_owed", "UPDATE_COMPANY"),
-    ("closings_to_review", "REVIEW_CLOSING"),
-    ("closings_ready_to_send", "SEND_CLOSING_TO_COMPANY"),
-    ("human_review_required", "HUMAN_REVIEW_NEEDED"),
+# (section_key, section_title, next_action_code) -- one row per one of
+# the ten required sections, in the required order.
+_ACTION_CENTER_SECTIONS = (
+    ("new_jobs_to_review", "New jobs to review", "REVIEW_NEW_JOB"),
+    ("company_k_owed", "Company K acknowledgments owed", "ACK_COMPANY_K"),
+    ("assign_technician", "Technician assignment required", "ASSIGN_TECHNICIAN"),
+    ("ready_to_dispatch", "Ready to send to technician", "SEND_JOB_TO_TECHNICIAN"),
+    ("waiting_technician_k", "Waiting for technician K", "WAIT_TECHNICIAN_K"),
+    ("technician_updates_to_review", "Technician updates to review", "REVIEW_TECHNICIAN_UPDATE"),
+    ("company_updates_owed", "Company updates owed", "UPDATE_COMPANY"),
+    ("closings_to_review", "Closings to review", "REVIEW_CLOSING"),
+    ("closings_ready_to_send", "Closings ready to send", "SEND_CLOSING_TO_COMPANY"),
+    ("human_review_required", "Human review required", "HUMAN_REVIEW_NEEDED"),
 )
+
+# Every action-generating next_action always resolves to exactly one
+# delivery mode in this build: a human copies text and explicitly
+# confirms it was sent -- there is no code path capable of an automatic
+# Quo or WhatsApp send, in demo mode or otherwise (see
+# adapters.DisabledQuoOutboundAdapter / ManualWhatsAppHandoffAdapter).
+# EXTERNAL_CONNECTOR_REQUIRED would apply once a sanctioned write API
+# exists; MOCK_DEMO_DELIVERY would apply if demo mode ever grew a
+# separate auto-confirm path (it deliberately hasn't -- see
+# docs/COMMERCIAL_READINESS.md's "human approval always required" line).
+_DELIVERY_MODE = "MANUAL COPY"
+
+
+def _normalize_action_center_item(
+    *, entity_type: str, entity_id, ticket: Optional[str], source: Optional[str],
+    technician: Optional[str], age_source: Optional[str], projection, destination: Optional[str], screen: str,
+) -> dict:
+    """The one normalized shape every Action Center item has, regardless
+    of whether it came from the pending-message projection or the
+    committed-job projection. `age_source` is either an ISO timestamp
+    (job items) or a pre-computed minutes-ago string (message items,
+    which only ever carry an age in minutes, not a timestamp) -- the
+    frontend's ageText()/minutesSince() helpers already handle both."""
+    return {
+        "entity_type": entity_type, "entity_id": entity_id, "ticket": ticket, "source": source,
+        "technician": technician, "stage": projection.next_action, "next_action": projection.next_action,
+        "blocking_reason": projection.blocking_reason, "age": age_source,
+        "human_review_needed": projection.human_review_needed, "destination": destination,
+        "delivery_mode": _DELIVERY_MODE, "screen": screen,
+        # Back-compat aliases for the current frontend (operator_ui_v2_connected/js/app.js
+        # reads "id"/"kind"/"waiting_since"/"age_minutes" today) -- both the
+        # normalized and legacy names are populated from the same values,
+        # not computed twice.
+        "id": entity_id, "kind": "job" if entity_type == "JOB" else "message",
+        "waiting_since": age_source if entity_type == "JOB" else None,
+        "age_minutes": age_source if entity_type == "INCOMING_MESSAGE" else None,
+    }
 
 
 def _action_center_job_item(conn, service: DispatcherService, job: dict, all_jobs: list) -> dict:
     job = dict(job)
     job["latest_technician_update"] = rm.get_latest_technician_update(conn, job["id"])
     projection = derive_next_action(_build_workflow_context(conn, service, job, all_jobs))
-    return {
-        "id": job["id"], "kind": "job", "ticket": job["ticket_number"], "source": job["source"],
-        "technician_name": job.get("assigned_technician_name"), "waiting_since": job.get("last_event_at") or job.get("updated_at"),
-        "blocking_reason": projection.blocking_reason, "next_action": projection.next_action, "screen": "active",
+    return _normalize_action_center_item(
+        entity_type="JOB", entity_id=job["id"], ticket=job["ticket_number"], source=job["source"],
+        technician=job.get("assigned_technician_name"), age_source=job.get("last_event_at") or job.get("updated_at"),
+        projection=projection, destination=job.get("assigned_technician_dispatch_group"), screen="active",
+    )
+
+
+def _action_center_message_item(d: dict) -> dict:
+    ctx = {
+        "needs_review": d["needs_review"], "k_required": d["k_required"], "k_sent": d["k_sent"],
+        "eligible_count": d["eligible_count"], "dispatched": d["dispatched"],
     }
+    projection = derive_pending_message_next_action(ctx)
+    if d["review_problems"] and projection.next_action == "REVIEW_NEW_JOB":
+        projection = WorkflowProjection(
+            projection.next_action, "; ".join(d["review_problems"]), projection.human_review_needed, projection.terminal,
+        )
+    return _normalize_action_center_item(
+        entity_type="INCOMING_MESSAGE", entity_id=d["message_id"], ticket=d["ticket"], source=d["source"],
+        technician=d.get("technician_name"), age_source=d["age_minutes"],
+        projection=projection, destination=d.get("destination"), screen="jobs",
+    )
 
 
 def route_action_center(handler: "Handler", match: dict, body: dict) -> dict:
@@ -724,50 +786,20 @@ def route_action_center(handler: "Handler", match: dict, body: dict) -> dict:
         all_jobs = shared.fetch_jobs(conn)
         non_terminal = [j for j in all_jobs if j["status"] not in ("Cancelled", "Rejected")]
 
-        by_next_action: dict = {code: [] for _, code in _ACTION_CENTER_JOB_SECTIONS}
+        by_next_action: dict = {}
         for j in non_terminal:
             item = _action_center_job_item(conn, service, j, non_terminal)
             by_next_action.setdefault(item["next_action"], []).append(item)
 
         live, _backlog, _other = rm.get_live_dispatch_queue(conn)
-        new_job_dtos = [_new_job_dto(conn, e) for e in live]
-        new_jobs_to_review = [d for d in new_job_dtos if d["needs_review"]]
-        company_k_owed = [d for d in new_job_dtos if d["k_required"] and not d["k_sent"]]
-        # "Ready for technician dispatch" is a pending-message concept too
-        # in this architecture (see workflow_projection's module docstring
-        # for why SEND_JOB_TO_TECHNICIAN can never fire for an
-        # already-committed job -- dispatch and job-creation are the same
-        # action here): reviewed, K resolved, not yet dispatched.
-        ready_for_dispatch = [
-            d for d in new_job_dtos
-            if not d["needs_review"] and not (d["k_required"] and not d["k_sent"]) and not d["dispatched"]
-        ]
+        for d in (_new_job_dto(conn, e) for e in live):
+            item = _action_center_message_item(d)
+            by_next_action.setdefault(item["next_action"], []).append(item)
 
-        def new_job_item(d: dict, reason: Optional[str] = None) -> dict:
-            return {
-                "id": d["message_id"], "kind": "message", "ticket": d["ticket"], "source": d["source"],
-                "technician_name": None, "age_minutes": d["age_minutes"],
-                "blocking_reason": reason if reason is not None else ("; ".join(d["review_problems"]) if d["review_problems"] else None),
-                "next_action": "REVIEW_NEW_JOB", "screen": "jobs",
-            }
-
-        sections = {
-            "new_jobs_to_review": {
-                "items": [new_job_item(d) for d in new_jobs_to_review[:_ACTION_CENTER_SECTION_MAX]],
-                "total": len(new_jobs_to_review),
-            },
-            "company_k_owed": {
-                "items": [new_job_item(d, "Company K acknowledgment required.") for d in company_k_owed[:_ACTION_CENTER_SECTION_MAX]],
-                "total": len(company_k_owed),
-            },
-            "ready_for_dispatch": {
-                "items": [new_job_item(d, "Ready to dispatch to technician.") for d in ready_for_dispatch[:_ACTION_CENTER_SECTION_MAX]],
-                "total": len(ready_for_dispatch),
-            },
-        }
-        for section_key, next_action_code in _ACTION_CENTER_JOB_SECTIONS:
+        sections = {}
+        for section_key, title, next_action_code in _ACTION_CENTER_SECTIONS:
             items = by_next_action.get(next_action_code, [])
-            sections[section_key] = {"items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
+            sections[section_key] = {"title": title, "items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
         return {"sections": sections}
     finally:
         conn.close()
