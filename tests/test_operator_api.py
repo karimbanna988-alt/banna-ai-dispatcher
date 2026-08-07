@@ -1294,6 +1294,69 @@ def test_action_center_normalized_item_schema_fields(api_env):
     assert item["delivery_mode"] == "MANUAL COPY"
 
 
+def test_route_active_technician_k_uses_the_pending_observations_passed_in(api_env):
+    """route_active fetches whatsapp_pending_observations once per
+    request and hands the same list into _technician_k_dto for every
+    job (operator_api.py's route_active), instead of each job
+    re-querying the table itself. Proves that wiring is actually
+    honored -- an observation seeded before the call is still reflected
+    in the per-job technician_k candidates, not silently dropped by
+    passing the list through an extra parameter. Same fixture pattern as
+    test_technician_k_waiting_surfaces_a_strong_candidate above."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_bridge_observation(message_id="wa-obs-1")
+    entries = api.route_active(None, {}, {})["entries"]
+    entry = next(e for e in entries if e["id"] == job_id)
+    assert entry["technician_k"] is not None
+    assert entry["technician_k"]["status"] == "waiting"
+    assert any(c["message_id"] == "wa-obs-1" for c in entry["technician_k"]["candidates"])
+
+
+def test_route_active_and_action_center_stay_fast_at_moderate_synthetic_volume(api_env):
+    """Regression bound for the N+1 fix in route_active/route_action_center
+    (operator_api.py: technician_k/company_update_owed are now computed
+    once per job instead of twice, and whatsapp_pending_observations is
+    fetched once per request instead of once per job). 50 synthetic jobs,
+    bulk-inserted directly (never through the real pipeline, purely to
+    get volume quickly) -- generous enough not to flake on a slow CI
+    machine, tight enough to catch a regression back to per-job
+    quadratic-ish behavior."""
+    conn = storage.connect(api_env)
+    try:
+        tech_id = storage.add_technician(
+            conn, name="Perf Regression Tech", areas=["Charlotte"], skills=["car lockout"],
+            dispatch_group="Perf Dispatch", closing_group="Perf Closings",
+        )
+        now = storage._now()
+        for i in range(50):
+            fields = json.dumps({"city": "Charlotte", "state": "NC", "service_type": "Car Lockout", "phone": "1-555-000-0000"})
+            cur = conn.execute(
+                "INSERT INTO events (job_id, ticket_number, raw_message, message_type, source, luxor_message, "
+                "final_action, created_at, channel, schema_version) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"PERFREG{i}", "synthetic perf regression fixture", "NEW", "AGN", "synthetic", "Approve", now, "manual", 3),
+            )
+            event_id = cur.lastrowid
+            job_cur = conn.execute(
+                "INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at, status, "
+                "last_event_id, last_event_at, assigned_technician_id, reconciliation_state) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (f"PERFREG{i}", "AGN", fields, now, now, "Approved", event_id, now, tech_id, None),
+            )
+            conn.execute("UPDATE events SET job_id = ? WHERE id = ?", (job_cur.lastrowid, event_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    t0 = time.perf_counter()
+    api.route_active(None, {}, {})
+    active_ms = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+    api.route_action_center(None, {}, {})
+    action_center_ms = (time.perf_counter() - t0) * 1000
+
+    assert active_ms < 500, f"route_active took {active_ms:.1f}ms for 50 synthetic jobs -- regression suspected"
+    assert action_center_ms < 500, f"route_action_center took {action_center_ms:.1f}ms for 50 synthetic jobs -- regression suspected"
+
+
 def test_action_center_never_touches_quo_or_whatsapp_adapters():
     import inspect
     src = inspect.getsource(api.route_action_center)
