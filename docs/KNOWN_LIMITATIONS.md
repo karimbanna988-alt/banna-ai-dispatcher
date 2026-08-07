@@ -19,18 +19,25 @@ single place to check.
   `whatsapp_shadow_bridge/test/no-send-static-check.test.js`, not just
   a policy.
 
-## Technician acceptance ("K") is not tracked
+## Technician acceptance ("K") tracking — human-confirmed, not auto-accepted
 
-There is no schema concept anywhere of "the technician accepted this
-job." A bare "K"/"ok"/"👍" reply captured by the WhatsApp bridge is
-explicitly flagged for human review rather than auto-interpreted as
-acceptance (`whatsapp_bridge_adapter.py`'s `_ACKNOWLEDGEMENT_ONLY_TEXTS`
-handling). A dispatcher must read the WhatsApp Pending queue and
-manually confirm a technician accepted a job — nothing in the product
-tracks or gates on this today. See
-`docs/END_TO_END_WORKFLOW_AUDIT.md` step 6. Building deterministic
-match evidence (allowlisted group, quoted-message ID, ticket/PDL,
-timestamp proximity, confidence category) is scoped, not started.
+**Corrected this pass** — this section previously described a
+pre-tracking state that no longer reflects the product; left uncorrected
+it would understate what exists today.
+
+A `technician_acceptance` table (job-keyed) does track accepted/declined
+state, and `dispatcher.technician_ack.classify_candidates()` classifies
+each captured WhatsApp reply against a job as EXACT / STRONG / AMBIGUOUS
+/ UNMATCHED (group-name match, ticket match, acknowledgment/decline
+text vocabulary — see that module for the exact rules). What remains a
+deliberate limitation, not a gap: **no reply is ever auto-accepted**. A
+bare "K"/"ok"/"👍" is surfaced as a candidate the dispatcher must
+explicitly confirm (`route_technician_k_confirm_accepted`/
+`_confirm_declined`, wired to "Confirm technician accepted"/"declined"
+buttons in the Active job detail) — even an EXACT-category match still
+requires a human click, by design (see the absolute safety rule against
+removing human approval). AMBIGUOUS candidates additionally show their
+specific reasons so the dispatcher can judge them, rather than guessing.
 
 ## Human review requirement
 
@@ -139,3 +146,23 @@ environment — unconditionally, not gated behind `if __name__ ==
 environment can trigger this. See `docs/OPERATIONS_RUNBOOK.md`'s
 "Known operational risk" section for the specifics and the incident
 that surfaced this during this sprint.
+
+## Global search scope (added this sprint)
+
+`GET /api/search` covers committed jobs (any status) and still-pending
+incoming messages — ticket, source, technician, city, service only, no
+customer name/phone/address. Selecting a result for a `Closed`+`Settled`
+or `Cancelled`/`Rejected` job navigates to the Completed/History screen
+but does not yet pre-select that specific row there (no per-job
+selection API exists for that screen yet) — every other case (Active,
+Closings, still-pending Jobs) does pre-select. A minor, disclosed gap,
+not a defect.
+
+## Technician mapping completeness (found this sprint, not fixed)
+
+A `python tools/system_readiness.py` run against the real database
+found 12 of 15 active technicians missing a `dispatch_group` and/or
+`closing_group` — the WhatsApp destinations a dispatch/closing gets
+copied to. Not modified (this is real configuration data, not
+something to alter without the owner). Confirm every technician who
+will receive real dispatches during a pilot has both configured.

@@ -139,3 +139,18 @@ against — nothing here is a vague aspiration.
       volume (see `docs/WORKFLOW_SPEED_AUDIT.md`); no new infrastructure
       (cache, queue, etc.) was added, so no new operational dependency
       needs to be understood or monitored for this pilot.
+
+## Operator Speed Round 2 — relevant to this checklist
+
+- [ ] Run `python tools/system_readiness.py` before a pilot goes live —
+      it now checks technician dispatch/closing-group mappings and
+      service-area configuration in addition to its prior checks, and a
+      run against the real database during this round found 12 of 15
+      active technicians missing a dispatch_group and/or closing_group.
+      Confirm every technician who will actually receive real dispatches
+      during the pilot has both configured before relying on them.
+- [ ] Global search and "Next actionable job" are read-only navigation
+      aids — neither can mutate a job, so there is nothing new to train
+      operators to avoid; both are safe to introduce mid-pilot.
+- [ ] No new external dependency was added for search (`GET /api/search`
+      queries the existing SQLite database only).

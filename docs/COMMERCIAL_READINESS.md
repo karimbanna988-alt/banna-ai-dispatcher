@@ -404,3 +404,25 @@ real and tested; this sprint made using them faster, not fundamentally
 different in kind. A real, evidenced reload-loses-CSRF-token bug
 (category 13, user authentication) was also found and fixed in the same
 sprint — see `docs/SECURITY_AUDIT.md` finding #5's update.
+
+## Addendum 2 — Operator Speed Round 2 (search, Next Actionable Job, performance)
+
+Category 4 gained a global search (ticket/source/technician/city/service,
+opens directly into a job's Fast Path context) and a "Next actionable
+job" control (jumps to the highest-priority Action Center item without
+manual scanning) — both quantified separately from Scenario A's
+baseline in `docs/WORKFLOW_SPEED_AUDIT.md` (a -53.8% and -85.7% modeled
+reduction respectively for the specific cross-job tasks they target;
+Scenario A's own score is honestly reported as unchanged this round —
+no further single-job friction was found that doesn't fabricate data or
+remove a real approval). `route_action_center`/`route_active` latency
+improved further (-33.6%/-59.6% vs the original pre-sprint baseline) by
+fixing a genuine O(n^2) algorithmic issue, not by adding caching or new
+infrastructure. Category 1 (core dispatch workflow) status is unaffected
+— these are speed and findability improvements over already-real
+mechanics. `tools/system_readiness.py` (category 14, monitoring and
+diagnostics) gained real technician-mapping, service-area, Quo/WhatsApp
+structural, bind-address, and demo-isolation checks; a run against the
+real database surfaced a genuine, previously-undocumented gap: 12 of 15
+active technicians are missing a dispatch_group and/or closing_group —
+worth the owner's attention before a pilot depends on those technicians.
