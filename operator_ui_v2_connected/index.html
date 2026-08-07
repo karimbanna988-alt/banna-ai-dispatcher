@@ -35,9 +35,14 @@
     LUXOR
     <span class="header-date" id="headerDateContext"></span>
   </div>
+  <div class="header-search-wrap">
+    <input type="text" id="globalSearchInput" class="header-search-input" placeholder="Search ticket, technician, city... ( / )" autocomplete="off">
+    <div class="header-search-results" id="globalSearchResults" style="display:none;"></div>
+  </div>
   <div class="header-actions">
     <span class="status-dot" id="headerStatusDot"></span>
     <span class="status-text" id="headerStatusText">Connected -- real data · manual WhatsApp bridge</span>
+    <button class="icon-btn mobile-search-btn" id="mobileSearchBtn" title="Search">&#128269;</button>
     <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>
     <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
   </div>

@@ -358,14 +358,21 @@ function renderActionCenterScreen(groups) {
       </div>`;
   }).join("");
   root.querySelectorAll("[data-acscreen]").forEach(btn => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const targetScreen = btn.dataset.acscreen;
       const kind = btn.dataset.ackind;
       const id = btn.dataset.acid;
       setScreen(targetScreen);
-      if (kind === "job" && targetScreen === "active") {
-        setTimeout(() => selectActive(parseInt(id, 10)), 0);
-      }
+      // Explicit await, not setTimeout(0) racing setScreen's own
+      // fire-and-forget refreshAll() -- that race was real: refreshAll's
+      // load can finish after the timeout and silently overwrite this
+      // selection with its own default-first-job fallback. Found and
+      // fixed while building global search's equivalent open-result flow.
+      // A job's own "screen" (operator_api.py's _job_target_screen) can
+      // now be active/closings/history depending on its real status --
+      // "Open" must land wherever the job actually lives, not always Active.
+      if (kind === "job" && targetScreen === "active") { await loadActive(); selectActive(parseInt(id, 10)); }
+      else if (kind === "job" && targetScreen === "closings") { await loadClosings(); selectClosing(parseInt(id, 10)); }
     });
   });
 }
@@ -2098,14 +2105,120 @@ function perfBossViewHtml(dash) {
     <div class="detail-meta">Data trustworthy enough? <strong>${dash.summary.jobs_received.data_quality === "insufficient_data" ? "Not yet -- too little history" : "Reasonable for the KPIs marked Good above"}</strong></div>`;
 }
 
+/* ============================================================== SEARCH ===
+   One global search box (desktop: persistent in the header; mobile: a
+   search icon opens it as a full-width overlay). Read-only -- selecting
+   a result only navigates and pre-selects, it never mutates anything.
+   No PII (phone/address/customer name) is requested or rendered here;
+   /api/search itself never returns those fields. */
+const searchState = { results: [], activeIndex: -1, debounceTimer: null };
+
+function searchResultRowHtml(r, i) {
+  const label = `#${esc(r.ticket || "No ref")}`;
+  const age = r.entity_type === "INCOMING_MESSAGE"
+    ? (r.age != null ? ageText(r.age) : "")
+    : (r.age ? ageText(minutesSince(r.age)) : "");
+  return `
+    <div class="header-search-row ${i === searchState.activeIndex ? "active" : ""}" data-idx="${i}">
+      <span class="hs-ticket">${label}</span>
+      <span class="hs-meta">${esc(r.source || "")}${r.technician ? " &middot; " + esc(r.technician) : ""} &middot; ${esc(r.next_action || r.stage || "")}</span>
+      <span class="hs-age">${esc(age)}</span>
+    </div>`;
+}
+
+function renderSearchResults() {
+  const wrap = document.querySelector(".header-search-wrap.mobile-open") || document.querySelector(".header-search-wrap");
+  const panel = wrap.querySelector(".header-search-results");
+  const input = document.getElementById("globalSearchInput");
+  const hasQuery = input.value.trim().length >= 2;
+  if (!searchState.results.length) {
+    panel.innerHTML = hasQuery ? `<div class="header-search-empty">No matches.</div>` : "";
+    panel.style.display = hasQuery ? "block" : "none";
+    return;
+  }
+  panel.innerHTML = searchState.results.map((r, i) => searchResultRowHtml(r, i)).join("");
+  panel.style.display = "block";
+  panel.querySelectorAll("[data-idx]").forEach(row => {
+    row.addEventListener("click", () => openSearchResult(parseInt(row.dataset.idx, 10)));
+  });
+}
+
+async function runSearch(q) {
+  if (q.trim().length < 2) { searchState.results = []; renderSearchResults(); return; }
+  const data = await callOrHandleAuth(() => Api.search(q.trim()));
+  if (!data) return;
+  searchState.results = data.results;
+  searchState.activeIndex = -1;
+  renderSearchResults();
+}
+
+async function openSearchResult(idx) {
+  const r = searchState.results[idx];
+  if (!r) return;
+  closeSearchResults();
+  closeMobileSearch();
+  setScreen(r.screen);
+  // Deliberately awaits its own explicit load rather than racing
+  // setScreen's fire-and-forget refreshAll() with a setTimeout(0) --
+  // that race is real (refreshAll's own load can finish after the
+  // timeout and overwrite the selection with its own default fallback).
+  // "history" has no per-job selection API yet, so that one case only
+  // gets the screen change (still far faster than manually filtering a
+  // completed-jobs table).
+  if (r.entity_type === "JOB") {
+    if (r.screen === "active") { await loadActive(); selectActive(r.entity_id); }
+    else if (r.screen === "closings") { await loadClosings(); selectClosing(r.entity_id); }
+  } else if (r.entity_type === "INCOMING_MESSAGE") {
+    await loadJobs(); selectJob(r.entity_id);
+  }
+}
+
+function closeSearchResults() {
+  document.querySelectorAll(".header-search-results").forEach(p => { p.style.display = "none"; p.innerHTML = ""; });
+  searchState.results = [];
+  searchState.activeIndex = -1;
+}
+
+function openMobileSearch() {
+  document.querySelector(".header-search-wrap").classList.add("mobile-open");
+  document.getElementById("globalSearchInput").focus();
+}
+function closeMobileSearch() {
+  document.querySelector(".header-search-wrap").classList.remove("mobile-open");
+}
+
+document.getElementById("globalSearchInput").addEventListener("input", (e) => {
+  clearTimeout(searchState.debounceTimer);
+  const q = e.target.value;
+  searchState.debounceTimer = setTimeout(() => runSearch(q), 200);
+});
+document.getElementById("globalSearchInput").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); searchState.activeIndex = Math.min(searchState.results.length - 1, searchState.activeIndex + 1); renderSearchResults(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); searchState.activeIndex = Math.max(0, searchState.activeIndex - 1); renderSearchResults(); }
+  else if (e.key === "Enter") {
+    if (searchState.activeIndex >= 0) openSearchResult(searchState.activeIndex);
+    else if (searchState.results.length === 1) openSearchResult(0);
+  } else if (e.key === "Escape") {
+    closeSearchResults(); e.target.blur(); closeMobileSearch();
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".header-search-wrap")) closeSearchResults();
+});
+document.getElementById("mobileSearchBtn").addEventListener("click", () => {
+  const wrap = document.querySelector(".header-search-wrap");
+  if (wrap.classList.contains("mobile-open")) closeMobileSearch(); else openMobileSearch();
+});
+
 /* ============================================================ KEYBOARD ===
    Safe, low-risk shortcuts only -- a desktop enhancement, never required
    (mobile has no keyboard and must stay fully usable without any of
    this). Explicitly NOT bound to a key: mark sent, assign technician,
    accept/decline technician, closing confirmation, complete, or any
    other external/irreversible action -- those stay click-only, always.
-   "/" (focus search) is intentionally not bound yet -- there is no
-   global search feature built in this version to focus. */
+   "/" focuses the search box; it never mutates anything, so it's safe
+   even though search itself was added after this comment was first
+   written for a version with no search feature. */
 function _currentListAndSelection() {
   if (state.screen === "jobs") return { list: newJobsLive, key: "message_id", selected: state.jobsSelected, select: selectJob };
   if (state.screen === "active") return { list: activeJobs, key: "id", selected: state.activeSelected, select: selectActive };
@@ -2136,10 +2249,15 @@ function _copyShortcutTarget() {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { closeSheet(); hideConfirmModal(); return; }
+  if (e.key === "Escape") { closeSheet(); hideConfirmModal(); closeSearchResults(); closeMobileSearch(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return; // never fight the browser's/OS's own shortcuts
   const tag = (document.activeElement && document.activeElement.tagName) || "";
   const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (document.activeElement && document.activeElement.isContentEditable);
+  if (e.key === "/" && !typing) {
+    e.preventDefault();
+    if (isMobile()) openMobileSearch(); else document.getElementById("globalSearchInput").focus();
+    return;
+  }
   if (typing) return;
   if (e.key === "j" || e.key === "J") { e.preventDefault(); _moveSelection(1); }
   else if (e.key === "k" || e.key === "K") { e.preventDefault(); _moveSelection(-1); }

@@ -65,6 +65,11 @@ const Api = {
   },
 
   getActionCenter() { return this._call("GET", "/api/action_center"); },
+  getNextActionableJob(excludeEntityId) {
+    const qs = excludeEntityId != null ? `?exclude_entity_id=${encodeURIComponent(excludeEntityId)}` : "";
+    return this._call("GET", `/api/next_actionable_job${qs}`);
+  },
+  search(q) { return this._call("GET", `/api/search?q=${encodeURIComponent(q)}`); },
 
   getNewJobs() { return this._call("GET", "/api/new_jobs"); },
   sync() { return this._call("POST", "/api/sync", {}); },

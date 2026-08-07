@@ -1280,6 +1280,26 @@ def test_action_center_group_ordering_is_deterministic_oldest_urgent_first(api_e
     assert ids_in_order.index(old_result["job_id"]) < ids_in_order.index(new_result["job_id"])
 
 
+def test_action_center_job_screen_routes_a_closing_stage_job_to_closings_not_active(api_env):
+    """Regression: _action_center_job_item used to hardcode screen="active"
+    for every job regardless of its real stage, so clicking "Open" on a
+    closings_to_review/closings_ready_to_send item sent the operator to
+    the Active screen, where a Closed job never appears at all (Active
+    only covers ACTIVE_JOB_WORKSPACE_STATUSES). Found while wiring global
+    search's own (correct) screen resolution and fixed via the same
+    shared _job_target_screen helper."""
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        conn.execute("UPDATE jobs SET status = 'Closed' WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    result = api.route_action_center(None, {}, {})
+    item = next(i for i in result["sections"]["closings_to_review"]["items"] if i["id"] == job_id)
+    assert item["screen"] == "closings"
+
+
 def test_action_center_lists_a_job_missing_technician_assignment(api_env):
     job_id = _seed_active_job(api_env)  # no technician assigned
     result = api.route_action_center(None, {}, {})
@@ -1467,6 +1487,154 @@ def test_route_active_and_action_center_stay_fast_at_moderate_synthetic_volume(a
 def test_action_center_never_touches_quo_or_whatsapp_adapters():
     import inspect
     src = inspect.getsource(api.route_action_center)
+    assert "quo_adapter" not in src
+    assert "whatsapp_adapter" not in src
+
+
+# ======================================================= GLOBAL SEARCH =====
+def test_search_finds_a_committed_job_by_ticket(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    result = api.route_search(None, {}, {"q": "A200"})
+    assert any(r["entity_id"] == job_id and r["entity_type"] == "JOB" for r in result["results"])
+
+
+def test_search_finds_a_job_by_technician_name(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    result = api.route_search(None, {}, {"q": "fabricated tech"})
+    assert any(r["entity_id"] == job_id for r in result["results"])
+
+
+def test_search_finds_a_job_by_city(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    result = api.route_search(None, {}, {"q": "charlotte"})
+    assert any(r["entity_id"] == job_id for r in result["results"])
+
+
+def test_search_finds_an_uncommitted_pending_message(api_env):
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A801"))
+    result = api.route_search(None, {}, {"q": "A801"})
+    assert any(r["entity_type"] == "INCOMING_MESSAGE" and r["ticket"] == "A801" for r in result["results"])
+
+
+def test_search_result_screen_routes_a_closed_unsettled_job_to_closings(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        conn.execute("UPDATE jobs SET status = 'Closed' WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    result = api.route_search(None, {}, {"q": "A200"})
+    match = next(r for r in result["results"] if r["entity_id"] == job_id)
+    assert match["screen"] == "closings"
+
+
+def test_search_result_screen_routes_a_settled_job_to_history(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        conn.execute("UPDATE jobs SET status = 'Closed', reconciliation_state = 'Settled' WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    result = api.route_search(None, {}, {"q": "A200"})
+    match = next(r for r in result["results"] if r["entity_id"] == job_id)
+    assert match["screen"] == "history"
+
+
+def test_search_never_returns_phone_or_address(api_env):
+    _seed_active_job_with_technician(api_env)
+    result = api.route_search(None, {}, {"q": "charlotte"})
+    combined = json.dumps(result)
+    assert "phone" not in combined.lower()
+    assert "555-010" not in combined
+
+
+def test_search_requires_a_minimum_query_length(api_env):
+    _seed_active_job_with_technician(api_env)
+    result = api.route_search(None, {}, {"q": "a"})
+    assert result["results"] == []
+
+
+def test_search_caps_results_and_reports_truncation(api_env):
+    from dispatcher.rules.service_areas import load_service_areas
+    tech_id = add_configured_technician(api_env)
+    seed_live_boundary(api_env)
+    for i in range(25):
+        seed_pending(api_env, f"m{i}", agn_message(f"A{i:03d}"))
+        api.route_acknowledge(None, {"message_id": f"m{i}"}, {})
+        api.route_prepare_dispatch(None, {"message_id": f"m{i}"}, {})
+        job_id = api.route_confirm_dispatch(None, {"message_id": f"m{i}"}, {})["job_id"]
+        conn = storage.connect(api_env)
+        try:
+            storage.assign_technician(conn, job_id, tech_id, load_service_areas())
+        finally:
+            conn.close()
+    result = api.route_search(None, {}, {"q": "agn"})
+    assert len(result["results"]) == api._SEARCH_RESULT_MAX
+    assert result["truncated"] is True
+
+
+def test_search_never_touches_quo_or_whatsapp_adapters():
+    import inspect
+    src = inspect.getsource(api.route_search)
+    assert "quo_adapter" not in src
+    assert "whatsapp_adapter" not in src
+
+
+# ================================================= NEXT ACTIONABLE JOB =====
+def test_next_actionable_job_matches_action_center_top_item(api_env):
+    job_id = _seed_active_job(api_env)  # no technician -> assign_technician, an ACTION NOW item
+    ac = api.route_action_center(None, {}, {})
+    top = ac["groups"][0]["items"][0] if ac["groups"][0]["key"] == "action_now" else None
+    assert top is not None
+    result = api.route_next_actionable_job(None, {}, {})
+    assert result["found"] is True
+    assert result["item"]["entity_id"] == top["entity_id"]
+
+
+def test_next_actionable_job_skips_waiting_items(api_env):
+    """A job only waiting on a technician's K reply must never be
+    offered as the "next actionable job" -- there is nothing for the
+    operator to actually do about it yet."""
+    _seed_active_job_with_technician(api_env)  # -> waiting_technician_k only
+    result = api.route_next_actionable_job(None, {}, {})
+    assert result["found"] is False
+
+
+def test_next_actionable_job_surfaces_human_review_when_it_is_the_only_thing(api_env):
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A810"))
+    handled = api.route_handle_manually(None, {"message_id": "m1"}, {})
+    result = api.route_next_actionable_job(None, {}, {})
+    assert result["found"] is True
+    assert result["item"]["entity_id"] == handled["job_id"]
+
+
+def test_next_actionable_job_respects_exclude_entity_id(api_env):
+    job_id = _seed_active_job(api_env)
+    result = api.route_next_actionable_job(None, {}, {"exclude_entity_id": str(job_id)})
+    assert result["found"] is False
+
+
+def test_next_actionable_job_never_mutates_anything(api_env):
+    """A pure read -- calling it twice in a row must never change the
+    job's state (no acceptance/decline/sent/complete triggered)."""
+    job_id = _seed_active_job(api_env)
+    api.route_next_actionable_job(None, {}, {})
+    api.route_next_actionable_job(None, {}, {})
+    conn = storage.connect(api_env)
+    try:
+        job = storage.get_job_by_id(conn, job_id)
+    finally:
+        conn.close()
+    assert job["status"] == "Approved"
+
+
+def test_next_actionable_job_never_touches_quo_or_whatsapp_adapters():
+    import inspect
+    src = inspect.getsource(api.route_next_actionable_job)
     assert "quo_adapter" not in src
     assert "whatsapp_adapter" not in src
 

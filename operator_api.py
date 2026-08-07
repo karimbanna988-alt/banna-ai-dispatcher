@@ -908,6 +908,22 @@ def _normalize_action_center_item(
     }
 
 
+def _job_target_screen(job: dict) -> str:
+    """Which screen a job's own detail actually lives on -- Active only
+    covers ACTIVE_JOB_WORKSPACE_STATUSES (New/Approved/In Progress/Needs
+    Review); a Closed-but-unsettled job lives on Closings, and a
+    Closed+Settled/Cancelled/Rejected job only appears on the Completed
+    (history) screen. Shared by Action Center and search so "Open"/a
+    search result always lands somewhere the job is actually listed,
+    instead of silently landing on a screen where it can't be found."""
+    status = job.get("status")
+    if status in ("Cancelled", "Rejected"):
+        return "history"
+    if status == "Closed":
+        return "history" if job.get("reconciliation_state") == "Settled" else "closings"
+    return "active"
+
+
 def _action_center_job_item(
     conn, service: DispatcherService, job: dict, all_jobs: list, pending_observations: Optional[list] = None,
 ) -> dict:
@@ -919,7 +935,7 @@ def _action_center_job_item(
     return _normalize_action_center_item(
         entity_type="JOB", entity_id=job["id"], ticket=job["ticket_number"], source=job["source"],
         technician=job.get("assigned_technician_name"), age_source=job.get("last_event_at") or job.get("updated_at"),
-        projection=projection, destination=job.get("assigned_technician_dispatch_group"), screen="active",
+        projection=projection, destination=job.get("assigned_technician_dispatch_group"), screen=_job_target_screen(job),
     )
 
 
@@ -940,52 +956,160 @@ def _action_center_message_item(d: dict) -> dict:
     )
 
 
+def _compute_action_center(conn) -> dict:
+    """The one place Action Center's sections/groups are computed --
+    route_action_center and route_next_actionable_job both call this
+    rather than each running their own independent pass, so "what's
+    next" always agrees with what the Action Center screen itself
+    shows."""
+    service = _service(conn)
+    all_jobs = shared.fetch_jobs(conn)
+    non_terminal = [j for j in all_jobs if j["status"] not in ("Cancelled", "Rejected")]
+    # See route_active's identical comment: fetched once for the
+    # whole request rather than once per job inside the loop below.
+    pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+
+    by_next_action: dict = {}
+    for j in non_terminal:
+        item = _action_center_job_item(conn, service, j, non_terminal, pending_observations)
+        by_next_action.setdefault(item["next_action"], []).append(item)
+
+    live, _backlog, _other = rm.get_live_dispatch_queue(conn)
+    for d in (_new_job_dto(conn, e) for e in live):
+        item = _action_center_message_item(d)
+        by_next_action.setdefault(item["next_action"], []).append(item)
+
+    sections = {}
+    for section_key, title, next_action_code in _ACTION_CENTER_SECTIONS:
+        items = by_next_action.get(next_action_code, [])
+        sections[section_key] = {"title": title, "items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
+
+    groups = []
+    for group_key, group_title, section_keys in _ACTION_CENTER_GROUPS:
+        group_items = [
+            item for sk in section_keys for item in by_next_action.get(_SECTION_NEXT_ACTION[sk], [])
+        ]
+        # Deterministic ordering only: priority bucket rank first
+        # (URGENT before DUE before NORMAL before WAITING), then
+        # oldest first within the same bucket. No AI ranking, no
+        # decimal score -- ties are broken by insertion order, which
+        # is itself deterministic (section order, then discovery
+        # order within a section).
+        group_items.sort(key=lambda i: (
+            _PRIORITY_RANK.get(i["priority"], 2),
+            -(_item_age_minutes(i["entity_type"], i["age"]) or 0),
+        ))
+        groups.append({
+            "key": group_key, "title": group_title,
+            "items": group_items[:_ACTION_CENTER_GROUP_MAX], "total": len(group_items),
+        })
+
+    return {"sections": sections, "groups": groups}
+
+
 def route_action_center(handler: "Handler", match: dict, body: dict) -> dict:
+    conn = get_conn()
+    try:
+        return _compute_action_center(conn)
+    finally:
+        conn.close()
+
+
+def route_next_actionable_job(handler: "Handler", match: dict, body: dict) -> dict:
+    """Deterministic "what should I do next" control (Priority 5 of the
+    operator-speed brief): the single highest-priority item from the
+    ACTION NOW group -- the exact same ordering Action Center itself
+    displays, never a separate ranking. Deliberately does NOT look at
+    WAITING (nothing to action there) and deliberately DOES surface
+    NEEDS REVIEW if that group is genuinely the highest-priority thing
+    outstanding (an excluded_current_id lets the frontend ask for "the
+    next one after this" once the current job stops being actionable,
+    without the caller having to know why). Never mutates anything --
+    purely a read that tells the frontend where to navigate next."""
+    excluded_id = body.get("exclude_entity_id")
+    conn = get_conn()
+    try:
+        ac = _compute_action_center(conn)
+        candidates = [
+            item for group in ac["groups"] if group["key"] in ("action_now", "needs_review")
+            for item in group["items"]
+        ]
+        if excluded_id is not None:
+            candidates = [c for c in candidates if str(c["entity_id"]) != str(excluded_id)]
+        if not candidates:
+            return {"found": False, "item": None}
+        candidates.sort(key=lambda i: (
+            _PRIORITY_RANK.get(i["priority"], 2),
+            -(_item_age_minutes(i["entity_type"], i["age"]) or 0),
+        ))
+        return {"found": True, "item": candidates[0]}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- SEARCH
+# One global search across committed jobs and live pending messages.
+# Deliberately excludes phone/address/customer name from both the query
+# match and the result shape -- ticket/source/technician/city/service
+# only, matching the brief's explicit "no unnecessary PII" instruction.
+_SEARCH_RESULT_MAX = 20
+_SEARCH_MIN_QUERY_LENGTH = 2
+
+
+def _search_job_haystack(job: dict) -> list:
+    return [job.get("ticket_number"), job.get("source"), job.get("assigned_technician_name"),
+            job.get("service_area"), job.get("description")]
+
+
+def _search_message_haystack(d: dict) -> list:
+    return [d.get("ticket"), d.get("source"), d.get("technician_name"), d.get("city"), d.get("service")]
+
+
+def _search_matches(haystack: list, q: str) -> bool:
+    return any(h and q in str(h).lower() for h in haystack)
+
+
+def _search_job_result(conn, service: DispatcherService, job: dict, all_jobs: list, pending_observations: list) -> dict:
+    job = dict(job)
+    job["latest_technician_update"] = rm.get_latest_technician_update(conn, job["id"])
+    projection = derive_next_action(
+        _build_workflow_context(conn, service, job, all_jobs, pending_observations=pending_observations)
+    )
+    return {
+        "entity_type": "JOB", "entity_id": job["id"], "ticket": job["ticket_number"], "source": job["source"],
+        "technician": job.get("assigned_technician_name"), "stage": job["status"], "next_action": projection.next_action,
+        "age": job.get("last_event_at") or job.get("updated_at"), "screen": _job_target_screen(job),
+    }
+
+
+def _search_message_result(d: dict) -> dict:
+    return {
+        "entity_type": "INCOMING_MESSAGE", "entity_id": d["message_id"], "ticket": d["ticket"], "source": d["source"],
+        "technician": d.get("technician_name"), "stage": "New", "next_action": "REVIEW_NEW_JOB",
+        "age": d["age_minutes"], "screen": "jobs",
+    }
+
+
+def route_search(handler: "Handler", match: dict, body: dict) -> dict:
+    q = (body.get("q") or "").strip().lower()
+    if len(q) < _SEARCH_MIN_QUERY_LENGTH:
+        return {"query": q, "results": []}
     conn = get_conn()
     try:
         service = _service(conn)
         all_jobs = shared.fetch_jobs(conn)
-        non_terminal = [j for j in all_jobs if j["status"] not in ("Cancelled", "Rejected")]
-        # See route_active's identical comment: fetched once for the
-        # whole request rather than once per job inside the loop below.
         pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
-
-        by_next_action: dict = {}
-        for j in non_terminal:
-            item = _action_center_job_item(conn, service, j, non_terminal, pending_observations)
-            by_next_action.setdefault(item["next_action"], []).append(item)
-
-        live, _backlog, _other = rm.get_live_dispatch_queue(conn)
-        for d in (_new_job_dto(conn, e) for e in live):
-            item = _action_center_message_item(d)
-            by_next_action.setdefault(item["next_action"], []).append(item)
-
-        sections = {}
-        for section_key, title, next_action_code in _ACTION_CENTER_SECTIONS:
-            items = by_next_action.get(next_action_code, [])
-            sections[section_key] = {"title": title, "items": items[:_ACTION_CENTER_SECTION_MAX], "total": len(items)}
-
-        groups = []
-        for group_key, group_title, section_keys in _ACTION_CENTER_GROUPS:
-            group_items = [
-                item for sk in section_keys for item in by_next_action.get(_SECTION_NEXT_ACTION[sk], [])
-            ]
-            # Deterministic ordering only: priority bucket rank first
-            # (URGENT before DUE before NORMAL before WAITING), then
-            # oldest first within the same bucket. No AI ranking, no
-            # decimal score -- ties are broken by insertion order, which
-            # is itself deterministic (section order, then discovery
-            # order within a section).
-            group_items.sort(key=lambda i: (
-                _PRIORITY_RANK.get(i["priority"], 2),
-                -(_item_age_minutes(i["entity_type"], i["age"]) or 0),
-            ))
-            groups.append({
-                "key": group_key, "title": group_title,
-                "items": group_items[:_ACTION_CENTER_GROUP_MAX], "total": len(group_items),
-            })
-
-        return {"sections": sections, "groups": groups}
+        matched_jobs = [j for j in all_jobs if _search_matches(_search_job_haystack(j), q)]
+        results = [
+            _search_job_result(conn, service, j, all_jobs, pending_observations)
+            for j in matched_jobs[:_SEARCH_RESULT_MAX]
+        ]
+        if len(results) < _SEARCH_RESULT_MAX:
+            live, _backlog, _other = rm.get_live_dispatch_queue(conn)
+            dtos = [_new_job_dto(conn, e) for e in live]
+            matched_messages = [d for d in dtos if _search_matches(_search_message_haystack(d), q)]
+            results.extend(_search_message_result(d) for d in matched_messages[:_SEARCH_RESULT_MAX - len(results)])
+        return {"query": q, "results": results, "truncated": len(matched_jobs) > _SEARCH_RESULT_MAX}
     finally:
         conn.close()
 
@@ -1682,6 +1806,8 @@ ROUTES = [
     ("GET", r"^/api/demo_status$", route_demo_status, {"public": True}),
     ("GET", r"^/api/command_center$", route_command_center, {}),
     ("GET", r"^/api/action_center$", route_action_center, {}),
+    ("GET", r"^/api/next_actionable_job$", route_next_actionable_job, {}),
+    ("GET", r"^/api/search$", route_search, {}),
     ("GET", r"^/api/inbox_review$", route_inbox_review, {}),
     ("GET", r"^/api/new_jobs$", route_new_jobs, {}),
     ("POST", r"^/api/sync$", route_sync, {}),
