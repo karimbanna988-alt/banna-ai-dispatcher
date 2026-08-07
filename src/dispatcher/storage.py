@@ -1304,12 +1304,23 @@ def technician_acceptance_schema_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def get_technician_acceptance(conn: sqlite3.Connection, job_id: int) -> dict:
+def get_technician_acceptance(conn: sqlite3.Connection, job_id: int, schema_present: Optional[bool] = None) -> dict:
     """Always returns a dict -- never raises for a job with no row yet
     (the common case before a technician has replied at all), and never
     raises on a database that hasn't run this migration (returns the
-    same all-None shape, per technician_acceptance_schema_present())."""
-    if not technician_acceptance_schema_present(conn):
+    same all-None shape, per technician_acceptance_schema_present()).
+
+    `schema_present` lets a caller that already checked
+    technician_acceptance_schema_present(conn) itself this request (e.g.
+    operator_api.py's _technician_k_dto, looping over many jobs) pass
+    that answer straight through instead of this function re-querying
+    sqlite_master a second time for the same fact -- profiling
+    route_action_center at 500 synthetic jobs found this exact double
+    check was ~36% of the route's total cost. Pass nothing (the
+    default) to check it here, unchanged for any other caller."""
+    if schema_present is None:
+        schema_present = technician_acceptance_schema_present(conn)
+    if not schema_present:
         return {"job_id": job_id, "accepted_at": None, "accepted_via_message_id": None,
                 "declined_at": None, "declined_via_message_id": None, "decline_reason": None}
     row = conn.execute(

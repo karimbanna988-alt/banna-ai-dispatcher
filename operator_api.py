@@ -539,7 +539,26 @@ def _active_next_action_label(conn, job: dict) -> str:
     return "Prepare company reply"
 
 
-def _technician_k_dto(conn, job: dict, all_jobs: list, pending_observations: Optional[list] = None) -> Optional[dict]:
+def _group_waiting_jobs_by_technician(all_jobs: list) -> dict:
+    """Precomputed once per request: technician_name -> [(job_id, ticket_number), ...]
+    for every Approved job currently assigned to them. Profiling
+    route_action_center at 500 synthetic jobs showed this exact
+    "who else is this technician already juggling" computation was the
+    dominant cost -- _technician_k_dto used to scan the full all_jobs
+    list per job to build it, making the whole route effectively O(n^2)
+    (5.1M dict.get() calls for 500 jobs x 10 reps in the profile). One
+    grouping pass shared across every job turns that into O(n)."""
+    by_tech: dict = {}
+    for j in all_jobs:
+        if j.get("status") == "Approved" and j.get("assigned_technician_name"):
+            by_tech.setdefault(j["assigned_technician_name"], []).append((j["id"], j["ticket_number"]))
+    return by_tech
+
+
+def _technician_k_dto(
+    conn, job: dict, all_jobs: list, pending_observations: Optional[list] = None,
+    waiting_by_technician: Optional[dict] = None,
+) -> Optional[dict]:
     """None means "not applicable right now": no technician assigned, or
     the job has already moved past the awaiting-K stage (a technician
     update has already been recorded). Otherwise returns either the
@@ -552,14 +571,18 @@ def _technician_k_dto(conn, job: dict, all_jobs: list, pending_observations: Opt
     request (route_active, route_action_center) fetch this list once
     and pass it in, instead of this function re-querying the whole
     table fresh for every single job -- same result, same query, just
-    not repeated N times. Pass nothing (the default) to fetch it here,
-    unchanged for any other caller."""
+    not repeated N times. `waiting_by_technician` does the equivalent
+    for the other_waiting computation below -- see
+    _group_waiting_jobs_by_technician's docstring. Pass nothing (the
+    default) for either to compute them here, unchanged for any other
+    caller."""
     technician_name = job.get("assigned_technician_name")
     if job.get("status") != "Approved" or not technician_name:
         return None
-    if not storage.technician_acceptance_schema_present(conn):
+    schema_present = storage.technician_acceptance_schema_present(conn)
+    if not schema_present:
         return None
-    ta = storage.get_technician_acceptance(conn, job["id"])
+    ta = storage.get_technician_acceptance(conn, job["id"], schema_present=schema_present)
     if ta["accepted_at"]:
         return {"status": "accepted", "accepted_at": ta["accepted_at"], "via_message_id": ta["accepted_via_message_id"]}
     if ta["declined_at"]:
@@ -573,11 +596,14 @@ def _technician_k_dto(conn, job: dict, all_jobs: list, pending_observations: Opt
     technician = {"name": technician_name, "dispatch_group": job.get("assigned_technician_dispatch_group")}
     if pending_observations is None:
         pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
-    other_waiting = [
-        other["ticket_number"] for other in all_jobs
-        if other["id"] != job["id"] and other.get("assigned_technician_name") == technician_name
-        and other.get("status") == "Approved"
-    ]
+    if waiting_by_technician is not None:
+        other_waiting = [ticket for jid, ticket in waiting_by_technician.get(technician_name, []) if jid != job["id"]]
+    else:
+        other_waiting = [
+            other["ticket_number"] for other in all_jobs
+            if other["id"] != job["id"] and other.get("assigned_technician_name") == technician_name
+            and other.get("status") == "Approved"
+        ]
     matches = technician_ack.classify_candidates(job, technician, pending_observations, other_waiting_ticket_numbers=other_waiting)
     candidates = [
         {"message_id": m.message_id, "category": m.category, "is_decline_shaped": m.is_decline_shaped, "reasons": m.reasons}
@@ -596,13 +622,16 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
         # active jobs (this list doesn't depend on which job is being
         # processed, only on global pending-observation state).
         pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+        # See _group_waiting_jobs_by_technician's docstring -- was an
+        # O(n) scan per job (O(n^2) overall) before this hoist.
+        waiting_by_technician = _group_waiting_jobs_by_technician(jobs)
         entries = []
         for j in jobs:
             episode = storage.get_shadow_episode_for_job(conn, j["id"])
             # Computed once per job here, then handed to
             # _workflow_projection_dto below instead of letting it
             # recompute the same two DTOs a second time internally.
-            technician_k = _technician_k_dto(conn, j, jobs, pending_observations)
+            technician_k = _technician_k_dto(conn, j, jobs, pending_observations, waiting_by_technician)
             company_update_owed = _company_update_owed_dto(conn, j)
             entries.append({
                 "id": j["id"],
@@ -623,7 +652,7 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "workflow": _workflow_projection_dto(
                     conn, service, j, jobs,
                     technician_k=technician_k, company_update_owed=company_update_owed,
-                    pending_observations=pending_observations,
+                    pending_observations=pending_observations, waiting_by_technician=waiting_by_technician,
                 ),
             })
         return {"entries": entries}
@@ -714,18 +743,20 @@ _UNSET = object()
 def _build_workflow_context(
     conn, service: DispatcherService, job: dict, all_jobs: list, *,
     technician_k=_UNSET, company_update_owed=_UNSET, pending_observations: Optional[list] = None,
+    waiting_by_technician: Optional[dict] = None,
 ) -> dict:
     """Gathers exactly the facts dispatcher.workflow_projection.derive_next_action()
     needs for one job, reusing the same per-job DTOs every existing
     screen already computes. A caller that already computed
     technician_k/company_update_owed for this job this request (e.g.
     route_active, which needs both independently of the projection) can
-    pass them in to avoid computing them twice; pending_observations
-    lets a caller looping over many jobs fetch that table once instead
-    of once per job. See that module's docstring for the full
-    precedence rules this feeds."""
+    pass them in to avoid computing them twice; pending_observations and
+    waiting_by_technician let a caller looping over many jobs compute
+    those once instead of once per job (see _technician_k_dto and
+    _group_waiting_jobs_by_technician). See that module's docstring for
+    the full precedence rules this feeds."""
     if technician_k is _UNSET:
-        technician_k = _technician_k_dto(conn, job, all_jobs, pending_observations)
+        technician_k = _technician_k_dto(conn, job, all_jobs, pending_observations, waiting_by_technician)
     if company_update_owed is _UNSET:
         company_update_owed = _company_update_owed_dto(conn, job)
     return {
@@ -742,10 +773,12 @@ def _build_workflow_context(
 def _workflow_projection_dto(
     conn, service: DispatcherService, job: dict, all_jobs: list, *,
     technician_k=_UNSET, company_update_owed=_UNSET, pending_observations: Optional[list] = None,
+    waiting_by_technician: Optional[dict] = None,
 ) -> dict:
     ctx = _build_workflow_context(
         conn, service, job, all_jobs,
         technician_k=technician_k, company_update_owed=company_update_owed, pending_observations=pending_observations,
+        waiting_by_technician=waiting_by_technician,
     )
     projection = derive_next_action(ctx)
     return {
@@ -926,11 +959,15 @@ def _job_target_screen(job: dict) -> str:
 
 def _action_center_job_item(
     conn, service: DispatcherService, job: dict, all_jobs: list, pending_observations: Optional[list] = None,
+    waiting_by_technician: Optional[dict] = None,
 ) -> dict:
     job = dict(job)
     job["latest_technician_update"] = rm.get_latest_technician_update(conn, job["id"])
     projection = derive_next_action(
-        _build_workflow_context(conn, service, job, all_jobs, pending_observations=pending_observations)
+        _build_workflow_context(
+            conn, service, job, all_jobs,
+            pending_observations=pending_observations, waiting_by_technician=waiting_by_technician,
+        )
     )
     return _normalize_action_center_item(
         entity_type="JOB", entity_id=job["id"], ticket=job["ticket_number"], source=job["source"],
@@ -968,10 +1005,14 @@ def _compute_action_center(conn) -> dict:
     # See route_active's identical comment: fetched once for the
     # whole request rather than once per job inside the loop below.
     pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+    # See _group_waiting_jobs_by_technician's docstring -- this was the
+    # dominant cost at volume (an O(n) scan per job, O(n^2) overall)
+    # before being hoisted to one O(n) pass shared by every job.
+    waiting_by_technician = _group_waiting_jobs_by_technician(all_jobs)
 
     by_next_action: dict = {}
     for j in non_terminal:
-        item = _action_center_job_item(conn, service, j, non_terminal, pending_observations)
+        item = _action_center_job_item(conn, service, j, non_terminal, pending_observations, waiting_by_technician)
         by_next_action.setdefault(item["next_action"], []).append(item)
 
     live, _backlog, _other = rm.get_live_dispatch_queue(conn)
@@ -1069,11 +1110,17 @@ def _search_matches(haystack: list, q: str) -> bool:
     return any(h and q in str(h).lower() for h in haystack)
 
 
-def _search_job_result(conn, service: DispatcherService, job: dict, all_jobs: list, pending_observations: list) -> dict:
+def _search_job_result(
+    conn, service: DispatcherService, job: dict, all_jobs: list, pending_observations: list,
+    waiting_by_technician: Optional[dict] = None,
+) -> dict:
     job = dict(job)
     job["latest_technician_update"] = rm.get_latest_technician_update(conn, job["id"])
     projection = derive_next_action(
-        _build_workflow_context(conn, service, job, all_jobs, pending_observations=pending_observations)
+        _build_workflow_context(
+            conn, service, job, all_jobs,
+            pending_observations=pending_observations, waiting_by_technician=waiting_by_technician,
+        )
     )
     return {
         "entity_type": "JOB", "entity_id": job["id"], "ticket": job["ticket_number"], "source": job["source"],
@@ -1099,9 +1146,10 @@ def route_search(handler: "Handler", match: dict, body: dict) -> dict:
         service = _service(conn)
         all_jobs = shared.fetch_jobs(conn)
         pending_observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+        waiting_by_technician = _group_waiting_jobs_by_technician(all_jobs)
         matched_jobs = [j for j in all_jobs if _search_matches(_search_job_haystack(j), q)]
         results = [
-            _search_job_result(conn, service, j, all_jobs, pending_observations)
+            _search_job_result(conn, service, j, all_jobs, pending_observations, waiting_by_technician)
             for j in matched_jobs[:_SEARCH_RESULT_MAX]
         ]
         if len(results) < _SEARCH_RESULT_MAX:
