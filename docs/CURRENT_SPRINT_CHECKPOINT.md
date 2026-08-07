@@ -1,163 +1,269 @@
-# Current Sprint Checkpoint — Demo Scenarios + Lifecycle Stepper + Sales Script
+# Current Sprint Checkpoint — Security Hardening + Scenarios C/D/E + Workflow Speed Baseline
 
-Written at a natural stopping point, not a session-limit cutoff. Supersedes
-the previous checkpoint (that sprint's work — the pending-message
-projection fix, the QUO_API_KEY test-isolation fix — is preserved in
-git history).
+Written at a natural stopping point inside the "TWO-HOUR AUTONOMOUS
+OPTIMIZATION SPRINT — SECURITY + OPERATOR SPEED + WORKFLOW LAYOUT +
+COMMERCIAL FINISH" brief. Supersedes the previous checkpoint (that
+sprint's work — demo scenarios A/B/F, the lifecycle stepper, the sales
+script — is preserved in git history, HEAD `dd00a08`).
 
 ## Starting state
 
-HEAD `ce8ee44` (end of the "workflow coverage gap + QUO_API_KEY fix"
-sprint). Real DB (`data/dispatcher.db`): 6 jobs, 10 events, integrity
-OK — unchanged throughout this sprint.
+HEAD `dd00a08`. Real DB (`data/dispatcher.db`): 6 jobs, 10 events,
+integrity OK — unchanged throughout this sprint (re-verified at
+checkpoint time below).
 
-## Priority 1 — Demo scenarios A, B, F (DONE)
+## Scope decision, disclosed up front
 
-`scripts/seed_demo_scenarios.py` — three named scenarios, each driving
-a job through real `operator_api.route_*`/`DispatcherService` calls
-only (never hand-built rows), reusable both as a standalone script and
-imported directly from tests:
+The governing brief for this sprint is 18 parts covering security,
+UI/UX redesign (fast-path flows, Action Center rearrangement, keyboard
+shortcuts, closing-workflow redesign, priority scoring, responsive
+re-verification at 5 viewports, performance-fix implementation), the
+three missing demo scenarios, and a full commercial-doc refresh —
+realistically a multi-day project. This sprint deliberately completed a
+bounded, high-value subset and explicitly did **not** attempt the deep
+UI/UX redesign work (Parts 2–11, 15, 17), disclosed here rather than
+delivered shallow. See "What was deliberately not attempted" below for
+the itemized list.
 
-- **Scenario A (happy path):** AGN job → reviewed → company K
-  mock-sent → technician assigned → dispatch mock-sent → technician K
-  accepted → status update recorded → company update mock-sent →
-  closing recorded → company closing mock-sent → `complete_job()`.
-  Ends `Closed` + `Settled` with a 10-event audit trail, and (verified
-  by test) appears in **zero** Action Center sections once done.
-- **Scenario B (human review):** zero eligible technicians for the
-  job's area/service — proves `derive_pending_message_next_action()`
-  reaches `HUMAN_REVIEW_NEEDED` without ever fabricating an assignment
-  (a test asserts the technicians table stays empty).
-- **Scenario F (technician decline):** a captured "can't" WhatsApp
-  reply confirmed as a decline — proves `technician_acceptance` records
-  `declined_at` with `accepted_at` staying `None` (no false acceptance),
-  and the job's `next_action` moves to `HUMAN_REVIEW_NEEDED`.
+## Priority 1 — Security audit (20-point checklist) + fixes (DONE)
 
-One real bug found and fixed while building these: running multiple
-scenarios back-to-back in one process could land inside
-`luxor_ops_shared`'s 5-second pending-queue cache TTL, causing a
-freshly-inserted message to be invisible to the very next call. Fixed
-by calling `shared.clear_pending_caches()` right after each scenario's
-message insert — the same pattern `route_confirm_dispatch` already uses
-after a successful dispatch, just applied proactively here too.
+`docs/SECURITY_AUDIT.md` — full checklist, each item cited to specific
+file:line evidence. Two real, safely-scoped findings fixed:
 
-**Tests:** 11 in `tests/test_demo_scenarios.py`. **Commit:** `70cb6b7`.
+- **Verbose 500 errors** (`operator_api.py`'s generic exception handler
+  was echoing `str(exc)` to the client) — now sends a generic
+  `"Internal error."`; full traceback still logged server-side.
+- **No Content-Security-Policy header** — added
+  (`default-src 'self'; script-src 'self'; style-src 'self'
+  'unsafe-inline'; ...`), verified live in-browser with zero console CSP
+  violations across login + full navigation.
 
-Scenarios C (duplicate/correction), D (technician restriction), and E
-(incomplete closing) were **not built** — E is already covered
-implicitly by existing `REVIEW_CLOSING` tests
-(`tests/test_workflow_projection.py`), and C/D didn't reach the top of
-the priority queue this round. See "exact next steps" below.
+One real MEDIUM finding (`0.0.0.0` bind address, all interfaces not just
+loopback) documented but **deliberately not auto-fixed** — it changes
+live server startup/deployment behavior, which needs the owner's
+confirmation of intent first (recommendation given in the doc: switch to
+`127.0.0.1` if LAN access was never actually required). One LOW finding
+(`X-Forwarded-Proto` trust for the `Secure` cookie flag) documented,
+negligible real-world impact given this app's actual deployment shape.
+Eight items audited with no finding (XSS escaping, SQL parameterization,
+session/CSRF/cookies, login throttling, path traversal, route
+authorization, demo/test isolation, secret log exposure). Two items
+explicitly out of scope per the brief itself (duplicate session secret,
+backup-file permissions not reviewed).
 
-## Priority 2 — Lifecycle stepper (DONE)
+**Tests:** 2 new in `tests/test_operator_api.py`
+(`test_content_security_policy_header_present`,
+`test_internal_error_response_is_generic_not_the_raw_exception`).
+**Commit:** `19b2c1e`.
 
-`dispatcher.workflow_projection.derive_lifecycle_steps()` — a third
-pure function alongside the two `next_action` functions, mapping the
-same already-gathered facts into the required 11-step lifecycle
-(Received → Reviewed → Company acknowledged → Technician assigned →
-Sent to technician → Technician accepted → Work/update → Company
-updated → Closing received → Closing sent → Complete), each step
-`completed`/`current`/`blocked`/`pending`. At most one step is ever
-`current` or `blocked` (enforced by a dedicated test); a dead-terminal
-job (Cancelled/Rejected) shows no `current` step at all.
+## Priority 2 — Security regression tests (DONE, folded into P1's commit)
 
-Wired into both required surfaces: `route_active`'s per-job `workflow`
-dict gained a `steps` array (+ `delivery_mode`, always `"MANUAL COPY"`
-in this build — the other two brief-specified values don't apply until
-a real outbound connector or a distinct demo-auto-confirm path exists,
-neither of which does), and `_new_job_dto` (New Jobs / incoming review)
-gained the same. `lifecycleStepperHtml()` in the frontend only renders
-what the backend already decided — no independent JS calculation.
+Covered by the same commit as P1 above plus the pre-existing regression
+suite re-verified still passing (unauthenticated write rejection,
+session invalidation, cookie flags, CSRF, path traversal rejection,
+XSS escaping, SQL-parameterization-sensitive inputs, secret redaction,
+demo DB fail-closed, QUO_API_KEY clearing, WhatsApp no-send, Quo
+GET-only, no production PII in demo fixtures). No destructive
+penetration testing was performed against anything live, per the brief.
 
-**Verified live** at 1440×900 and 390×844 against a real Scenario F job:
-steps 1–5 completed, step 6 "Technician accepted" shown blocked in red
-with the decline reason, steps 7–11 pending — exact match to the
-pure-function's own tests. 1920×1080 was not separately screenshotted
-(the stepper is a compact flex-wrap block inside the same
-already-verified max-width layout; low risk, just not captured).
+## Priority 3 — Demo scenarios C, D, E (DONE)
 
-**Tests:** 24 in `tests/test_workflow_projection.py`. **Commit:** `334f318`.
+`scripts/seed_demo_scenarios.py` gained three new scenario functions,
+each driving real service/route calls only:
 
-## Priority 4 — Sales demo script (DONE)
+- **Scenario C (duplicate/correction):** the same ticket arrives twice
+  (second message has a corrected phone number). Proves
+  `save_audit_entry`'s `ON CONFLICT(source, ticket_number)` upsert
+  creates **no** second job row (`first_job_id == second_job_id`,
+  `distinct_job_row_count == 1`) while the correction reaches the
+  correct job (`latest_phone_on_record` reflects the corrected value)
+  and both messages remain in the audit trail.
+- **Scenario D (technician restriction):** two technicians seeded, one
+  ineligible for the job's area. Proves `storage.assign_technician()`
+  rejects the ineligible technician with a specific area-mismatch
+  reason (`outcome='handle_manually'`) and the eligible alternative is
+  then assigned successfully — no fabricated eligibility.
+- **Scenario E (incomplete closing):** a closing is recorded with no
+  final amount/payment method. Proves the raw closing **is** recorded
+  (job reaches `Closed`) but `prepare_company_closing()` refuses with
+  the specific reason `"Missing: amount, payment method"` — the amount
+  is never fabricated to unblock the workflow, and the job stays visible
+  under Action Center's `closings_to_review` section rather than
+  silently disappearing.
 
-`docs/SALES_DEMO_SCRIPT.md` rewritten for the full current workflow —
-14 steps (login → Command Center → Action Center → new job → AI
-extraction → deterministic validation → company K → technician
-recommendation → dispatch → technician K → technician update → company
-update → closing → completion/KPI/audit), each with exact
-click/appears/say/proves. "What NOT to claim" preserved and extended
-(no outbound step is automatic; Quo remains structurally GET-only).
+All three were designed by reading the exact underlying mechanism first
+(the upsert SQL, `assign_technician`'s rejection path,
+`prepare_company_closing`'s validation) before writing scenario code —
+unlike Scenario A/F in the prior sprint, all three worked correctly on
+first run, no debugging cycle needed.
 
-**Commit:** `93e8df4`.
+**Tests:** 19 in `tests/test_demo_scenarios.py` (all scenarios A–F now
+have coverage; A/B/F tests were pre-existing, re-verified still
+passing). **Commit:** `ef7ca2d`.
 
-## An unplanned but valuable outcome
+All six named scenarios (A, B, C, D, E, F) are now complete and covered.
 
-The full suite ran **fully clean for the first time this session**:
-1473 tests, 0 failures (previous rounds always had 1-2 socket-teardown
-flakes even after the QUO_API_KEY fix). Plausibly the QUO_API_KEY fix
-from the prior sprint removed enough wall-clock time/contention from
-the suite that the separate `ConnectionAbortedError` teardown flake
-simply didn't get a window to occur this run — not a claim that it's
-fixed, just an honest observation. Real DB integrity/FK checks clean,
-job/event counts unchanged (6 jobs, 10 events) before and after.
+## Priority 4 — Workflow speed baseline audit, docs only (DONE)
+
+`docs/WORKFLOW_SPEED_AUDIT.md` — two independent measurements, kept
+strictly separate per the brief's explicit instruction:
+
+1. **Scenario A operator-path interaction counts**, stage by stage (10
+   stages), cited to the actual click-handler wiring in
+   `operator_ui_v2_connected/js/app.js` (function + line references),
+   not a simulated/guessed count. Totals for one full happy-path job:
+   18 clicks, 2 screen transitions, 1 confirmation modal, ~5 required
+   typed/pasted fields, 4 clipboard-copy operations — consistent with
+   the 10-event audit trail Scenario A's own test asserts. The single
+   highest-friction stage identified is Closing (3–4 hand-typed fields
+   from a technician's raw message) — flagged as the most defensible
+   target for a future fast-capture UI, not built this pass.
+2. **Measured local API latency** (`time.perf_counter()`, in-process,
+   no HTTP/network layer) at the small demo-fixture volume (18 jobs:
+   all routes 2–8ms p50) and at synthetic 10/100/500-job volumes
+   (bulk-inserted into a throwaway scratchpad SQLite file, never
+   `data/dispatcher.db`, explicitly labeled non-canonical benchmark
+   data). This surfaced a real, evidenced finding: `route_active` and
+   `route_action_center` scale roughly linearly with job count
+   (`route_active`: 10ms at 10 jobs → 526ms p50 at 500 jobs), consistent
+   with `route_active`'s per-job query loop
+   (`operator_api.py:564-592`, ~5 additional queries per job). **Not
+   fixed this pass** — real-world volume is 6 jobs today, so this is a
+   documented future task, not an active problem, and batching read
+   queries under time pressure risked introducing a real-model bug for
+   no currently-measurable benefit.
+
+No effort-scoring model, before/after redesign comparison, or actual UI
+change was built — Part 2 (the effort model) and Parts 3–11 (the actual
+redesign this would compare against) were explicitly out of scope this
+pass; presenting a "before/after" without ever building an "after" would
+misrepresent the work.
+
+**Commit:** `d595616`.
 
 ## What was deliberately not attempted, and why
 
-Priorities 3, 5, and 6 (Action Center visual-overflow demo data,
-commercial doc updates beyond the sales script, and the full
-screenshot-artifact sweep) were not attempted this round:
+Per the scope decision above, the following brief parts were not
+started this sprint:
 
-- **P3 — Action Center overflow/5-item-cap visual demo.** The cap and
-  `total` count are already tested at the API level
-  (`test_action_center_sections_cap_at_five_items`, prior sprint); a
-  dedicated *visual* screenshot proving "View all" specifically was not
-  captured this round.
-- **P5 — Remaining commercial docs** (`docs/COMMERCIAL_READINESS.md`,
-  `docs/PRODUCTION_CHECKLIST.md`, `docs/KNOWN_LIMITATIONS.md`). Not
-  updated this round — the sales script was prioritized as the more
-  time-sensitive, externally-facing document.
-- **P6 — Screenshot artifacts saved to `artifacts/final_workflow_demo/`.**
-  As disclosed in every prior sprint this session: no tool in this
-  environment can persist captured screenshot bytes to disk. Every
-  screenshot claimed above was genuinely captured and inspected live in
-  this conversation; none exist as files on disk.
-
-## Exact next steps
-
-1. **Scenarios C and D** — Duplicate/Correction and Technician
-   Restriction are the two still-missing named scenarios. Both are
-   small deltas on `scripts/seed_demo_scenarios.py`'s existing
-   patterns: C reuses the same message twice with `save_pending_and_mark_processed`
-   (already idempotent by `message_id`) plus a corrected second
-   message; D seeds two technicians where the first is deliberately
-   ineligible (e.g. wrong area) so `resolve_job_routing` rejects them
-   with a visible reason.
-2. **Remaining commercial docs (P5)** — `COMMERCIAL_READINESS.md`,
-   `PRODUCTION_CHECKLIST.md`, `KNOWN_LIMITATIONS.md` should be
-   refreshed to mention Action Center and the lifecycle stepper by
-   name; the READY/PILOT READY/BLOCKED categorization from this
-   sprint's brief is still accurate and can be transcribed directly.
-3. **1920×1080 stepper verification** — quick, just not done yet.
+- **Part 2 — Effort-scoring model.** No `EFFORT = f(clicks, nav, typing,
+  copy, search, decisions)` formula was implemented; the interaction
+  counts in `WORKFLOW_SPEED_AUDIT.md` are raw counts, not weighted
+  scores.
+- **Parts 3–4 — Critical-path optimization / "Fast Path" UI.** No
+  changes to `app.js`'s click flow, panel auto-opening, or a guided
+  REVIEW→ACKNOWLEDGE→ASSIGN→DISPATCH→WAIT→UPDATE→CLOSE sequence.
+- **Parts 5–6 — Action Center rearrangement / priority scoring.** The
+  existing 10-section, alphabetical-by-workflow-stage layout is
+  unchanged; no priority_score field or URGENT/DUE/NORMAL/WAITING
+  bucketing was added.
+- **Part 7 — Keyboard shortcuts.** None added (`/`, `J/K`, `Enter`,
+  `Esc`, `C`).
+- **Part 8 — Search.** No ticket/source/technician/city/phone lookup UI
+  was built.
+- **Part 9–10 — Visual hierarchy / job-detail rearrangement.** No color
+  system, above-the-fold restructuring, or collapsed-by-default
+  historical sections were implemented beyond what already existed.
+- **Part 11 — Closing fast path.** No dedicated fast-path UI for the
+  Closing stage, despite it being identified as the highest-friction
+  stage in the audit above.
+- **Part 15 — Responsive re-verification at 5 named viewports.** Not
+  re-run this sprint (the lifecycle stepper was verified at 1440×900
+  and 390×844 in the *prior* sprint; not repeated here since no layout
+  changed).
+- **Part 16 — Performance fix implementation.** The `route_active`
+  scaling issue was measured and documented, not fixed (see P4 above).
+- **Part 17 — Before/after acceptance re-measurement.** Not applicable
+  — no redesign was implemented to re-measure against.
+- **Part 18 (partial) — Remaining commercial docs.**
+  `docs/COMMERCIAL_READINESS.md`, `docs/PRODUCTION_CHECKLIST.md`, and
+  `docs/KNOWN_LIMITATIONS.md` were not refreshed this sprint (they were
+  last substantively reviewed in earlier sprints per prior checkpoints;
+  their READY/PILOT READY/BLOCKED categorization is understood to still
+  be accurate but was not re-verified against this sprint's specific
+  findings).
 
 ## Safety confirmations (re-verified at checkpoint time)
 
 - Real `data/dispatcher.db`: `PRAGMA integrity_check` = `ok`, zero FK
-  violations, 6 jobs / 10 events — unchanged.
+  violations, 6 jobs / 10 events — unchanged from the start of this
+  sprint.
 - `.env`: untouched, not inspected or modified this sprint.
-- No Quo or WhatsApp message sent — no Quo-adjacent or WhatsApp-adjacent
-  file was touched this sprint (the new scenarios use
-  `whatsapp_bridge_adapter.add_observation()`, the same receive-only,
-  already-audited entry point every prior sprint's K-tracking work used).
-- The live WhatsApp bridge was never started or re-paired — every demo
-  server this sprint used ran with `--no-bridge-adapter`.
-- All new tests use `tmp_path`-backed throwaway databases — zero real
-  network calls, zero real-DB writes (independently confirmed by the
-  session-wide tripwire fixture in `conftest.py`).
+- No Quo message sent, no Quo POST/PUT/PATCH/DELETE call made — no
+  Quo-adjacent code path was touched beyond the read-only audit of
+  `quo_client.py` (confirmed: no method capable of a non-GET request
+  exists in that file).
+- No WhatsApp message sent, no send-capable `whatsapp-web.js` method
+  called — the bridge's structural receive-only guarantee (no send
+  import anywhere in `whatsapp_shadow_bridge/`) was re-confirmed, not
+  modified.
+- The live WhatsApp bridge was never started or re-paired this sprint.
+- The WhatsApp pilot allowlist and real technician mappings were not
+  touched.
+- All new tests (security regression tests, Scenario C/D/E tests) use
+  `tmp_path`-backed throwaway databases — zero real-DB writes,
+  independently confirmed by the session-wide `_real_database_untouched_tripwire`
+  fixture in `conftest.py`, and by the direct integrity/FK/row-count
+  check above.
+- The synthetic 10/100/500-job performance-benchmark databases used a
+  throwaway scratchpad SQLite path, never `data/dispatcher.db`, and
+  contained no real customer data (uniform synthetic placeholder fields
+  only).
+- Full suite: **1483 passed, 0 failed** (`python -m pytest -q tests`,
+  323s).
+
+## Remaining blockers before a paid pilot
+
+- The `0.0.0.0` server bind address (Security Audit finding #9) should
+  be reviewed with the owner — switch to `127.0.0.1` if the Cloudflare
+  tunnel is the only intended access path.
+- The duplicate `OPERATOR_API_SESSION_SECRET` entry in `.env` (known,
+  explicitly out of scope every sprint so far) should be resolved
+  before any credential rotation is needed.
+- Backup file permissions (`scripts/backup_database.py`) have not yet
+  been reviewed.
+
+## Remaining blockers before automatic outbound production (unchanged from prior sprints)
+
+- Quo remains structurally GET-only (no POST/PUT/PATCH/DELETE method
+  exists anywhere in this codebase) — any real outbound send requires
+  new, deliberately-built, explicitly-approved code, not a
+  configuration flip.
+- WhatsApp sending remains structurally absent (no send-capable
+  `whatsapp-web.js` method is imported anywhere) — same category of
+  gap, same reasoning.
+- No auto-send, auto-accept, or auto-complete path exists anywhere in
+  the workflow; every state transition that reaches an external party
+  or a terminal status still requires an explicit human click.
+
+## Exact next steps
+
+1. **Owner decision on `0.0.0.0` bind address** — one-line change if LAN
+   access was never intended (Security Audit finding #9).
+2. **Performance fix for `route_active`/`route_action_center`** — batch
+   the per-job lookups (`get_shadow_episode_for_job`,
+   `_company_update_owed_dto`, `_technician_k_dto`,
+   `_workflow_projection_dto`) into `IN (...)`-style batched queries
+   instead of one query per job per lookup type. Only worth doing once
+   real job volume approaches the point where it's user-visible (current
+   real volume: 6 jobs, ~4ms — not yet a problem).
+3. **Actual UI/UX redesign work (brief Parts 2–11, 15, 17)** — the
+   highest-value candidate identified by this sprint's own audit is the
+   Closing stage (highest hand-typed-field count of any stage); a
+   dedicated fast-capture UI there would need its own scoped sprint with
+   before/after interaction counts re-measured against this sprint's
+   baseline in `docs/WORKFLOW_SPEED_AUDIT.md`.
+4. **Remaining commercial docs refresh** (`COMMERCIAL_READINESS.md`,
+   `PRODUCTION_CHECKLIST.md`, `KNOWN_LIMITATIONS.md`) to incorporate
+   this sprint's security-audit and workflow-speed-audit findings by
+   name.
 
 ## Demo
 
-Isolated demo running at `http://127.0.0.1:8517` against a freshly
-seeded throwaway database in the session scratchpad (never
-`data/dispatcher.db`), seeded with both the standard Command Center
-fixtures and all three demo scenarios. Login password is a per-process
-override, never the real `LUXOR_DEMO_PASSWORD`.
+No new demo server was started this sprint (this sprint's work was
+security audit + backend scenario scripts + docs, not a live UI
+change) — the isolated demo from the prior sprint
+(`http://127.0.0.1:8517`, throwaway scratchpad database, never
+`data/dispatcher.db`) remains the last verified-live instance; restart
+it fresh from `scripts/seed_demo_scenarios.py` (now covering all six
+scenarios A–F) if the owner wants to review this sprint's work live.
