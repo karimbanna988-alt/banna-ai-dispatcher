@@ -302,6 +302,25 @@ def test_security_headers_present_on_every_response(live_server):
         assert status_case["headers"].get("Referrer-Policy") == "no-referrer"
 
 
+def test_content_security_policy_header_present(live_server):
+    r = http_request(live_server, "GET", "/index.html")
+    csp = r["headers"].get("Content-Security-Policy")
+    assert csp is not None
+    assert "default-src 'self'" in csp
+    assert "script-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_internal_error_response_is_generic_not_the_raw_exception():
+    """Structural guard, not a live-exception test: an unhandled
+    exception's str() can contain a file path, a raw SQL fragment, or
+    other internal detail (see docs/SECURITY_AUDIT.md finding #1) --
+    the client-facing 500 body must never interpolate it."""
+    source = (REPO_ROOT / "operator_api.py").read_text(encoding="utf-8")
+    assert 'f"Internal error: {exc}"' not in source
+    assert '"Internal error."' in source
+
+
 def test_no_password_or_session_secret_ever_logged(live_server, capsys):
     http_request(live_server, "POST", "/api/login", {"password": "wrong-guess-xyz"})
     http_request(live_server, "POST", "/api/login", {"password": TEST_PASSWORD})

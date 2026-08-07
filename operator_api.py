@@ -1549,6 +1549,19 @@ SECURITY_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "no-referrer"),
+    # Defense in depth, not a response to a found XSS -- every dynamic
+    # value already goes through the frontend's esc() before reaching
+    # innerHTML (verified by grep across every msg-block/detail-meta
+    # render site in operator_ui_v2_connected/js/app.js). script-src
+    # 'self' is safe because index.html has zero inline <script> tags
+    # (both app.js and api.js are external files); style-src keeps
+    # 'unsafe-inline' because the UI uses inline style="..." attributes
+    # extensively and a full refactor to eliminate them is out of scope
+    # here -- still blocks loading a remote stylesheet.
+    ("Content-Security-Policy",
+     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+     "base-uri 'self'; form-action 'self'"),
 )
 
 
@@ -1628,9 +1641,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
             except ApiError as exc:
                 self._send_json(exc.status, {"error": exc.message})
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
+                # Full detail goes to the server log only -- the client
+                # response is deliberately generic. An unhandled
+                # exception's str() can contain a file path, a raw SQL
+                # fragment, or other internal detail never meant to
+                # leave the process; ApiError (handled above) remains
+                # the one sanctioned way to send a specific message to
+                # the client.
                 traceback.print_exc()
-                self._send_json(500, {"error": f"Internal error: {exc}"})
+                self._send_json(500, {"error": "Internal error."})
             return
         self._send_json(404, {"error": f"No route for {method} {path}"})
 
