@@ -103,21 +103,228 @@ is already tens to hundreds of milliseconds at the larger volumes).
 | 100 | 45.49ms | 50.32ms | 50.67ms | 88.84ms | 96.85ms | 100.67ms |
 | 500 | 264.66ms | 287.74ms | 308.06ms | 526.33ms | 656.49ms | 668.98ms |
 
-**Finding (evidenced, not fixed this pass):** both routes scale
-roughly linearly with job count, consistent with a per-job query loop
-rather than a single batched query. `route_active`
-(`operator_api.py:564-592`) calls `storage.get_shadow_episode_for_job`,
-`_active_next_action_label`, `_company_update_owed_dto`,
-`_technician_k_dto`, and `_workflow_projection_dto` once *per job* inside
-its `for j in jobs:` loop -- each of those does at least one additional
-SQL query, so the route issues on the order of 5N+1 queries for N active
-jobs. `route_action_center` composes several similar per-item lookups
-across its 10 sections. At the real database's current volume (6 jobs)
-this is invisible (low single-digit ms); at 500 synthetic jobs it crosses
-half a second. This is flagged per Part 16's instruction to report
-measured/evidenced problems, but **not fixed this pass** -- batching
-these into fewer queries (e.g. one `IN (...)` lookup per lookup type
-instead of N separate ones) is a real, scoped, future performance task,
-not attempted here to avoid rushed changes to read-model code under a
-"do not add unnecessary work" directive when the real-world volume
-(single digits of jobs) does not yet make this an active problem.
+**Finding (evidenced):** both routes scale roughly linearly with job
+count, consistent with a per-job query loop rather than a single batched
+query. `route_active` (`operator_api.py:564-592`) called
+`storage.get_shadow_episode_for_job`, `_active_next_action_label`,
+`_company_update_owed_dto`, `_technician_k_dto`, and
+`_workflow_projection_dto` once *per job* inside its `for j in jobs:`
+loop -- each of those does at least one additional SQL query, so the
+route issued on the order of 5N+1 queries for N active jobs.
+`route_action_center` composes several similar per-item lookups across
+its 10 sections. At the real database's current volume (6 jobs) this was
+already invisible (low single-digit ms); at 500 synthetic jobs it
+crossed half a second.
+
+**Update -- fixed in the Operator Speed Implementation sprint (this
+document's second half, below):** `_technician_k_dto` and
+`_company_update_owed_dto` were being computed *twice* per job in
+`route_active` (once directly, once again inside
+`_workflow_projection_dto`'s internal call), and
+`storage.list_whatsapp_pending_observations()` was re-queried from
+scratch inside the per-job loop in both routes instead of once per
+request. Both are now computed/fetched once and threaded through. This
+is a redundant-work fix, not a batching rewrite -- the remaining
+per-job queries (`get_shadow_episode_for_job`, `get_technician_acceptance`,
+the workflow-projection's `closing` lookup) still run once per job and
+were deliberately left alone (see below for why). Batching those into
+`IN (...)` queries remains a real, scoped, **not yet attempted** future
+task.
+
+---
+
+# Operator Speed Implementation Sprint
+
+Continuation of the audit above, covering the follow-on sprint that
+implemented (not just measured) a bounded set of the highest-value
+optimizations. Starting point: the baseline captured above (18 clicks,
+2 screen transitions, ~5 typed/pasted fields, 4 copies for one full
+Scenario A job; route_active/route_action_center's measured N+1-shaped
+scaling). This sprint deliberately did not attempt the full 18-part
+brief that motivated it -- see `docs/CURRENT_SPRINT_CHECKPOINT.md` for
+the exact scope decision and what was left out.
+
+## Performance re-benchmark (same method, same synthetic volumes)
+
+Same `time.perf_counter()`, in-process, no-HTTP-layer method as the
+baseline above; same throwaway scratchpad SQLite databases at 10/100/500
+synthetic jobs (never `data/dispatcher.db`).
+
+| Jobs | `route_action_center` p50 (before &rarr; after) | % change | `route_active` p50 (before &rarr; after) | % change |
+|---|---|---|---|---|
+| 10 | 6.56ms &rarr; 5.74ms | -12.5% | 10.31ms &rarr; 6.49ms | -37.0% |
+| 100 | 45.49ms &rarr; 37.92ms | -16.6% | 88.84ms &rarr; 47.50ms | -46.5% |
+| 500 | 264.66ms &rarr; 227.60ms | -14.0% | 526.33ms &rarr; 273.89ms | -48.0% |
+
+`route_active` improved materially (roughly halved at scale) because it
+had the literal duplicate-computation bug described above. `route_action_center`
+improved more modestly (~14-17%) because its only redundancy was the
+per-job re-fetch of an (empty, in this synthetic dataset)
+`whatsapp_pending_observations` table -- a real fix, but a smaller one.
+`route_active`'s remaining per-job queries (shadow episode, technician
+acceptance) are the honest reason it isn't faster still; batching those
+is the scoped future task noted above. **No caching layer and no SQLite
+denormalization were added**, per the brief's explicit instruction --
+this is entirely "stop doing the same query twice," not new
+infrastructure.
+
+Job-detail and search routes were not separately benchmarked this
+round: job detail (`route_job_workspace`) is a single-job lookup with no
+per-job loop to begin with (not implicated in the N+1 finding), and no
+global search route exists yet in this build (see below).
+
+## Fast Path -- what changed
+
+- Confirming dispatch (Jobs screen) now auto-switches to the Active
+  screen with that same job already selected, instead of leaving the
+  operator on Jobs to manually navigate and re-find it. This removes
+  the exact friction the baseline audit flagged for that stage
+  ("requires a screen change the operator must remember to make").
+- A job whose technician reported "Completed" now shows a single
+  dominant "Go to Closing" primary action in its Active detail panel,
+  which jumps straight to the Closings screen with that same job
+  already selected -- removing the equivalent friction flagged for the
+  Closing stage.
+- Nothing auto-advances into an external send, an acceptance, a
+  decline, or a completion -- every step past an auto-navigation still
+  requires its own explicit click, unchanged from the baseline.
+- Action Center gained a 3-group presentation (Action now / Waiting on
+  someone else / Needs review) with a deterministic priority bucket
+  (URGENT/DUE/NORMAL/WAITING) per item, sorted oldest-and-most-urgent
+  first within each group -- this reduces *scanning* effort across the
+  whole queue, a dimension the single-job effort model below does not
+  capture (see the caveat in that section).
+- The four "copy a prepared message, then mark it sent" flows (company
+  K, technician dispatch, company update, company closing) now use one
+  consistent button pattern ("Copy &lt;thing&gt;" / "Mark sent
+  manually") instead of four different confirm-sent phrasings.
+- Safe keyboard shortcuts (J/K/Enter/Esc/C) were added for the
+  list-based screens, desktop-only, none bound to a mutating action.
+
+## Effort model -- before/after
+
+Per the brief's instruction, this is **a comparative engineering
+heuristic, not measured human time**, and is kept entirely separate
+from the measured latency numbers above. Weights are exactly as
+specified:
+
+```
+EFFORT = C + 3N + 4T + 2P + 2S + 3D
+C = clicks/taps            N = navigation/context switches
+T = typing interactions    P = copy operations
+S = scroll/search ops      D = decision points
+```
+
+**Method:** each of Scenario A's 10 stages (from the baseline table
+above) was re-scored stage by stage, assigning explicit C/N/T/P/S/D
+counts from the same real click-handler wiring in `app.js` used to
+build the original baseline table. A "decision point" (D) is scored
+only where the operator must genuinely judge or choose between
+options (classifying a technician-K candidate, verifying/correcting a
+parsed technician update, confirming a closing is actually complete)
+-- not for routine "confirm you did the thing" clicks, which are
+already counted as C. S (scroll/search) is scored 0 throughout both
+columns: this sprint did not touch scrolling behavior or build a
+search feature (see "What wasn't done" below), so inflating S in the
+BEFORE column just to make the AFTER column look better would be
+exactly the "manipulating the metric" the brief prohibits.
+
+| Stage | C before&rarr;after | N before&rarr;after | T before&rarr;after | P before&rarr;after | D before&rarr;after | What changed |
+|---|---|---|---|---|---|---|
+| 1. Incoming review | 1&rarr;1 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | unchanged |
+| 2. Company K | 2&rarr;2 | 0&rarr;0 | 0&rarr;0 | 1&rarr;1 | 0&rarr;0 | label only |
+| 3. Technician determine | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | unchanged |
+| 4. Technician dispatch | 4&rarr;4 | 0&rarr;0 | 0&rarr;0 | 1&rarr;1 | 0&rarr;0 | label only |
+| 5. Wait for K | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | unchanged (passive) |
+| 6. Technician K accept | 2&rarr;1 | 1&rarr;0 | 0&rarr;0 | 0&rarr;0 | 1&rarr;1 | dispatch-confirm auto-selects the job in Active -- the separate "find it in the list" click and screen change are gone |
+| 7. Technician update | 2&rarr;2 | 0&rarr;0 | 2&rarr;2 | 0&rarr;0 | 1&rarr;1 | unchanged (Priority 6 "remove unnecessary typing" not attempted -- see below) |
+| 8. Company update | 2&rarr;2 | 0&rarr;0 | 0&rarr;0 | 1&rarr;1 | 0&rarr;0 | label only |
+| 9. Closing | 4&rarr;4 | 1&rarr;0 | 3&rarr;3 | 1&rarr;1 | 1&rarr;1 | "Go to Closing" replaces the old independent navigate+find-it-in-the-list step with one bundled click -- same click count, the screen change is no longer a separate operator-recalled step |
+| 10. Completion | 1&rarr;1 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | 0&rarr;0 | unchanged |
+| **Total** | **18&rarr;17** | **2&rarr;0** | **5&rarr;5** | **4&rarr;4** | **3&rarr;3** | |
+
+### A. Full Scenario A
+
+- BEFORE: C=18, N=2, T=5, P=4, S=0, D=3 &rarr; EFFORT = 18 + 3(2) + 4(5) + 2(4) + 2(0) + 3(3) = 18+6+20+8+0+9 = **61**
+- AFTER: C=17, N=0, T=5, P=4, S=0, D=3 &rarr; EFFORT = 17 + 3(0) + 4(5) + 2(4) + 2(0) + 3(3) = 17+0+20+8+0+9 = **54**
+- **Reduction: 7 points, 11.5%.**
+
+### B. Closing workflow alone (stage 9 in isolation)
+
+- BEFORE: C=4, N=1, T=3, P=1, S=0, D=1 &rarr; EFFORT = 4 + 3(1) + 4(3) + 2(1) + 2(0) + 3(1) = 4+3+12+2+0+3 = **24**
+- AFTER: C=4, N=0, T=3, P=1, S=0, D=1 &rarr; EFFORT = 4 + 0 + 12 + 2 + 0 + 3 = **21**
+- **Reduction: 3 points, 12.5%.**
+
+### Honest assessment against the 25% target
+
+Both come in at roughly 11-13%, short of the brief's 25% aspirational
+target. Reported as-is, not adjusted -- per the brief's own instruction
+("if 25% cannot safely be reached, report the maximum defensible
+reduction. Do not manipulate the metric"). Why it landed here:
+
+- **N (navigation) is fully eliminated where it was touched** -- both
+  of Scenario A's two screen transitions (stage 6, stage 9) now cost
+  zero operator-recalled navigation. N is weighted 3x, so this is
+  actually the single highest-leverage change available in this model;
+  there were only two navigation points to remove, and both are gone.
+- **T (typing, weighted 4x, the heaviest weight in the model) was
+  deliberately left untouched.** Priority 6 of the brief ("remove
+  unnecessary typing... pre-fill it") was evaluated and not
+  implemented: every typed field remaining in Scenario A (the
+  technician's raw message paste, the closing amount, the payment
+  method) is genuinely new information from outside the system --
+  pre-filling any of it would mean fabricating a price, a payment
+  method, or a technician's words, which the brief's own absolute
+  safety rules prohibit ("fabricate...prices...closing values"). This
+  is the correct call, not a missed optimization, but it does cap how
+  much this model can move: T alone contributes 20 of the 61 BEFORE
+  points.
+- **D (decision points) was correctly left unchanged.** The brief
+  explicitly warns against "reject[ing] an optimization if it saves
+  one click but increases ambiguity" -- none of this sprint's changes
+  removed a judgment call the operator used to make, and none should.
+- **C (clicks) only dropped by 1** in the full-scenario count, because
+  most of the navigation savings showed up as N, not C -- the clicks
+  that used to accompany manual navigation (selecting the job in a
+  list after arriving) were already counted as part of the *next*
+  stage's C in the original baseline, so removing the navigation alone
+  doesn't remove a click unless a click is also genuinely eliminated
+  (as it was in stage 6).
+
+### What the effort model does not capture
+
+Scenario A's effort model is scoped to **one job moving through the
+whole workflow alone**. It does not capture the benefit of Action
+Center's new 3-group priority presentation, which is a *multi-job
+triage* improvement (finding which of N waiting jobs needs attention
+next), not a single-job workflow-step reduction. That benefit is real
+-- the fixed key-mismatch bug alone means "Ready to send to technician"
+items are now visible at all, where before they silently never
+rendered -- but this specific model has no dimension for "queue-scanning
+effort across many jobs simultaneously," so it isn't reflected in the
+61&rarr;54 number above. A future S (search/scroll)-weighted model
+extension, once a real search feature exists, would be the natural
+place to capture it.
+
+## What wasn't done this sprint (disclosed, not silently skipped)
+
+- **Priority 6 (remove unnecessary typing):** evaluated per field: none
+  of Scenario A's remaining typed fields are safely pre-fillable
+  without fabricating data (see above). No change made.
+- **Priority 8 (global search)** and its `/` keyboard shortcut: not
+  built. A real search feature (backend route + latency measurement +
+  frontend UI) is a standalone-sized piece of work; deferred rather
+  than shipped shallow. The `/` shortcut is intentionally not bound to
+  anything in this build rather than bound to a feature that doesn't
+  exist.
+- **Priority 11/12 (full responsive/desktop-density pass)** at all 5
+  specified viewports: not re-verified this sprint beyond spot-checking
+  the screens this sprint actually changed (Action Center, Active
+  detail). No layout/CSS density changes were made to Command Center,
+  Jobs, or Closings beyond what's described above.
+- **Priority 10's remaining batching work** (shadow episode and
+  technician-acceptance lookups still run once per job): the redundant
+  *duplicate* computation was fixed; converting the remaining per-job
+  queries into batched `IN (...)` queries was not attempted, per the
+  brief's own "do not prematurely optimize SQLite" guidance combined
+  with the real database's current low volume (6 jobs).
