@@ -942,19 +942,34 @@ def _normalize_action_center_item(
 
 
 def _job_target_screen(job: dict) -> str:
-    """Which screen a job's own detail actually lives on -- Active only
-    covers ACTIVE_JOB_WORKSPACE_STATUSES (New/Approved/In Progress/Needs
-    Review); a Closed-but-unsettled job lives on Closings, and a
-    Closed+Settled/Cancelled/Rejected job only appears on the Completed
-    (history) screen. Shared by Action Center and search so "Open"/a
-    search result always lands somewhere the job is actually listed,
-    instead of silently landing on a screen where it can't be found."""
+    """Which screen a job's own detail actually lives on -- checked
+    against each screen's REAL membership rule, not guessed. Active only
+    covers rm.ACTIVE_JOB_WORKSPACE_STATUSES (New/Approved/In Progress/
+    Needs Review); Closings covers "In Progress" and Closed-but-unsettled;
+    Closed+Settled/Cancelled/Rejected only appears on the Completed
+    (history) screen. Shared by Action Center, search, and Next
+    Actionable Job so none of them ever silently land on a screen the
+    job doesn't actually appear on.
+
+    A "Handle Manually" job (assign_technician rejected every candidate,
+    or an operator explicitly chose "Handle manually") falls into NONE
+    of the three -- found as a real bug while testing search against
+    Scenario D: routing it to "active" like everything else landed on a
+    screen where it silently isn't listed, and the operator ends up
+    looking at whatever job happens to be first in that list instead,
+    with no error or indication anything went wrong. Action Center is
+    the one place such a job is guaranteed to be visible (its
+    `human_review_required` section), so that's the honest answer here
+    -- this build has no dedicated single-job detail screen for this
+    status yet."""
     status = job.get("status")
     if status in ("Cancelled", "Rejected"):
         return "history"
     if status == "Closed":
         return "history" if job.get("reconciliation_state") == "Settled" else "closings"
-    return "active"
+    if status in rm.ACTIVE_JOB_WORKSPACE_STATUSES:
+        return "active"
+    return "actioncenter"
 
 
 def _action_center_job_item(

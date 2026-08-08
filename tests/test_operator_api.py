@@ -1300,6 +1300,32 @@ def test_action_center_job_screen_routes_a_closing_stage_job_to_closings_not_act
     assert item["screen"] == "closings"
 
 
+def test_action_center_job_screen_routes_a_handle_manually_job_to_action_center_not_active(api_env):
+    """Regression, found live while testing global search against a
+    Scenario-D-shaped job: status "Handle Manually" is in NEITHER
+    Active's ACTIVE_JOB_WORKSPACE_STATUSES NOR Closings'/History's
+    membership rules -- it was falling through _job_target_screen's old
+    "anything else defaults to active" catch-all, so search/Open/Next
+    Actionable Job all silently sent the operator to the Active screen,
+    where the job never appears (selectActive falls back to whatever
+    job happens to be first in the list, no error surfaced). Action
+    Center's own human_review_required section is the one place such a
+    job is guaranteed listed."""
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        conn.execute("UPDATE jobs SET status = 'Handle Manually' WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    result = api.route_action_center(None, {}, {})
+    item = next(i for i in result["sections"]["human_review_required"]["items"] if i["id"] == job_id)
+    assert item["screen"] == "actioncenter"
+
+    active_ids = [e["id"] for e in api.route_active(None, {}, {})["entries"]]
+    assert job_id not in active_ids, "sanity check: the job must genuinely not be in Active for this test to mean anything"
+
+
 def test_action_center_lists_a_job_missing_technician_assignment(api_env):
     job_id = _seed_active_job(api_env)  # no technician assigned
     result = api.route_action_center(None, {}, {})
@@ -1541,6 +1567,19 @@ def test_search_result_screen_routes_a_settled_job_to_history(api_env):
     result = api.route_search(None, {}, {"q": "A200"})
     match = next(r for r in result["results"] if r["entity_id"] == job_id)
     assert match["screen"] == "history"
+
+
+def test_search_result_screen_routes_a_handle_manually_job_to_action_center(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    try:
+        conn.execute("UPDATE jobs SET status = 'Handle Manually' WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    result = api.route_search(None, {}, {"q": "A200"})
+    match = next(r for r in result["results"] if r["entity_id"] == job_id)
+    assert match["screen"] == "actioncenter"
 
 
 def test_search_never_returns_phone_or_address(api_env):

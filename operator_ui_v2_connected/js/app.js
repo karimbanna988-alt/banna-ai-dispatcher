@@ -213,7 +213,7 @@ Api.getDemoStatus().then(status => {
 })();
 
 /* ============================================================ NAVIGATION */
-function setScreen(name) {
+function setScreen(name, opts) {
   state.screen = name;
   document.querySelectorAll(".screen").forEach(el => el.classList.toggle("active", el.id === "screen-" + name));
   document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item[data-screen]").forEach(el => {
@@ -221,7 +221,19 @@ function setScreen(name) {
   });
   closeSheet();
   closeSettingsMenu();
-  refreshAll();
+  // { skipRefresh: true } is for a caller about to do its own explicit,
+  // awaited load-then-select right after this call -- letting this
+  // function ALSO fire its own unawaited refreshAll() would start a
+  // second, uncontrolled concurrent fetch of the same data. Both
+  // resolve independently and can call the same screen's render
+  // function in either order; if the fire-and-forget one lands last it
+  // silently overwrites a just-made selection with its own
+  // default-first-item fallback. This was a real, reproduced bug even
+  // after switching the racing caller from setTimeout(0) to a plain
+  // await -- awaiting the SECOND load never controlled the FIRST
+  // (unawaited) one setScreen itself kicks off. Every normal nav click
+  // omits opts and keeps refreshing exactly as before.
+  if (!(opts && opts.skipRefresh)) refreshAll();
 }
 document.querySelectorAll(".desktop-sidebar .nav-item, .mobile-bottom-nav .nav-item[data-screen]").forEach(el => {
   el.addEventListener("click", () => setScreen(el.dataset.screen));
@@ -763,7 +775,7 @@ function wireConfirmModal(j) {
       // screen to navigate and re-find it themselves
       // (docs/WORKFLOW_SPEED_AUDIT.md's stage 6 friction).
       if (r.job_id) {
-        setScreen("active");
+        setScreen("active", { skipRefresh: true });
         await loadActive();
         selectActive(r.job_id);
       }
@@ -1487,7 +1499,7 @@ async function handleActiveAction(action, id, msgId) {
     } else if (action === "go_to_closing") {
       // Fast Path: stay on this same job, just switch screens for it --
       // no separate "find it in the Closings list" step.
-      setScreen("closings");
+      setScreen("closings", { skipRefresh: true });
       await loadClosings();
       selectClosing(id);
     }
@@ -2164,20 +2176,27 @@ async function runSearch(q) {
 // "Next actionable job" -- one normalized item shape
 // (entity_type/entity_id/screen, exactly what operator_api.py's
 // _normalize_action_center_item / search results already produce),
-// one navigation implementation. Deliberately awaits its own explicit
-// load rather than racing setScreen's fire-and-forget refreshAll() with
-// a setTimeout(0) -- that race is real (refreshAll's own load can
-// finish after the timeout and overwrite the selection with its own
-// default fallback). "history" has no per-job selection API yet, so
-// that one case only gets the screen change (still far faster than
-// manually filtering a completed-jobs table).
+// one navigation implementation. setScreen is called with
+// {skipRefresh: true} and this function does its own explicit, awaited
+// load-then-select instead -- letting setScreen ALSO fire its normal
+// unawaited refreshAll() would start a second, uncontrolled concurrent
+// fetch of the same screen's data racing this one. This was a real,
+// reproduced bug (not just theoretical): even after this function's
+// own load was already a plain `await` rather than a `setTimeout(0)`,
+// the selection was still intermittently overwritten by setScreen's own
+// fire-and-forget load resolving afterward and reapplying its
+// default-first-item fallback. "history" has no per-job selection API
+// yet, so that case just gets a normal refresh for whatever it shows.
 async function navigateToItem(item) {
-  setScreen(item.screen);
+  setScreen(item.screen, { skipRefresh: true });
   if (item.entity_type === "JOB") {
     if (item.screen === "active") { await loadActive(); selectActive(item.entity_id); }
     else if (item.screen === "closings") { await loadClosings(); selectClosing(item.entity_id); }
+    else { await refreshAll(); }
   } else if (item.entity_type === "INCOMING_MESSAGE") {
     await loadJobs(); selectJob(item.entity_id);
+  } else {
+    await refreshAll();
   }
 }
 
