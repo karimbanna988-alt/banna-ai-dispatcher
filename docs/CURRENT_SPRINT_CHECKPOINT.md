@@ -1,301 +1,300 @@
-# Current Sprint Checkpoint — Operator Speed Implementation Sprint
+# Current Sprint Checkpoint — Operator Speed Round 2
 
-Written at the natural end of the "OPERATOR SPEED IMPLEMENTATION SPRINT
-— FAST PATH + ACTION CENTER + CLOSINGS + PERFORMANCE + RESPONSIVE UX"
-brief. Supersedes the previous checkpoint (that sprint's work — the
-security audit, Scenarios C/D/E, the workflow-speed baseline audit — is
-preserved in git history, HEAD `ad69d01`).
+Written at the natural end of the "FINAL PILOT-CLOSURE SPRINT — OPERATOR
+SPEED ROUND 2 + SEARCH + DENSITY + FINAL SECURITY/PILOT CHECK" brief.
+Supersedes the previous checkpoint (round 1's work — Fast Path, Action
+Center grouping/priority, the first performance fix, the reload-CSRF
+fix — is preserved in git history, HEAD `3350b38`).
 
 ## Starting state
 
-HEAD `ad69d01`. Real DB (`data/dispatcher.db`): 6 jobs, 10 events,
-integrity OK — unchanged throughout this sprint (re-verified below).
+HEAD `3350b38`. Real DB (`data/dispatcher.db`): 6 jobs, 10 events,
+integrity OK — unchanged throughout this round (re-verified below).
 
 ## Scope decision, disclosed up front
 
-The governing brief was again a 14-part, multi-day-scale spec (a full
-guided Fast Path, Action Center rearrangement + deterministic priority,
-an aggressive Closing redesign, typing removal, global search, safe
-keyboard shortcuts, an N+1 performance fix, full responsive
-verification at 5 viewports, a security follow-up pass, and an effort
-model with a 25% reduction target) layered onto an already very long
-session. This sprint implemented — not just documented — a bounded,
-real subset:
+Another 14-part, multi-day-scale brief. This round implemented — not
+just documented — a bounded, real subset: a friction re-audit (found
+nothing further safe to remove from Scenario A itself), global search,
+Next Actionable Job, an Action Center performance fix that closed a
+genuine O(n²) algorithmic issue, an extended pilot-readiness tool, a
+backup-security review, a test-order-flake fix, and an honest effort
+re-measurement. Two real, user-facing bugs were found and fixed
+*during* this round's own live-testing (not planned work, but fixed
+immediately since a broken write/navigation path directly undermines
+the round's purpose) — see below.
 
-1. Fixed the measured N+1-shaped performance issue in
-   `route_active`/`route_action_center`.
-2. Action Center 3-group presentation + deterministic priority buckets.
-3. Fast Path auto-navigation at the two screen-transition friction
-   points the baseline audit identified (dispatch confirm -> Active;
-   technician-completed -> Closings).
-4. Consistent Copy/Mark-sent button wording across all four
-   prepared-outbound flows, plus safe keyboard shortcuts (J/K/Enter/Esc/C).
-5. The effort model, computed with the brief's exact weights and
-   reported honestly (short of the 25% target, with the specific reason
-   why).
+Explicitly **not** attempted, each disclosed at the point it applies:
+typing removal beyond what round 1 already ruled out (Priority 2 — see
+below), a dedicated Closing-stage UI redesign beyond what already
+existed (Priority 6's deeper ask), full desktop-density verification at
+1366×768/1920×1080 and mobile at 430×932 (Priority 7/8 — only the
+screens this round actually changed were spot-checked), and the
+remaining per-job query batching flagged in round 1 (shadow episode,
+technician acceptance — still once per job, not yet batched).
 
-Explicitly **not** attempted, each disclosed at the point it applies in
-`docs/WORKFLOW_SPEED_AUDIT.md`'s "What wasn't done this sprint" section:
-typing removal (Priority 6 — evaluated field-by-field, none safely
-pre-fillable without fabricating data), global search (Priority 8 — a
-standalone-sized feature), a dedicated Closing fast-capture UI beyond
-the navigation fix (Priority 5's deeper redesign), full 5-viewport
-responsive re-verification (only the screens actually changed were spot
-checked), and the remaining per-job query batching in
-`route_active`/`route_action_center` (the duplicate-computation bug was
-fixed; batching the still-once-per-job shadow-episode/technician-
-acceptance lookups was not attempted).
+## Priority 1 — Re-audit for remaining Scenario A friction (DONE, honest null result)
 
-## Priority 1 — Performance fix (DONE)
+Re-scored all 10 stages against the current implementation; reproduced
+the exact same C/N/T/P/S/D counts as the end of round 1. No further
+safe reduction exists in Scenario A's own single-job flow — every
+remaining typed field is genuinely new information (technician's
+message, closing amount, payment method), and every remaining decision
+point is a real judgment call the brief protects. This conclusion
+directed the rest of the round toward a *different* dimension (moving
+between jobs in a queue) rather than forcing a number that doesn't
+exist. Full writeup in `docs/WORKFLOW_SPEED_AUDIT.md`.
 
-`route_active` was computing `_technician_k_dto` and
-`_company_update_owed_dto` **twice** per job (once directly, once again
-inside `_workflow_projection_dto`'s internal call), and both
-`route_active`/`route_action_center` re-queried
-`whatsapp_pending_observations` from scratch inside their per-job
-loops. Both DTOs now accept precomputed values via a sentinel-based
-optional parameter (`_UNSET`, distinguishing "not supplied" from a
-legitimate `None` result); the observations list is fetched once per
-request and threaded through.
+## Priority 2 — Typing audit (DONE, honest null result, folded into Priority 1)
 
-**Measured (synthetic 10/100/500-job databases, never `data/dispatcher.db`):**
+Evaluated per field: ticket/technician/city/service are already
+displayed, never typed, in the current UI (nothing to prefill there).
+The remaining typed fields (technician's raw message, closing amount,
+payment method) cannot be safely prefilled without fabricating data.
+No change made — correctly, per the brief's own prohibition on
+fabricating prices/closing values.
 
-| Jobs | `route_action_center` p50 before&rarr;after | `route_active` p50 before&rarr;after |
+## Priority 3 — Global search (DONE)
+
+`GET /api/search`: matches ticket/source/technician/city/service across
+committed jobs (any status) and live pending messages — never
+phone/address/customer name, matching Action Center's existing no-PII
+rule. Capped at 20 results; the expensive per-result workflow
+projection is only computed for the capped subset, so search stays fast
+regardless of dataset size (measured p50 at 500 synthetic jobs: 14.76ms
+matching-all-of-them, 7.93ms for a single specific match). Frontend: a
+persistent header search box on desktop, a search-icon overlay on
+mobile, `/` focuses it, arrow keys + Enter select a result, Escape
+closes it. Selecting a result navigates directly into that job's Fast
+Path context.
+
+**Tests:** 11 new. **Commit:** `98ee267`.
+
+## Priority 4/5 — Fast Path continuity audit + Next Actionable Job (DONE)
+
+Audited every successful action for continuity; the two screen
+transitions round 1 already fixed (dispatch confirm, Go to Closing)
+were re-confirmed still correct. Added `route_next_actionable_job`: the
+single highest-priority ACTION NOW/NEEDS REVIEW item, using the exact
+same ordering Action Center itself displays. Frontend: a "Next
+actionable job" button in the Action Center header, and a "Waiting on
+technician" + "Next actionable job" prompt on any Active job whose own
+next step is passively waiting on someone else. Never mutates anything
+-- purely a read that tells the frontend where to navigate.
+
+**Tests:** 5 new. **Commits:** `98ee267` (backend), `eb58b57` (frontend
++ shared navigation helper).
+
+## Two real bugs found and fixed while live-testing search (not planned work)
+
+**Bug 1 — `_job_target_screen` sent "Handle Manually" jobs to a screen
+they never appear on.** A job whose technician assignment was rejected
+for every eligible candidate (see Scenario D) gets status "Handle
+Manually" — which is in NEITHER Active's `ACTIVE_JOB_WORKSPACE_STATUSES`
+nor Closings'/History's membership rules. The screen-resolution helper
+(added in round 1's Open-button bugfix) defaulted anything not
+explicitly Closed/Cancelled/Rejected to "active", so search results,
+Action Center's "Open", and Next Actionable Job all silently sent the
+operator to the Active screen for such a job — where it never appears,
+so `selectActive`'s own fallback silently substitutes whatever job
+happens to be first in the list, with no error surfaced. Reproduced
+live via search against a Scenario-D-shaped job (kept "selecting"
+SCEN-F instead of the searched-for SCEN-D). Fixed: unmatched statuses
+now route to `"actioncenter"` (the one screen such a job is genuinely
+listed on, via `human_review_required`) instead of a screen that
+silently doesn't show it.
+
+**Bug 2 — `setScreen()` always fires its own unawaited `refreshAll()`,
+racing any caller that does its own explicit load-then-select right
+after it.** This is why round 1's `setTimeout(0)`→`await` fix for the
+Action Center "Open" button wasn't actually sufficient: awaiting the
+*second* load never controlled the *first*, unawaited one `setScreen`
+itself always kicks off. Both loads fetch the same endpoint
+concurrently; whichever resolves last wins, and if it's the unawaited
+one, it silently overwrites a correct selection with its own
+default-first-item fallback. `setScreen` gained an optional
+`{skipRefresh: true}`, now used by every "navigate then select a
+specific item" call site (`navigateToItem`, `confirm_dispatch`'s
+auto-nav, `go_to_closing`). Verified with 15 repeated trials across 5
+different jobs post-fix (all correct) versus a real, reproducible
+mismatch before it.
+
+Both found and fixed in the same pass rather than deferred, since a
+broken navigation/selection path directly undermines this round's
+entire purpose. **Tests:** 3 new regression tests. **Commit:** `8d0acd2`.
+
+## Priority 9 — Action Center performance round 2 (DONE)
+
+Profiled `route_action_center` at 500 synthetic jobs (all sharing one
+technician — the worst case) with `cProfile` rather than guessing.
+Found `_technician_k_dto`'s "who else is this technician already
+juggling" computation was 80% of the route's total time — an O(n) scan
+per job, making the whole route effectively O(n²) (5.1M `dict.get()`
+calls in a 10-rep profile). Fixed with one O(n) grouping pass
+(`_group_waiting_jobs_by_technician`) computed once per request.
+Also fixed `technician_acceptance_schema_present` being queried twice
+per job (~36% of the remaining cost) via an optional `schema_present`
+param on `storage.get_technician_acceptance`.
+
+Cumulative profiled cost at 500 jobs: 4.78s → 2.41s for 10 reps (~50%
+reduction) on top of round 1's fix. Measured p50 at 500 jobs:
+`route_action_center` 227.60ms → 175.68ms this round (-33.6% vs the
+original pre-round-1 baseline); `route_active` 273.89ms → 212.39ms
+(-59.6% vs original). No caching or SQLite denormalization added.
+
+**Tests:** 2 new. **Commit:** `ae861aa`.
+
+## Priority 11/12 — Backup security review + pilot-readiness tool extension (DONE)
+
+`tools/system_readiness.py` already existed and covered much of what
+was asked (DB integrity/FK, backup destination writable, required
+secrets never printed, duplicate-secret comparison) — extended rather
+than duplicated. Added: technician dispatch/closing-group mapping
+completeness, service-area mapping presence, Quo GET-only and WhatsApp
+no-send structural checks, the 0.0.0.0 bind-address warning, and a
+demo/test DB isolation guard. Every `Check` now carries a category
+(CODE / CONFIGURATION / EXTERNAL INTEGRATION) so a non-PASS result is
+never mistaken for a software defect, per the brief's explicit
+instruction. Run read-only against the real database: surfaced a real,
+previously-undocumented finding — **12 of 15 active technicians are
+missing a dispatch_group and/or closing_group** — informational only,
+not modified (real configuration data).
+
+Backup review: `scripts/backup_database.py`/`restore_database.py`/
+`verify_backup.py` and `docs/BACKUP_RESTORE_RUNBOOK.md` reviewed.
+Mechanism is sound (online-backup API, restore structurally refuses to
+target the live database, retention scoped by exact source filename, no
+secrets ever included). One CONFIGURATION gap documented (backup
+directory doesn't harden its own Windows ACLs) — not a code defect.
+
+**Tests:** 38 new (`tests/test_system_readiness.py`). **Commit:** `51d45c3`.
+
+## Priority 10 — Test-order flake fix (DONE)
+
+`operator_api.py`'s `_LOGIN_ATTEMPTS`/`_ACTIVE_SESSIONS` are
+deliberately in-memory module-level state, but that let one test's
+login-rate-limit exhaustion leak into a nearby test within the pytest
+process — the exact flake round 1's checkpoint documented. New autouse
+`conftest.py` fixture resets both before and after every test. **Commit:** `51d45c3`.
+
+## Priority 13 — Effort re-measurement (DONE, honestly unchanged)
+
+| | Scenario A | Closing |
 |---|---|---|
-| 10 | 6.56ms &rarr; 5.74ms (-12.5%) | 10.31ms &rarr; 6.49ms (-37.0%) |
-| 100 | 45.49ms &rarr; 37.92ms (-16.6%) | 88.84ms &rarr; 47.50ms (-46.5%) |
-| 500 | 264.66ms &rarr; 227.60ms (-14.0%) | 526.33ms &rarr; 273.89ms (-48.0%) |
+| Original (HEAD `ad69d01`) | 61 | 24 |
+| Pre-round-2 (HEAD `3350b38`) | 54 (-11.5%) | 21 (-12.5%) |
+| Final (this round) | **54 (-11.5%, 0% vs pre-round-2)** | **21 (-12.5%, 0% vs pre-round-2)** |
 
-No caching layer, no SQLite denormalization added — purely removing
-duplicate work. **Tests:** 2 new (a pending-observations wiring
-regression, a 50-synthetic-job latency-bound regression).
-**Commit:** `04a15d5`.
-
-## Priority 2/3 — Action Center grouping + priority, Fast Path navigation (DONE)
-
-- New deterministic `priority` field per Action Center item
-  (URGENT/DUE/NORMAL/WAITING) — integer-bucket logic from
-  `human_review_needed`, item age, and a technician-K staleness
-  escalation (30+ min waiting escalates WAITING -> DUE). No AI ranking,
-  no exposed decimal score.
-- New `groups` response field (Action now / Waiting on someone else /
-  Needs review) as a presentation layer over the existing 10 sections —
-  the 10 sections are unchanged in the API and every existing test
-  still passes against them unmodified.
-- Fixed a real, previously-undiscovered bug while rewriting the
-  frontend renderer for this: the JS section-key list used
-  `"ready_for_dispatch"` while the backend's actual key was
-  `"ready_to_dispatch"` — that whole section (jobs ready to send to a
-  technician) silently rendered as permanently empty. Structurally
-  eliminated (stage labels are now driven directly from `next_action`
-  codes, not a second duplicated key list).
-- Fast Path: confirming dispatch now auto-navigates to Active with the
-  same job pre-selected; a job whose technician reported "Completed"
-  shows a dominant "Go to Closing" action that auto-navigates to
-  Closings with that job pre-selected. No screen ever auto-advances
-  into an external send, acceptance, decline, or completion.
-
-**Tests:** 5 new (priority-bucket correctness, group repartitioning
-with no loss/duplication, deterministic within-group ordering).
-Live-verified in-browser at desktop and mobile (screenshots taken,
-described under "Visual acceptance" below).
-**Commit:** `6e67b75`.
-
-## Real bug found and fixed while testing the above: CSRF token lost on reload
-
-`app.js`'s `boot()` calls `Api.checkSession()` (`GET /api/me`), never
-`login()`, whenever the session cookie is already valid — the ordinary
-case on any page reload. `checkSession()` never populated the
-frontend's in-memory CSRF token (only `login()` did), so every write
-after a reload 403'd with "Missing or invalid CSRF token" until an
-explicit logout/login. Found by live-testing the Fast Path changes in
-the browser — every write attempt failed after a routine reload.
-
-**Fix:** `route_me` now also returns `csrf_token_for(session_token)` —
-the same pure function `route_login` already used, re-derived from a
-session token the request already proved possession of, so no new
-secret or capability is created. `checkSession()` stores it.
-**Tests:** 2 new, end-to-end (`GET /api/me` alone, never `/api/login`,
-produces a token that a subsequent write accepts; the token matches
-what login would have issued). **Documented:**
-`docs/SECURITY_AUDIT.md` finding #5 (updated in place, since it
-directly concerns the CSRF/session mechanism that finding covers).
-**Commit:** `6e67b75` (bundled with Priority 2/3 — found and fixed in
-the same pass, not deferred, since a broken write path after any
-reload directly undermines this sprint's entire goal).
-
-## Priority 4/7 — Copy/Mark-sent consistency + safe keyboard shortcuts (DONE)
-
-All four prepared-outbound flows (company K, technician dispatch,
-company update, company closing) now use the same pattern: "Copy
-&lt;thing&gt;" + "Mark sent manually" (K keeps its own already-consistent
-"Mark K sent manually"). Four different confirm-sent phrasings
-("Confirm sent manually", "I sent this reply manually", "Confirm
-company response sent manually", "I sent this closing manually")
-collapsed to one.
-
-Safe keyboard shortcuts, desktop-only (mobile needs none of this):
-`J`/`K` move selection in whichever list screen is open (Jobs/Active/
-Closings); `Enter` opens the mobile sheet for the current selection;
-`Esc` closes any open sheet/modal; `C` clicks the current detail's one
-prepared-copy button, but only when exactly one exists (never a guess).
-None bound to a mutating action — mark sent, assign, accept/decline
-technician, closing confirmation, and complete all stay click-only.
-`/` (focus search) intentionally not bound — no search feature exists
-in this build to focus.
-
-Live-verified in-browser: J/K move and clamp at list boundaries, typing
-in a textarea doesn't trigger any shortcut, Esc closes an open sheet, C
-clicks the single unambiguous copy target.
-**Commit:** `e2426f1`.
-
-## Priority 14 — Effort model, before/after (DONE, honestly short of target)
-
-`EFFORT = C + 3N + 4T + 2P + 2S + 3D`, the brief's exact weights,
-applied stage-by-stage to Scenario A's 10 stages.
-
-- **Full Scenario A:** 61 &rarr; 54 (**-11.5%**).
-- **Closing workflow alone:** 24 &rarr; 21 (**-12.5%**).
-
-Both fall short of the brief's 25% aspirational target — reported as
-measured, not adjusted, per the brief's own "do not manipulate the
-metric" instruction. N (navigation, 3x weight) was fully eliminated
-where touched (both of Scenario A's two screen transitions now cost
-zero operator-recalled navigation) — the highest-leverage change
-available, since there were only two navigation points to remove and
-both are gone. T (typing, 4x — the heaviest weight in the model) was
-deliberately left untouched: every remaining typed field is genuinely
-new information from outside the system (a technician's message, a
-closing amount, a payment method), and pre-filling any of it would mean
-fabricating data, which the brief's own absolute safety rules prohibit.
-D (decision points) was correctly left unchanged — none of this
-sprint's changes removed a real judgment call. Full stage-by-stage
-table and reasoning in `docs/WORKFLOW_SPEED_AUDIT.md`.
-
-**Caveat documented in the same file:** this model is scoped to one job
-moving through the workflow alone, so it does not capture Action
-Center's multi-job triage improvement (including the section-key bug
-fix) — that benefit is real but has no dimension in this particular
-model.
-
-**Commit:** `76d382b`.
+Unchanged, honestly — no further Scenario A/Closing friction was found
+or removed (see Priority 1). Two new supplementary scenarios quantify
+what this round actually improved (a different dimension entirely):
+"find a job when its stage is unknown" (search) 13 → 6 (-53.8%); "move
+to the next actionable job" (Next Actionable Job) 7 → 1 (-85.7%). Full
+tables and reasoning in `docs/WORKFLOW_SPEED_AUDIT.md`.
 
 ## Visual acceptance (live-verified, this checkpoint)
 
-A completely fresh demo (`scripts/seed_command_center_demo_db.py` +
-`scripts/seed_demo_scenarios.py`, all six scenarios A-F) was seeded into
-a new scratchpad database, and a fresh `operator_api.py` process started
-against it (port 8519, `--no-bridge-adapter`, throwaway demo password
-and session secret) — the mid-development demo instance used while
-building this sprint's features was not reused for final acceptance,
-to verify the actual shipped state rather than a state polluted by
-manual testing.
+A completely fresh demo was seeded (`scripts/seed_command_center_demo_db.py`
++ `scripts/seed_demo_scenarios.py`, all six scenarios A-F) into a new
+scratchpad database, with a fresh `operator_api.py` process (port 8520,
+`--no-bridge-adapter`, throwaway demo password/session secret) — the
+mid-development instance was not reused for final acceptance.
 
-Verified at desktop (1440×900):
-- Command Center loads.
-- Action Center: 3 groups (Action now (8) / Waiting on someone else (6)
-  / Needs review (4)), correct priority chips and ordering (the
-  4-hour-old unassigned job sorts first in Action Now as URGENT; stale
-  8/6/5/3-hour waits sort before fresh waits in the Waiting group).
-- F400 (technician reported Completed) shows the "Go to Closing"
-  primary action; lifecycle stepper renders correctly.
+**Desktop (1440×900):** Command Center; Action Center (3 groups, correct
+priority ordering, "Next actionable job" button); search (found SCEN-D
+by ticket, landed on Action Center — the correct screen for a
+Handle-Manually job, confirming Bug 1's fix); normal Fast Path (F400 →
+"Go to Closing"); Human Review (SCEN-D visible with its real blocking
+reason); Closing (SCEN-E's incomplete-closing state, "Missing: amount,
+payment method"); Completed (SCEN-A closed, D600 cancelled). Race-fix
+stress test: 15/15 correct across repeated search-then-click trials on
+5 different jobs.
 
-Verified at mobile (375×812):
-- Action Center renders as single-column cards, priority chips visible,
-  bottom nav present and not overlapping content, no horizontal scroll.
-- F400's detail opens in the bottom sheet with "Go to Closing" as the
-  dominant primary action, reachable without scrolling.
-- Clicking "Go to Closing" on mobile correctly navigates to Closings
-  with F400 pre-selected and its capture form open.
+**Mobile (375×812):** Action Center as single-column cards with the
+"Next actionable job" button, priority chips, no horizontal scroll;
+mobile search overlay (search-icon toggle, full-width results); Fast
+Path bottom sheet (F400 → "Go to Closing" reachable without scrolling)
+confirmed correctly navigating to Closings when tapped (the properly
+scoped/visible button — an initial test-script false negative from an
+unscoped `document.querySelector` matching the desktop pane's
+`display:none` duplicate copy was investigated and ruled out as a real
+bug; a real finger tap can only ever reach the visible sheet element).
 
 Not re-verified this pass: 1366×768/1920×1080 desktop, 430×932 mobile,
-and Command Center/Jobs/Closings at mobile width (no layout changes
-were made to those screens this sprint, so this is a coverage gap, not
-a known issue — disclosed rather than silently skipped).
+Command Center/Jobs/Closings layout at mobile width (no layout changes
+were made to those beyond what's described above).
 
 ## Safety confirmations (re-verified at checkpoint time)
 
 - Real `data/dispatcher.db`: `PRAGMA integrity_check` = `ok`, zero FK
   violations, 6 jobs / 10 events — unchanged from the start of this
-  sprint and every prior sprint.
-- `.env`: untouched, not inspected or modified this sprint (still
-  `.gitignore`d, confirmed).
+  round and every prior round.
+- `.env`: untouched, not inspected or modified this round.
 - No Quo message sent, no Quo POST/PUT/PATCH/DELETE call made —
-  `quo_client.py` re-confirmed to contain no method capable of a
-  non-GET request.
-- No WhatsApp message sent, no send-capable `whatsapp-web.js` method
-  called; the bridge's receive-only guarantee was not touched.
+  re-confirmed structurally via `tools/system_readiness.py`'s new
+  `check_quo_read_only`, which now runs as a repeatable regression
+  check, not just a one-time manual grep.
+- No WhatsApp message sent, no send-capable method called —
+  re-confirmed structurally via the new `check_whatsapp_no_send`.
 - The live WhatsApp bridge was never started or re-paired — every demo
-  server this sprint used ran with `--no-bridge-adapter`.
+  server this round used `--no-bridge-adapter`.
 - The WhatsApp pilot allowlist and real technician mappings were not
-  touched.
-- `OPERATOR_API_SESSION_SECRET`'s known duplicate-line issue was not
-  resolved (still explicitly out of scope, unchanged from every prior
-  sprint).
-- The `0.0.0.0` server bind address was not changed (still awaiting
-  owner confirmation, per Security Audit finding #9, unchanged from the
-  prior sprint).
-- No secret value appears in any diff this sprint (checked via
-  `git diff` grep across every commit's touched files).
-- Full suite: **1492 passed, 0 failed**
-  (`python -m pytest -q tests`, ~320s). One flaky failure was observed
-  in an earlier run of the same suite
-  (`test_post_without_csrf_token_rejected`, passes deterministically in
-  isolation) — traced to `operator_api.py`'s module-level
-  `_LOGIN_ATTEMPTS`/`_ACTIVE_SESSIONS` dicts not being reset between
-  tests, a pre-existing test-isolation gap (same category as the
-  "socket-teardown flake" noted in earlier checkpoints), not a
-  regression from this sprint's changes — confirmed by running the
-  full suite again cleanly and by running the affected test file alone
-  twice with zero failures either time.
+  touched (the technician-mapping *finding* is informational only).
+- `OPERATOR_API_SESSION_SECRET`'s duplicate-line issue and the
+  `0.0.0.0` bind address were not changed (both still awaiting owner
+  decision, unchanged from every prior round).
+- No secret value appears in any diff this round.
+- Full suite: **1522 passed, 0 failed** (`python -m pytest -q tests`,
+  ~330s, run twice cleanly this round with zero flakes observed post-fix).
 
 ## Remaining blockers before a paid pilot
 
-Unchanged from the prior checkpoint: owner decision on the `0.0.0.0`
-bind address; the duplicate `OPERATOR_API_SESSION_SECRET` line in
-`.env`; backup file permissions unreviewed. New, minor, operational-only
-item from this sprint: if a pilot's session was already open before
-this upgrade, one logout/login clears the (now-fixed) reload CSRF gap
-cleanly for that session — not a blocker, just a one-time note for
-whoever deploys this update to a live pilot.
+Unchanged from the prior checkpoint (owner decision on `0.0.0.0`,
+duplicate session-secret line, backup directory ACL hardening on a
+shared machine) plus one new, real, actionable item this round's
+pilot-readiness tool surfaced: **12 of 15 active technicians are
+missing a dispatch_group and/or closing_group** — confirm every
+technician who will receive real dispatches during a pilot has both
+configured before relying on them (`python tools/system_readiness.py`
+to re-check).
 
 ## Remaining blockers before automatic outbound production
 
-Unchanged: Quo remains structurally GET-only, WhatsApp sending remains
-structurally absent, no auto-send/accept/complete path exists anywhere
-— every state transition that reaches an external party or a terminal
-status still requires an explicit human click, including every new Fast
-Path transition added this sprint (which only ever auto-navigates
-screens/pre-selects a job, never auto-confirms an external action).
+Unchanged: Quo remains structurally GET-only (now with a repeatable
+regression check, not just a documented audit finding), WhatsApp
+sending remains structurally absent (same), no auto-send/accept/
+complete path exists anywhere — search and Next Actionable Job are both
+pure reads, neither can mutate a job.
 
 ## Exact next steps
 
-1. **Remaining query batching** for `route_active`/`route_action_center`
-   (shadow episode, technician acceptance lookups) — a real, scoped,
-   future performance task now that the duplicate-computation bug is
-   fixed; only worth doing once real job volume approaches the point
-   where it's user-visible (current real volume: 6 jobs, low single-digit ms).
-2. **Global search (Priority 8)** — backend route, frontend UI, latency
-   measurement, then wire the `/` shortcut that was deliberately left
-   unbound this sprint.
-3. **Closing fast-capture UI (Priority 5's deeper redesign)** — the
-   Closing stage remains the single highest-typing stage in the
-   workflow (T=3 required fields); the navigation friction around it is
-   now fixed, but the data-entry itself was not redesigned this sprint.
-4. **Full responsive re-verification** at the 2 remaining desktop and 1
-   remaining mobile viewport, and at the screens this sprint didn't
-   touch.
-5. **Test-isolation fix** for `operator_api.py`'s module-level
-   `_LOGIN_ATTEMPTS`/`_ACTIVE_SESSIONS` dicts (an autouse fixture that
-   resets them between tests would remove the observed flake).
+1. **Owner action:** review the 12-of-15 technician mapping gap and the
+   `0.0.0.0` bind-address decision.
+2. **Remaining query batching** for `route_active`/`route_action_center`
+   (shadow episode, technician acceptance lookups still run once per
+   job, just no longer duplicated or quadratic) — real, scoped, future
+   task once real job volume makes it worth doing.
+3. **Closing stage's deeper redesign** (Priority 6's full ask beyond
+   navigation) — the Closing stage remains the single highest-typing
+   stage in the workflow; this round's Fast Path navigation to it is
+   done, but the data-entry form itself was not redesigned.
+4. **Full responsive re-verification** at the remaining 2 desktop and 1
+   mobile viewport not covered this round.
+5. **The orphaned/unwired `activeDetailPane` copy on mobile** — noticed
+   while investigating the mobile Fast Path test artifact above:
+   `renderActiveDetail()` writes into `activeDetailPane.innerHTML` even
+   on mobile (where it's `display:none` and invisible), and its own
+   `wireActiveDetailActions` call wires the *wrong* root due to
+   `isMobile()` resolving to the bottom sheet instead. Zero real user
+   impact (the pane is genuinely invisible on mobile) — wasted render
+   work only, not a functional bug. Not fixed this round; noted for a
+   future pass.
 
 ## Demo
 
-Fresh isolated demo left running at `http://127.0.0.1:8519`
-(`--no-bridge-adapter`, throwaway demo password
-`luxor-demo-final`, throwaway session secret, database at
-`<scratchpad>/demo_final_acceptance.db` — never `data/dispatcher.db`),
+Fresh isolated demo left running at `http://127.0.0.1:8520`
+(`--no-bridge-adapter`, throwaway demo password `luxor-round2-final`,
+throwaway session secret, database at
+`<scratchpad>/demo_round2_final.db` — never `data/dispatcher.db`),
 seeded with the standard Command Center fixtures plus all six demo
-scenarios (A-F). This is a clean instance seeded specifically for this
-checkpoint's visual-acceptance pass, separate from the instance used
-during development.
+scenarios (A-F).
