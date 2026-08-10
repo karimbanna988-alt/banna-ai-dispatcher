@@ -90,6 +90,35 @@ STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
 LIVE_WINDOW_MINUTES = luxor_desk_shared.NEW_JOBS_LIVE_WINDOW_SECONDS // 60  # 60 -- single source of truth
 
+# get_live_dispatch_queue()'s "live" bucket is bounded only by the one-time
+# console-activation boundary (console_activation_state.live_queue_started_at,
+# set once and never advanced -- see storage.ensure_live_queue_activated's
+# docstring). It is NOT a rolling recency window, so a raw quo_pending_messages
+# row can sit there for days/weeks without ever aging out on its own.
+# route_new_jobs already compensates for this with its own LIVE_WINDOW_MINUTES
+# split (60 min) for the Jobs screen's "live" vs "older" tabs -- but
+# _compute_action_center historically fed the whole unfiltered "live" bucket
+# straight into Action Center, so a message from 10+ days ago could appear in
+# ACTION NOW as if it were current work (see docs/ACTION_CENTER_STALE_MESSAGE_FIX.md).
+#
+# This is deliberately a MUCH more generous window than LIVE_WINDOW_MINUTES:
+# LIVE_WINDOW_MINUTES marks "brand new, needs immediate triage" for the Jobs
+# screen's own tabs; this constant marks "still plausibly today's operational
+# work" for Action Center, which must not disappear an item the moment it
+# turns 61 minutes old, only once it's genuinely stale backlog. 24 hours is
+# a deliberate, explicit choice for this locksmith-dispatch business (jobs
+# are expected to resolve same-day), not a value derived from any existing
+# constant -- tune if that assumption changes.
+#
+# Applies ONLY to pre-commit raw-message items (INCOMING_MESSAGE / kind
+# "message"). Committed jobs (kind "job") are never filtered by age here --
+# their eligibility for Action Center is governed by jobs.status via
+# derive_next_action(), exactly as before this fix; an old job that is
+# genuinely still active (e.g. Approved with no technician assigned) must
+# keep surfacing regardless of how long it has been waiting -- that is the
+# whole point of Action Center for a job that's fallen behind.
+ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES = 24 * 60
+
 
 class ApiError(Exception):
     def __init__(self, status: int, message: str):
@@ -1031,7 +1060,18 @@ def _compute_action_center(conn) -> dict:
         by_next_action.setdefault(item["next_action"], []).append(item)
 
     live, _backlog, _other = rm.get_live_dispatch_queue(conn)
-    for d in (_new_job_dto(conn, e) for e in live):
+    # See ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES's own comment: "live" here
+    # is bounded only by a one-time activation boundary, not a rolling
+    # window, so an old raw message must be explicitly excluded here or it
+    # would appear in ACTION NOW indefinitely. It remains fully visible in
+    # Inbox Review (route_inbox_review, unaffected by this filter) and in
+    # the Jobs screen's "older" tab (route_new_jobs) -- never deleted,
+    # never marked resolved, never hidden anywhere except this one screen.
+    current_dtos = (
+        d for d in (_new_job_dto(conn, e) for e in live)
+        if d["age_minutes"] <= ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES
+    )
+    for d in current_dtos:
         item = _action_center_message_item(d)
         by_next_action.setdefault(item["next_action"], []).append(item)
 

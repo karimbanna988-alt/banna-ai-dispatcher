@@ -1420,6 +1420,119 @@ def test_action_center_send_job_to_technician_reachable_through_real_workflow_st
     assert matched["next_action"] == "SEND_JOB_TO_TECHNICIAN"
 
 
+# ============================== ACTION CENTER STALE-MESSAGE REGRESSION (Priority-0 fix) ==
+# Reproduces the real production bug: get_live_dispatch_queue()'s "live"
+# bucket is bounded only by a one-time console-activation boundary (see
+# ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES's own comment in operator_api.py),
+# not a rolling window, so a raw quo_pending_messages row from days/weeks
+# ago used to appear in Action Center's ACTION NOW as if it were current
+# work. All items below live-activate with the default (very old, 2020)
+# boundary -- exactly like the real production database's boundary from
+# 2026-07-29 -- so these tests would have failed before the fix.
+
+def _all_action_center_items(result):
+    return [item for group in result["groups"] for item in group["items"]]
+
+
+def test_action_center_excludes_a_pending_quo_message_older_than_the_lookback_window(api_env):
+    seed_live_boundary(api_env)  # defaults to 2020-01-01 -- matches production's stale boundary
+    add_configured_technician(api_env)
+    ten_days_ago_minutes = -(10 * 24 * 60)
+    seed_pending(api_env, "old1", agn_message("STALE1"), minutes_from_now=ten_days_ago_minutes)
+    result = api.route_action_center(None, {}, {})
+    tickets = [i.get("ticket") for i in _all_action_center_items(result)]
+    assert "STALE1" not in tickets
+
+
+def test_action_center_includes_a_recent_pending_quo_message_within_the_lookback_window(api_env):
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "recent1", agn_message("FRESH1"), minutes_from_now=-30)  # 30 min old
+    result = api.route_action_center(None, {}, {})
+    tickets = [i.get("ticket") for i in _all_action_center_items(result)]
+    assert "FRESH1" in tickets
+
+
+def test_action_center_includes_a_message_right_at_the_lookback_boundary(api_env):
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    seed_pending(api_env, "edge1", agn_message("EDGE1"),
+                 minutes_from_now=-(api.ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES - 1))
+    result = api.route_action_center(None, {}, {})
+    tickets = [i.get("ticket") for i in _all_action_center_items(result)]
+    assert "EDGE1" in tickets
+
+
+def test_action_center_old_committed_active_job_is_handled_by_status_not_message_age(api_env):
+    """The exact real-world case this fix must NOT break: job id=1 in
+    production is a real, non-terminal 'Approved' job with no technician
+    assigned, last touched 359 hours ago -- it must keep surfacing in
+    Action Center (ASSIGN_TECHNICIAN) precisely because its *status*
+    still demands action, regardless of how old it is. Only pre-commit
+    raw messages are age-filtered; committed jobs never are."""
+    job_id = _seed_active_job(api_env)  # commits a real job, no technician assigned -> ASSIGN_TECHNICIAN
+    conn = storage.connect(api_env)
+    fifteen_days_ago = (datetime.now(timezone.utc) - timedelta(days=15)).isoformat()
+    conn.execute("UPDATE jobs SET last_event_at = ?, updated_at = ? WHERE id = ?", (fifteen_days_ago, fifteen_days_ago, job_id))
+    conn.commit()
+    conn.close()
+
+    result = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in result["sections"]["assign_technician"]["items"]]
+    assert job_id in ids
+
+
+def test_action_center_whatsapp_observation_correlation_is_unaffected_by_the_message_lookback_filter(api_env):
+    """The message-age filter touches only the raw quo_pending_messages
+    loop -- it must not change how a real WhatsApp observation
+    correlates to a job's next-action projection."""
+    job_id = _seed_active_job_with_technician(api_env)
+    conn = storage.connect(api_env)
+    storage.add_whatsapp_observation(conn, {
+        "message_id": "wa1", "group_id": "g@g.us", "group_name": "Fab Dispatch",
+        "sender": "1555", "direction": "incoming", "timestamp": "1700000000",
+        "text": "k on the way", "extracted_ticket": None, "quoted_message_id": None,
+    })
+    conn.close()
+
+    result = api.route_action_center(None, {}, {})
+    ids = [i["id"] for i in result["sections"]["waiting_technician_k"]["items"]]
+    assert job_id in ids  # unchanged behavior: the job still surfaces normally
+
+
+def test_inbox_review_still_retains_a_message_excluded_from_action_center_by_the_lookback_filter(api_env):
+    """The fix must never delete, resolve, or hide the historical row
+    anywhere else -- route_inbox_review (Archive) is deliberately
+    unfiltered by recency and must still return it."""
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    ten_days_ago_minutes = -(10 * 24 * 60)
+    seed_pending(api_env, "old1", agn_message("STALE1"), minutes_from_now=ten_days_ago_minutes)
+
+    ac = api.route_action_center(None, {}, {})
+    assert "STALE1" not in [i.get("ticket") for i in _all_action_center_items(ac)]
+
+    archive = api.route_inbox_review(None, {}, {"page": 1, "page_size": 50})
+    archive_message_ids = [row["message_id"] for row in archive["messages"]]
+    assert "old1" in archive_message_ids
+
+
+def test_action_center_totals_do_not_count_the_excluded_stale_backlog(api_env):
+    """Requirement 6: counts/KPIs shown alongside Action Center must not
+    treat the excluded stale backlog as active work."""
+    seed_live_boundary(api_env)
+    add_configured_technician(api_env)
+    before = api.route_action_center(None, {}, {})
+    before_total = sum(g["total"] for g in before["groups"])
+
+    ten_days_ago_minutes = -(10 * 24 * 60)
+    seed_pending(api_env, "old1", agn_message("STALE1"), minutes_from_now=ten_days_ago_minutes)
+
+    after = api.route_action_center(None, {}, {})
+    after_total = sum(g["total"] for g in after["groups"])
+    assert after_total == before_total  # the new stale row must not inflate any group's total
+
+
 def test_action_center_ack_company_k_disappears_once_acknowledged(api_env):
     seed_live_boundary(api_env)
     add_configured_technician(api_env)
