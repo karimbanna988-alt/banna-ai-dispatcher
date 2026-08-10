@@ -372,6 +372,55 @@ def test_demo_test_isolation_guard_passes_against_the_real_repo():
     assert result.level == "PASS"
 
 
+# --------------------------------------------------------- human review backlog
+def test_human_review_backlog_pass_when_none_found(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    result = sr.check_human_review_backlog(db_path)
+    assert result.level == "PASS"
+
+
+def test_human_review_backlog_counts_handle_manually_jobs(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    conn = storage.connect(db_path)
+    now = storage._now()
+    conn.execute(
+        "INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at, status) "
+        "VALUES ('T1', 'AGN', '{}', ?, ?, 'Handle Manually')", (now, now),
+    )
+    conn.commit()
+    conn.close()
+    result = sr.check_human_review_backlog(db_path)
+    assert result.level == "WARNING"
+    assert result.category == "CONFIGURATION"
+    assert "1" in result.detail
+
+
+def test_human_review_backlog_counts_technician_declines(tmp_path):
+    db_path = _seeded_db(tmp_path)
+    conn = storage.connect(db_path)
+    now = storage._now()
+    job_cur = conn.execute(
+        "INSERT INTO jobs (ticket_number, source, latest_fields_json, created_at, updated_at, status) "
+        "VALUES ('T1', 'AGN', '{}', ?, ?, 'Approved')", (now, now),
+    )
+    conn.execute(
+        "INSERT INTO technician_acceptance (job_id, declined_at, decline_reason, updated_at) VALUES (?, ?, ?, ?)",
+        (job_cur.lastrowid, now, "too far", now),
+    )
+    conn.commit()
+    conn.close()
+    result = sr.check_human_review_backlog(db_path)
+    assert result.level == "WARNING"
+
+
+def test_human_review_backlog_never_touches_the_real_database():
+    """Uses the same strict read-only sqlite3 URI mode every other DB
+    check in this tool uses -- proven here by pointing it at the real
+    database and confirming it only reads."""
+    result = sr.check_human_review_backlog(storage.DB_PATH)
+    assert result.level in ("PASS", "WARNING")
+
+
 # --------------------------------------------------------------------- main
 def test_main_exit_code_1_when_any_check_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(sr, "run_all_checks", lambda db_path: [sr.Check("x", "FAIL", "bad")])

@@ -26,6 +26,9 @@ Checks, in order:
  17. Server bind address (flags 0.0.0.0, does not change it)
  18. Demo/test database fail-closed guard is importable and raises
      correctly against the real database path
+ 19. Human review backlog -- a conservative, read-only lower bound
+     (Handle Manually + technician-declined jobs), not the exact
+     Action Center count (see that check's own docstring for why)
 
 Each check also reports a category: CODE (a real defect fixable in this
 repo), CONFIGURATION (needs an operator/owner action, not a bug), or
@@ -448,6 +451,42 @@ def check_demo_test_isolation() -> Check:
                  "resolve_db_path('demo', <real db path>) did NOT raise -- fail-closed guard may be broken.")
 
 
+def check_human_review_backlog(db_path: Path) -> Check:
+    """A deliberately conservative, read-only approximation -- NOT the
+    same authoritative count route_action_center's
+    derive_next_action()/derive_pending_message_next_action() produce
+    (this tool does not import operator_api.py, which has real startup
+    side effects like session-secret provisioning, and re-implementing
+    the full projection here would risk becoming the "second,
+    independent count" this codebase's own docstrings warn against).
+    Instead this counts only the two clearest, most common
+    HUMAN_REVIEW_NEEDED triggers directly from the schema: jobs marked
+    "Handle Manually" (assign_technician found no eligible technician,
+    or an operator explicitly chose it) and jobs a technician declined
+    (technician_acceptance.declined_at set). Real-world triggers this
+    does NOT count (a Custom technician update, all-ambiguous K
+    candidates) mean this can undercount the real Action Center backlog
+    but never overcount one of these two categories -- reported as a
+    lower bound, not an exact figure."""
+    if not db_path.exists():
+        return Check("Human review backlog (approximate)", "WARNING", "Database not found -- skipped.", category="CONFIGURATION")
+    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        handle_manually = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'Handle Manually'").fetchone()[0]
+        declined = 0
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='technician_acceptance'").fetchone():
+            declined = conn.execute("SELECT COUNT(*) FROM technician_acceptance WHERE declined_at IS NOT NULL").fetchone()[0]
+    except sqlite3.OperationalError as exc:
+        return Check("Human review backlog (approximate)", "WARNING", f"Could not query: {exc}", category="CONFIGURATION")
+    finally:
+        conn.close()
+    total = handle_manually + declined
+    detail = f"At least {total} job(s) likely need human review (Handle Manually: {handle_manually}, technician declined: {declined}) -- a lower bound, see Action Center for the exact, authoritative list."
+    if total == 0:
+        return Check("Human review backlog (approximate)", "PASS", detail)
+    return Check("Human review backlog (approximate)", "WARNING", detail, category="CONFIGURATION")
+
+
 def run_all_checks(db_path: Path) -> list:
     checks = []
     checks.append(check_crm_port())
@@ -465,6 +504,7 @@ def run_all_checks(db_path: Path) -> list:
     checks.append(check_whatsapp_no_send())
     checks.append(check_bind_address())
     checks.append(check_demo_test_isolation())
+    checks.append(check_human_review_backlog(db_path))
     return checks
 
 
