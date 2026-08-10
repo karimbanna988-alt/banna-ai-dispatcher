@@ -152,4 +152,8 @@ const Api = {
   ignoreWhatsappObservation(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/ignore`, {});
   },
+  getWhatsappShadowFeed() { return this._call("GET", "/api/whatsapp_shadow_feed"); },
+  promoteWhatsappToJob(messageId) {
+    return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});
+  },
 };

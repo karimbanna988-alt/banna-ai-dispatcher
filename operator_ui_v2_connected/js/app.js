@@ -1079,6 +1079,8 @@ document.getElementById("ccChartPeriodSelect").addEventListener("change", (e) =>
 
 /* =============================================================== ACTIVE */
 let whatsappPending = [];
+let whatsappShadowFeedIntervalId = null;
+const WHATSAPP_SHADOW_FEED_POLL_MS = 4000;
 
 async function loadActive() {
   const data = await callOrHandleAuth(() => Api.getActive());
@@ -1087,6 +1089,8 @@ async function loadActive() {
   renderActiveScreen();
   loadWhatsappBridgeStatus();
   loadWhatsappPending();
+  if (whatsappShadowFeedIntervalId) clearInterval(whatsappShadowFeedIntervalId);
+  whatsappShadowFeedIntervalId = setInterval(loadWhatsappPending, WHATSAPP_SHADOW_FEED_POLL_MS);
 }
 
 async function loadWhatsappBridgeStatus() {
@@ -1099,67 +1103,91 @@ async function loadWhatsappBridgeStatus() {
 
 async function loadWhatsappPending() {
   try {
-    const data = await callOrHandleAuth(() => Api.getWhatsappPending());
+    const data = await callOrHandleAuth(() => Api.getWhatsappShadowFeed());
     if (!data) return;
-    whatsappPending = data.pending;
+    whatsappPending = data.items;
     renderWhatsappPending();
   } catch (e) { /* bridge/adapter unreachable -- CRM keeps working normally */ }
 }
 
-const ROLE_LABELS = {
-  COMPANY_JOB_INTAKE: "Company job intake",
-  COMPANY_CLOSINGS: "Company closings",
-  TECH_DISPATCH: "Technician dispatch",
-  TECH_CLOSINGS: "Technician closings",
-  UNMAPPED_WORK: "Unmapped work group",
-  IGNORE: "Ignore",
+const CONFIDENCE_CHIP_CLASS = {
+  EXACT: "chip-settled", STRONG: "chip-settled",
+  AMBIGUOUS: "chip-priority-due", UNMATCHED: "chip-waiting",
 };
 
-function whatsappNextAction(o) {
-  if (o.group_mapping_status === "HUMAN_REVIEW") return "Needs mapping — confirm this group's company/technician, then attach or ignore.";
-  if (o.human_review_needed) return "Bare acknowledgement — check context, then attach or ignore.";
-  if (o.correlated_job_id) return `Likely reply to job #${o.correlated_job_id} — verify, then attach.`;
-  return "Review and attach to the matching job, or ignore.";
+function whatsappFeedTime(iso) {
+  if (!iso) return "--:--";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "--:--";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/* LIVE SHADOW FEED: real WhatsApp message -> group identified -> role
+   identified -> interpreted -> job match/candidate -> next human action.
+   Backed by GET /api/whatsapp_shadow_feed (route_whatsapp_shadow_feed),
+   itself a pure read over whatsapp_pending_observations enriched by the
+   confirmed group registry -- nothing here is auto-sent, auto-accepted,
+   or auto-closed; every row ends in a human click. */
 function renderWhatsappPending() {
   const section = document.getElementById("whatsappPendingSection");
   const list = document.getElementById("whatsappPendingList");
   if (!whatsappPending.length) { section.style.display = "none"; list.innerHTML = ""; return; }
   section.style.display = "block";
   list.innerHTML = whatsappPending.map(o => {
-    const roleLabel = ROLE_LABELS[o.group_role] || o.group_role || "Unmapped work group";
-    const statusChip = o.group_mapping_status === "CONFIRMED"
+    const statusChip = o.mapping_status === "CONFIRMED"
       ? `<span class="chip chip-settled">CONFIRMED</span>`
       : `<span class="chip chip-needs-action">HUMAN REVIEW</span>`;
-    const who = [o.group_company, o.group_technician_name].filter(Boolean).join(" · ");
-    const whoLine = who ? `<div class="detail-meta">${esc(who)}${o.group_service_area ? " · " + esc(o.group_service_area) : ""}</div>` : "";
+    const confidenceChip = o.confidence
+      ? `<span class="chip ${CONFIDENCE_CHIP_CLASS[o.confidence] || ""}">${esc(o.confidence)}</span>` : "";
+    const who = [o.company, o.technician].filter(Boolean).join(" · ");
+    const whoLine = who ? `<div class="detail-meta">${esc(who)}${o.service_area ? " · " + esc(o.service_area) : ""}</div>` : "";
+    const proposedLine = (o.proposed_job_id || o.proposed_ticket)
+      ? `<div class="detail-meta">Proposed: ${o.proposed_job_id ? `job #${o.proposed_job_id}` : ""}${o.proposed_ticket ? ` (${esc(o.proposed_ticket)})` : ""}</div>` : "";
+    const missingLine = (o.missing_fields || []).length
+      ? `<div class="detail-meta">Missing: ${esc(o.missing_fields.join(", "))}</div>` : "";
+    const canPromote = o.role === "COMPANY_JOB_INTAKE" && o.proposed_ticket && o.mapping_status === "CONFIRMED";
+    const canAttach = (o.role === "TECH_DISPATCH" || o.role === "TECH_CLOSINGS") && o.mapping_status === "CONFIRMED";
     return `
     <div class="mobile-row" data-mid="${esc(o.message_id)}">
       <div class="row-top">
-        <strong>${esc(o.group_name)}</strong>
-        <span class="age">${esc(o.extracted_ticket || "no ticket guess")}</span>
+        <strong>${whatsappFeedTime(o.time)} &middot; ${esc(o.group_name)}</strong>
+        ${statusChip}
       </div>
-      <div class="detail-meta">${esc(roleLabel)} ${statusChip} <span class="chip">${o.direction === "outgoing" ? "OUTGOING (audit only)" : "INCOMING"}</span></div>
+      <div class="detail-meta">${esc(o.role_label || o.role)} ${confidenceChip}</div>
       ${whoLine}
-      <div class="row-bottom">${esc(o.text)}</div>
-      <div class="detail-meta">${esc(whatsappNextAction(o))}</div>
+      <div class="row-bottom">${esc(o.interpretation || "")}</div>
+      <div class="row-bottom" style="opacity:.75;">${esc(o.text_preview || "")}</div>
+      ${proposedLine}
+      ${missingLine}
+      <div class="detail-meta"><strong>Next:</strong> ${esc(o.next_action || "")}</div>
       <div class="action-secondary-row" style="margin-top:6px;">
-        <button class="btn btn-primary" data-whatsappaction="attach" data-mid="${esc(o.message_id)}">Attach to selected job</button>
+        ${canPromote ? `<button class="btn btn-primary" data-whatsappaction="promote" data-mid="${esc(o.message_id)}">Promote to job</button>` : ""}
+        ${canAttach && o.proposed_job_id ? `<button class="btn btn-primary" data-whatsappaction="attach-suggested" data-mid="${esc(o.message_id)}" data-jobid="${o.proposed_job_id}">Confirm match: job #${o.proposed_job_id}</button>` : ""}
+        ${canAttach ? `<button class="btn btn-secondary" data-whatsappaction="attach" data-mid="${esc(o.message_id)}">Attach to selected job</button>` : ""}
         <button class="btn btn-secondary" data-whatsappaction="ignore" data-mid="${esc(o.message_id)}">Ignore</button>
       </div>
     </div>`;
   }).join("");
   list.querySelectorAll("[data-whatsappaction]").forEach(el => {
-    el.addEventListener("click", () => handleWhatsappPendingAction(el.dataset.whatsappaction, el.dataset.mid));
+    el.addEventListener("click", () => handleWhatsappPendingAction(el.dataset.whatsappaction, el.dataset.mid, el.dataset.jobid));
   });
 }
 
-async function handleWhatsappPendingAction(action, messageId) {
+async function handleWhatsappPendingAction(action, messageId, jobId) {
   try {
     if (action === "ignore") {
       const r = await callOrHandleAuth(() => Api.ignoreWhatsappObservation(messageId)); if (!r) return;
       await loadWhatsappPending();
+    } else if (action === "promote") {
+      const r = await callOrHandleAuth(() => Api.promoteWhatsappToJob(messageId)); if (!r) return;
+      await loadWhatsappPending();
+      await loadActive();
+    } else if (action === "attach-suggested") {
+      const r = await callOrHandleAuth(() => Api.attachWhatsappObservation(messageId, jobId)); if (!r) return;
+      state.activeRawText[jobId] = r.text;
+      delete state.activePreview[jobId];
+      await loadWhatsappPending();
+      rerenderActiveDetail(jobId);
     } else if (action === "attach") {
       if (!state.activeSelected) { showTransientError("Select an Active job first, then Attach."); return; }
       const r = await callOrHandleAuth(() => Api.attachWhatsappObservation(messageId, state.activeSelected)); if (!r) return;

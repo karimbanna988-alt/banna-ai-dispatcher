@@ -82,6 +82,8 @@ from dispatcher.closing import ClosingInput, render_closing_from_persisted_field
 from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
+from dispatcher.parser import extract_job  # noqa: E402
+from dispatcher import pipeline  # noqa: E402
 from dispatcher.workflow_projection import (  # noqa: E402
     WorkflowProjection, derive_lifecycle_steps, derive_next_action, derive_pending_message_next_action,
 )
@@ -1902,6 +1904,210 @@ def route_whatsapp_ignore(handler: "Handler", match: dict, body: dict) -> dict:
     return {"success": True}
 
 
+# ------------------------------------------- WHATSAPP INTERPRETATION LAYER
+# Read-only enrichment of whatsapp_pending_observations for CONFIRMED
+# registry groups, reusing the exact same business logic every other
+# screen uses (extract_job/classify_incoming for intake,
+# dispatcher.technician_ack's EXACT/STRONG/AMBIGUOUS/UNMATCHED vocabulary
+# for technician-group correlation). Never writes to quo_pending_messages
+# -- WhatsApp stays a separate transport. Never auto-creates a job, never
+# auto-attaches: every result here is a SUGGESTION surfaced for a human
+# to confirm via the existing route_whatsapp_attach (technician messages)
+# or the new route_whatsapp_promote_to_job (company intake) below.
+
+def _registry_row_for_group(conn, group_id: str) -> Optional[dict]:
+    return storage.get_group_registry_entry(conn, group_id)
+
+
+def _resolve_registry_technician(conn, registry_row: dict) -> Optional[dict]:
+    """Prefers a real technicians.id (confirmed via DB dispatch_group/
+    closing_group match, e.g. Sebai/Ashraf/Kabaka) over the unconfirmed
+    free-text name (e.g. Toto/Joe, not yet in the technicians table)."""
+    tech_id = registry_row.get("technician_id")
+    if tech_id:
+        row = storage.get_technician(conn, tech_id)
+        if row:
+            return {"id": row["id"], "name": row["name"], "dispatch_group": row.get("dispatch_group"), "closing_group": row.get("closing_group")}
+    name = registry_row.get("technician_name_unconfirmed")
+    if name:
+        return {"id": None, "name": name, "dispatch_group": None, "closing_group": None}
+    return None
+
+
+_SUGGEST_EXACT, _SUGGEST_STRONG, _SUGGEST_AMBIGUOUS, _SUGGEST_UNMATCHED = (
+    technician_ack.CATEGORY_EXACT, technician_ack.CATEGORY_STRONG,
+    technician_ack.CATEGORY_AMBIGUOUS, technician_ack.CATEGORY_UNMATCHED,
+)
+
+
+def _suggest_job_for_technician(all_jobs: list, technician: Optional[dict], extracted_ticket: Optional[str]) -> dict:
+    """Generalization of technician_ack.classify_candidate's category
+    vocabulary to ANY technician-group message (K, ETA, update, closing),
+    not just acknowledgement-shaped text -- classify_candidate itself
+    only fires for exact "k"/"ok"/decline-vocabulary text, which is too
+    narrow for "which job is this ETA/closing about". Same four
+    categories, same meaning: EXACT (ticket named), STRONG (exactly one
+    open job for this technician), AMBIGUOUS (more than one, no ticket
+    named), UNMATCHED (none, or no technician resolved)."""
+    if not technician or not technician.get("name"):
+        return {"job": None, "category": _SUGGEST_UNMATCHED, "reasons": ["no technician resolved for this group"]}
+    open_jobs = [
+        j for j in all_jobs
+        if j.get("assigned_technician_name") == technician["name"] and j.get("status") in shared.ACTIVE_STATUSES
+    ]
+    ticket = (extracted_ticket or "").strip().upper()
+    if ticket:
+        exact = [j for j in open_jobs if (j.get("ticket_number") or "").strip().upper() == ticket]
+        if exact:
+            return {"job": exact[0], "category": _SUGGEST_EXACT, "reasons": [f"message references ticket {ticket}"]}
+    if len(open_jobs) == 1:
+        return {"job": open_jobs[0], "category": _SUGGEST_STRONG, "reasons": [f"{technician['name']} has exactly one open job"]}
+    if len(open_jobs) > 1:
+        return {"job": None, "category": _SUGGEST_AMBIGUOUS, "reasons": [f"{technician['name']} has {len(open_jobs)} open jobs, message names no ticket"]}
+    return {"job": None, "category": _SUGGEST_UNMATCHED, "reasons": [f"{technician['name']} has no open job"]}
+
+
+_ROLE_LABELS = {
+    "COMPANY_JOB_INTAKE": "COMPANY JOB INTAKE", "COMPANY_CLOSINGS": "COMPANY CLOSINGS",
+    "TECH_DISPATCH": "TECH DISPATCH", "TECH_CLOSINGS": "TECH CLOSINGS",
+    "UNMAPPED_WORK": "UNMAPPED WORK", "IGNORE": "IGNORE",
+}
+
+
+def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rules) -> dict:
+    role = obs.get("group_role") or "UNMAPPED_WORK"
+    confirmed = bool(obs.get("group_mapping_confirmed"))
+    base = {
+        "role": role, "role_label": _ROLE_LABELS.get(role, role),
+        "mapping_status": "CONFIRMED" if confirmed else "HUMAN_REVIEW",
+        "company": obs.get("group_company"), "technician": obs.get("group_technician_name"),
+        "service_area": obs.get("group_service_area"),
+        "interpretation": None, "proposed_job_id": None, "proposed_ticket": None,
+        "confidence": None, "missing_fields": [], "next_action": "HUMAN_REVIEW_NEEDED",
+    }
+    if not confirmed:
+        base["next_action"] = "GROUP_MAPPING_REQUIRED" if role == "UNMAPPED_WORK" else "HUMAN_REVIEW_NEEDED"
+        base["interpretation"] = "Unmapped/unconfirmed group -- no interpretation attempted."
+        return base
+
+    if role == "COMPANY_JOB_INTAKE":
+        job = extract_job(obs["text"], vehicle_rules)
+        classify_result = storage.classify_incoming(conn, job)
+        core = {"ticket": job.ticket_number.value, "phone": job.phone.value, "address": job.address.value, "service": job.service_type.value}
+        missing = [k for k, v in core.items() if not v]
+        needs_review = bool(missing) or bool(classify_result.conflicting_fields)
+        base.update({
+            "interpretation": "NEW JOB DETECTED" if job.ticket_number.value else "MESSAGE RECEIVED -- INSUFFICIENT DATA",
+            "proposed_ticket": job.ticket_number.value, "missing_fields": missing,
+            "confidence": "LOW" if needs_review else "OK",
+            "next_action": "REVIEW" if needs_review else "REVIEW -- READY TO PROMOTE",
+            "existing_job_id": classify_result.existing_job_id,
+        })
+        return base
+
+    if role in ("TECH_DISPATCH", "TECH_CLOSINGS"):
+        registry_row = storage.get_group_registry_entry(conn, obs["group_id"])
+        technician = _resolve_registry_technician(conn, registry_row) if registry_row else None
+        suggestion = _suggest_job_for_technician(all_jobs, technician, obs.get("extracted_ticket"))
+        job = suggestion["job"]
+        text_lower = (obs.get("text") or "").strip().lower()
+        if role == "TECH_DISPATCH":
+            if text_lower in technician_ack.ACKNOWLEDGEMENT_TEXTS:
+                interp = "TECHNICIAN K"
+            elif text_lower in technician_ack.DECLINE_TEXTS:
+                interp = "TECHNICIAN DECLINE"
+            elif "eta" in text_lower or any(ch.isdigit() for ch in text_lower):
+                interp = "TECHNICIAN ETA/UPDATE"
+            else:
+                interp = "TECHNICIAN UPDATE"
+            next_action = "CONFIRM TECHNICIAN ACCEPTED" if interp == "TECHNICIAN K" and job else "CONFIRM MATCH / REVIEW"
+        else:
+            interp = "CLOSING RECEIVED"
+            next_action = "REVIEW CLOSING"
+        base.update({
+            "interpretation": interp,
+            "proposed_job_id": job["id"] if job else None,
+            "proposed_ticket": job["ticket_number"] if job else None,
+            "confidence": suggestion["category"],
+            "missing_fields": ["amount", "payment_method"] if role == "TECH_CLOSINGS" else [],
+            "next_action": next_action if job or suggestion["category"] != _SUGGEST_UNMATCHED else "HUMAN_REVIEW_NEEDED",
+        })
+        return base
+
+    if role == "COMPANY_CLOSINGS":
+        base.update({
+            "interpretation": "COMPANY CLOSING DESTINATION",
+            "next_action": "DESTINATION CONTEXT ONLY -- no job created from this group",
+        })
+        return base
+
+    return base
+
+
+def route_whatsapp_shadow_feed(handler: "Handler", match: dict, body: dict) -> dict:
+    """The live-visibility surface Task 3 asks for: every recent pending
+    WhatsApp observation, enriched with role/mapping-status/interpretation/
+    proposed-job/confidence/next-action. Pure read -- computes nothing new
+    into storage, mutates nothing."""
+    conn = get_conn()
+    try:
+        observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+        observations.sort(key=lambda o: o.get("received_at") or "", reverse=True)
+        observations = observations[:100]
+        all_jobs = shared.fetch_jobs(conn)
+        vehicle_rules = shared.get_vehicle_rules()
+        items = []
+        for obs in observations:
+            interp = _interpret_whatsapp_observation(conn, obs, all_jobs, vehicle_rules)
+            items.append({
+                "message_id": obs["message_id"], "time": obs.get("received_at"),
+                "group_id": obs["group_id"], "group_name": obs["group_name"],
+                "text_preview": shared.mask_sensitive(obs["text"])[:280],
+                **interp,
+            })
+        confirmed_count = sum(1 for i in items if i["mapping_status"] == "CONFIRMED")
+        human_review_count = len(items) - confirmed_count
+        return {"items": items, "total": len(items), "confirmed_count": confirmed_count, "human_review_count": human_review_count}
+    finally:
+        conn.close()
+
+
+def route_whatsapp_promote_to_job(handler: "Handler", match: dict, body: dict) -> dict:
+    """Human-triggered "PROMOTE TO JOB" for a COMPANY_JOB_INTAKE candidate.
+    Reuses the exact existing job-commit path
+    (DispatcherService.confirm_whatsapp_dispatch -> storage.save_audit_entry)
+    Quo-sourced dispatches already use -- NOT a second job-creation system.
+    The WhatsApp observation's own message_id becomes the idempotency-key
+    basis, so the existing compute_idempotency_key/get_event_by_idempotency_key
+    guarantee (already used for every other confirm action) makes
+    "same message_id never promotes twice" true for free."""
+    message_id = match["message_id"]
+    observation = whatsapp_bridge_adapter.get_observation(message_id)
+    if observation is None:
+        raise ApiError(404, "No such pending WhatsApp observation.")
+    registry_row = None
+    conn = get_conn()
+    try:
+        registry_row = storage.get_group_registry_entry(conn, observation["group_id"])
+        if not registry_row or not registry_row["confirmed_by_owner"] or registry_row["role"] != "COMPANY_JOB_INTAKE":
+            raise ApiError(400, "This observation's group is not a confirmed COMPANY_JOB_INTAKE group.")
+        vehicle_rules = shared.get_vehicle_rules()
+        job = extract_job(observation["text"], vehicle_rules)
+        classify_result = storage.classify_incoming(conn, job)
+        if not job.ticket_number.value:
+            raise ApiError(400, "Cannot promote: no ticket/reference number could be extracted from this message.")
+        preview = pipeline.process_raw_message(observation["text"], vehicle_rules, shared.get_service_areas(), conn, None)
+        service = _service(conn)
+        result = service.confirm_whatsapp_dispatch(
+            f"whatsapp:{message_id}", job, classify_result, preview.luxor_message,
+        )
+        whatsapp_bridge_adapter.resolve_observation(message_id, "promoted", job_id=result.job_id)
+        shared.clear_pending_caches()
+        return _action_result_dto(result)
+    finally:
+        conn.close()
+
+
 ROUTES = [
     ("POST", r"^/api/login$", route_login, {"public": True, "skip_csrf": True}),
     ("POST", r"^/api/logout$", route_logout, {}),
@@ -1946,6 +2152,8 @@ ROUTES = [
     ("GET", r"^/api/whatsapp_bridge_status$", route_whatsapp_bridge_status, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/attach$", route_whatsapp_attach, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/ignore$", route_whatsapp_ignore, {}),
+    ("GET", r"^/api/whatsapp_shadow_feed$", route_whatsapp_shadow_feed, {}),
+    ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
 

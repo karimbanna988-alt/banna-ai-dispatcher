@@ -2016,3 +2016,186 @@ def test_no_credential_or_session_fields_in_stored_payloads(api_env):
             for bad in forbidden:
                 assert bad not in text
     conn.close()
+
+
+# ==================================================== WHATSAPP INTERPRETATION LAYER
+
+def _seed_registry(db_path, group_id, role, **kw):
+    conn = storage.connect(db_path)
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": group_id, "exact_name": kw.pop("exact_name", group_id), "role": role,
+        "is_active": True, "confirmed_by_owner": kw.pop("confirmed_by_owner", True),
+        "source": "owner_manual", **kw,
+    })
+    conn.close()
+
+
+def _seed_whatsapp_obs(db_path, message_id, group_id, group_name, text, extracted_ticket=None):
+    conn = storage.connect(db_path)
+    storage.add_whatsapp_observation(conn, {
+        "message_id": message_id, "group_id": group_id, "group_name": group_name,
+        "sender": "1555", "direction": "incoming", "timestamp": "1700000000",
+        "text": text, "extracted_ticket": extracted_ticket, "quoted_message_id": None,
+    })
+    conn.close()
+
+
+def test_shadow_feed_unmapped_group_shows_group_mapping_required(api_env):
+    _seed_whatsapp_obs(api_env, "m1", "unknown@g.us", "Some Random Group", "hello")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["mapping_status"] == "HUMAN_REVIEW"
+    assert item["next_action"] == "GROUP_MAPPING_REQUIRED"
+    assert item["proposed_job_id"] is None
+
+
+def test_shadow_feed_unconfirmed_registry_entry_is_human_review_not_confirmed(api_env):
+    _seed_registry(api_env, "g1@g.us", "TECH_DISPATCH", confirmed_by_owner=False)
+    _seed_whatsapp_obs(api_env, "m1", "g1@g.us", "Some Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["mapping_status"] == "HUMAN_REVIEW"
+
+
+def test_shadow_feed_company_job_intake_with_good_data_is_ready_to_promote(api_env):
+    add_configured_technician(api_env)
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("WA700"))
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["role"] == "COMPANY_JOB_INTAKE"
+    assert item["mapping_status"] == "CONFIRMED"
+    assert item["proposed_ticket"] == "WA700"
+    assert item["missing_fields"] == []
+    assert item["next_action"] == "REVIEW -- READY TO PROMOTE"
+
+
+def test_shadow_feed_company_job_intake_with_unparseable_text_shows_missing_fields(api_env):
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Adam - Greenville", "hey can you take this one")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["missing_fields"] != []
+    assert item["next_action"] == "REVIEW"
+    assert item["proposed_job_id"] is None
+
+
+def test_shadow_feed_tech_dispatch_k_with_exactly_one_open_job_is_strong_confidence(api_env):
+    job_id = _seed_active_job_with_technician(api_env)  # assigns "Fabricated Tech", dispatch_group "Fab Dispatch"
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN K"
+    assert item["confidence"] == "STRONG"
+    assert item["proposed_job_id"] == job_id
+    assert item["next_action"] == "CONFIRM TECHNICIAN ACCEPTED"
+
+
+def test_shadow_feed_tech_dispatch_with_no_open_job_is_unmatched_and_human_review(api_env):
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Nobody Assigned")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Nobody Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["confidence"] == "UNMATCHED"
+    assert item["next_action"] == "HUMAN_REVIEW_NEEDED"
+    assert item["proposed_job_id"] is None
+
+
+def test_shadow_feed_tech_dispatch_eta_message_is_labeled_and_matched(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "eta 20 minutes")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN ETA/UPDATE"
+    assert item["proposed_job_id"] == job_id
+
+
+def test_shadow_feed_tech_closings_never_invents_amount(api_env):
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "close@g.us", "Fab Closings", "job's done, paid cash")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "CLOSING RECEIVED"
+    assert "amount" in item["missing_fields"]
+    assert item["next_action"] == "REVIEW CLOSING"
+    assert item["proposed_job_id"] == job_id
+
+
+def test_shadow_feed_company_closings_is_destination_context_only(api_env):
+    _seed_registry(api_env, "cc@g.us", "COMPANY_CLOSINGS", company="GMI")
+    _seed_whatsapp_obs(api_env, "m1", "cc@g.us", "GMI All Areas Closings", "closed ticket 123, $80")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["proposed_job_id"] is None
+    assert "destination context only" in item["next_action"].lower()
+
+
+def test_shadow_feed_never_writes_to_quo_pending_messages(api_env):
+    """Explicit guard for the hard requirement: transports stay separate."""
+    add_configured_technician(api_env)
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("WA701"))
+    api.route_whatsapp_shadow_feed(None, {}, {})
+    assert get_jobs_count(api_env) == 0
+    conn = sqlite3.connect(api_env)
+    n = conn.execute("SELECT COUNT(*) FROM quo_pending_messages").fetchone()[0]
+    conn.close()
+    assert n == 0
+
+
+# ---------------------------------------------------- PROMOTE TO JOB (human action)
+
+def test_promote_to_job_creates_a_real_job_via_the_existing_commit_path(api_env):
+    add_configured_technician(api_env)
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("WA702"))
+    before = get_jobs_count(api_env)
+    result = api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    assert result["success"] is True
+    assert get_jobs_count(api_env) == before + 1
+    assert get_jobs_count(api_env) == 1
+    conn = sqlite3.connect(api_env)
+    n = conn.execute("SELECT COUNT(*) FROM quo_pending_messages").fetchone()[0]
+    conn.close()
+    assert n == 0  # still never written to the Quo transport table
+
+
+def test_promote_to_job_is_idempotent_by_whatsapp_message_id(api_env):
+    add_configured_technician(api_env)
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("WA703"))
+    first = api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    second = api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    assert first["job_id"] == second["job_id"]
+    assert get_jobs_count(api_env) == 1  # never a second job for the same WhatsApp message
+
+
+def test_promote_to_job_rejects_a_non_company_job_intake_group(api_env):
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="X")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Some Dispatch", "k")
+    with pytest.raises(api.ApiError):
+        api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    assert get_jobs_count(api_env) == 0
+
+
+def test_promote_to_job_rejects_when_no_ticket_can_be_extracted(api_env):
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Adam - Greenville", "can someone take this")
+    with pytest.raises(api.ApiError):
+        api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    assert get_jobs_count(api_env) == 0
+
+
+def test_promote_to_job_marks_the_observation_resolved(api_env):
+    add_configured_technician(api_env)
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("WA704"))
+    result = api.route_whatsapp_promote_to_job(None, {"message_id": "m1"}, {})
+    conn = storage.connect(api_env)
+    row = storage.get_whatsapp_observation(conn, "m1")
+    conn.close()
+    assert row["status"] == "promoted"
+    assert row["job_id"] == result["job_id"]
