@@ -357,6 +357,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _add_console_activation_support(conn)
     _add_whatsapp_pending_observations_support(conn)
     _add_technician_acceptance_support(conn)
+    _add_whatsapp_group_registry_support(conn)
+    _add_whatsapp_outgoing_audit_support(conn)
     # Single-row table (id=1 enforced) tracking the last successful Quo poll
     # checkpoint -- one dispatcher polling one org.
     conn.execute(
@@ -1223,14 +1225,46 @@ def _whatsapp_observation_row_to_dict(row) -> dict:
 
 
 def list_whatsapp_pending_observations(conn: sqlite3.Connection, include_resolved: bool = False) -> list:
-    where = "" if include_resolved else "WHERE status = 'pending'"
+    where = "" if include_resolved else "WHERE o.status = 'pending'"
+    # LEFT JOIN, not denormalized at write time: a group's registry role
+    # can be corrected by the owner later without needing to backfill
+    # every historical observation -- the display always reflects the
+    # CURRENT registry state, not a snapshot from when the message
+    # arrived. A group with no registry row at all (should not happen --
+    # the bridge only ever forwards allowlisted groups -- but handled
+    # defensively) reads as UNMAPPED_WORK / HUMAN_REVIEW, never silently
+    # blank.
     rows = conn.execute(
-        "SELECT message_id, group_id, group_name, sender, direction, whatsapp_timestamp, "
-        "text, extracted_ticket, quoted_message_id, correlated_job_id, job_id, status, "
-        f"human_review_needed, human_review_reason, received_at, created_at FROM whatsapp_pending_observations {where} "
-        "ORDER BY id ASC"
+        f"""
+        SELECT o.message_id, o.group_id, o.group_name, o.sender, o.direction, o.whatsapp_timestamp,
+               o.text, o.extracted_ticket, o.quoted_message_id, o.correlated_job_id, o.job_id, o.status,
+               o.human_review_needed, o.human_review_reason, o.received_at, o.created_at,
+               r.role, r.company, r.service_area, r.technician_id, r.technician_name_unconfirmed,
+               r.confirmed_by_owner, r.notes
+        FROM whatsapp_pending_observations o
+        LEFT JOIN whatsapp_group_registry r ON r.group_id = o.group_id
+        {where}
+        ORDER BY o.id ASC
+        """
     ).fetchall()
-    return [_whatsapp_observation_row_to_dict(r) for r in rows]
+    return [_whatsapp_observation_row_to_enriched_dict(r) for r in rows]
+
+
+def _whatsapp_observation_row_to_enriched_dict(row) -> dict:
+    base_cols = _WHATSAPP_OBSERVATION_COLUMNS
+    d = dict(zip(base_cols, row[: len(base_cols)]))
+    d["human_review_needed"] = bool(d["human_review_needed"])
+    (role, company, service_area, technician_id, technician_name_unconfirmed,
+     confirmed_by_owner, notes) = row[len(base_cols):]
+    d["group_role"] = role or "UNMAPPED_WORK"
+    d["group_company"] = company
+    d["group_service_area"] = service_area
+    d["group_technician_id"] = technician_id
+    d["group_technician_name"] = technician_name_unconfirmed
+    d["group_mapping_confirmed"] = bool(confirmed_by_owner)
+    d["group_mapping_status"] = "CONFIRMED" if confirmed_by_owner else "HUMAN_REVIEW"
+    d["group_offline_notes"] = notes
+    return d
 
 
 def get_whatsapp_observation(conn: sqlite3.Connection, message_id: str) -> Optional[dict]:
@@ -1261,6 +1295,166 @@ def resolve_whatsapp_observation(conn: sqlite3.Connection, message_id: str, stat
         )
     conn.commit()
     return get_whatsapp_observation(conn, message_id)
+
+
+_REGISTRY_ROLES = (
+    "COMPANY_JOB_INTAKE", "COMPANY_CLOSINGS", "TECH_DISPATCH", "TECH_CLOSINGS",
+    "UNMAPPED_WORK", "IGNORE",
+)
+
+
+def _add_whatsapp_group_registry_support(conn: sqlite3.Connection) -> None:
+    """Multi-group shadow mode's group identity table. Runtime code must
+    look a group up here by its exact WhatsApp group_id -- never infer a
+    group's role from its display name (names change, get typo'd, and
+    are not a safe identity key). Name-based analysis stays an offline,
+    human-reviewed proposal (see scripts/seed_whatsapp_group_registry.py)
+    that becomes a row here only once explicitly seeded; is_active and
+    confirmed_by_owner both default to inert so importing a row is never
+    itself an activation."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_group_registry (
+            group_id TEXT PRIMARY KEY,
+            exact_name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            company TEXT,
+            service_area TEXT,
+            technician_id INTEGER REFERENCES technicians(id),
+            technician_name_unconfirmed TEXT,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            confirmed_by_owner INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'name_heuristic',
+            notes TEXT,
+            confirmed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def upsert_group_registry_entry(conn: sqlite3.Connection, entry: dict) -> dict:
+    """Idempotent by group_id (the real WhatsApp id, never a name).
+    Re-running the seed script is always safe -- it never creates a
+    duplicate row and never silently downgrades an owner-confirmed row
+    back to unconfirmed unless the caller explicitly passes that."""
+    if entry.get("role") not in _REGISTRY_ROLES:
+        raise ValueError(f"role must be one of {_REGISTRY_ROLES}, got {entry.get('role')!r}")
+    now = _now()
+    existing = conn.execute(
+        "SELECT created_at FROM whatsapp_group_registry WHERE group_id = ?", (entry["group_id"],)
+    ).fetchone()
+    created_at = existing[0] if existing else now
+    conn.execute(
+        """
+        INSERT INTO whatsapp_group_registry
+            (group_id, exact_name, role, company, service_area, technician_id,
+             technician_name_unconfirmed, is_active, confirmed_by_owner, source, notes,
+             confirmed_at, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            exact_name = excluded.exact_name,
+            role = excluded.role,
+            company = excluded.company,
+            service_area = excluded.service_area,
+            technician_id = excluded.technician_id,
+            technician_name_unconfirmed = excluded.technician_name_unconfirmed,
+            is_active = excluded.is_active,
+            confirmed_by_owner = excluded.confirmed_by_owner,
+            source = excluded.source,
+            notes = excluded.notes,
+            confirmed_at = excluded.confirmed_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            entry["group_id"], entry["exact_name"], entry["role"], entry.get("company"),
+            entry.get("service_area"), entry.get("technician_id"),
+            entry.get("technician_name_unconfirmed"),
+            1 if entry.get("is_active") else 0, 1 if entry.get("confirmed_by_owner") else 0,
+            entry.get("source", "name_heuristic"), entry.get("notes"),
+            now if entry.get("confirmed_by_owner") else None, created_at, now,
+        ),
+    )
+    conn.commit()
+    return get_group_registry_entry(conn, entry["group_id"])
+
+
+_REGISTRY_COLUMNS = (
+    "group_id", "exact_name", "role", "company", "service_area", "technician_id",
+    "technician_name_unconfirmed", "is_active", "confirmed_by_owner", "source", "notes",
+    "confirmed_at", "created_at", "updated_at",
+)
+
+
+def _registry_row_to_dict(row) -> dict:
+    d = dict(zip(_REGISTRY_COLUMNS, row))
+    d["is_active"] = bool(d["is_active"])
+    d["confirmed_by_owner"] = bool(d["confirmed_by_owner"])
+    return d
+
+
+def get_group_registry_entry(conn: sqlite3.Connection, group_id: str) -> Optional[dict]:
+    row = conn.execute(
+        f"SELECT {', '.join(_REGISTRY_COLUMNS)} FROM whatsapp_group_registry WHERE group_id = ?",
+        (group_id,),
+    ).fetchone()
+    return _registry_row_to_dict(row) if row else None
+
+
+def list_group_registry(conn: sqlite3.Connection, active_only: bool = False) -> list:
+    where = "WHERE is_active = 1" if active_only else ""
+    rows = conn.execute(
+        f"SELECT {', '.join(_REGISTRY_COLUMNS)} FROM whatsapp_group_registry {where} ORDER BY group_id"
+    ).fetchall()
+    return [_registry_row_to_dict(r) for r in rows]
+
+
+def _add_whatsapp_outgoing_audit_support(conn: sqlite3.Connection) -> None:
+    """Deliberately a SEPARATE table from whatsapp_pending_observations,
+    with no shared accessor function and no column linking it into the
+    attach-to-job flow. This is what makes 'an outgoing message can
+    never become inbound work' a structural fact rather than a runtime
+    check that could be bypassed: nothing in this file ever reads this
+    table when computing what belongs in the actionable pending queue."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_outgoing_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL UNIQUE,
+            group_id TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            whatsapp_timestamp TEXT,
+            text TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def add_whatsapp_outgoing_audit(conn: sqlite3.Connection, entry: dict) -> dict:
+    now = _now()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO whatsapp_outgoing_audit "
+        "(message_id, group_id, group_name, whatsapp_timestamp, text, received_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (entry["message_id"], entry["group_id"], entry["group_name"], entry.get("timestamp"),
+         entry["text"], now, now),
+    )
+    conn.commit()
+    return {"accepted": True, "duplicate": cur.rowcount == 0}
+
+
+def list_whatsapp_outgoing_audit(conn: sqlite3.Connection) -> list:
+    rows = conn.execute(
+        "SELECT message_id, group_id, group_name, whatsapp_timestamp, text, received_at, created_at "
+        "FROM whatsapp_outgoing_audit ORDER BY id ASC"
+    ).fetchall()
+    cols = ("message_id", "group_id", "group_name", "whatsapp_timestamp", "text", "received_at", "created_at")
+    return [dict(zip(cols, r)) for r in rows]
 
 
 def _add_technician_acceptance_support(conn: sqlite3.Connection) -> None:
@@ -2879,6 +3073,22 @@ def shadow_schema_present(conn: sqlite3.Connection) -> bool:
         )
     }
     return {"shadow_episodes", "shadow_events"} <= tables
+
+
+def whatsapp_registry_schema_present(conn: sqlite3.Connection) -> bool:
+    """Same optional-capability pattern as shadow_schema_present() above:
+    the multi-group WhatsApp registry/outgoing-audit tables are layered
+    on top of core revision 2, not counted in SCHEMA_REVISION or
+    _SCHEMA_MARKERS, and checked independently so a database missing
+    only these degrades gracefully rather than being reported as
+    needing an urgent core migration."""
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('whatsapp_group_registry', 'whatsapp_outgoing_audit')"
+        )
+    }
+    return {"whatsapp_group_registry", "whatsapp_outgoing_audit"} <= tables
 
 _SHADOW_EPISODE_JSON_FIELDS = {
     "shadow_reasons": "shadow_reasons_json",

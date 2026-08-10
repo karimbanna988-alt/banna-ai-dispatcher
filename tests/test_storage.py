@@ -567,3 +567,155 @@ def test_fk_repair_aborts_and_reports_orphans_without_enabling_enforcement(tmp_p
     assert raw2.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 3
     schema_sql = raw2.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()[0]
     assert "jobs_pre_source_scoped_unique_backup" in schema_sql  # still drifted, repair rolled back
+
+
+def test_whatsapp_registry_schema_present_true_on_fresh_database(conn):
+    assert storage.whatsapp_registry_schema_present(conn) is True
+
+
+def test_whatsapp_registry_schema_present_false_when_tables_missing(conn):
+    conn.execute("DROP TABLE whatsapp_group_registry")
+    conn.execute("DROP TABLE whatsapp_outgoing_audit")
+    assert storage.whatsapp_registry_schema_present(conn) is False
+
+
+def test_missing_whatsapp_registry_tables_never_fails_the_blanket_schema_check(conn):
+    """Same optional-capability guarantee as Shadow Mode: a database
+    missing only the WhatsApp registry tables must still report
+    core-ready."""
+    conn.execute("DROP TABLE whatsapp_group_registry")
+    conn.execute("DROP TABLE whatsapp_outgoing_audit")
+    status = storage.check_schema_status(conn)
+    assert status.up_to_date
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == storage.SCHEMA_REVISION
+
+
+# ======================================================= WHATSAPP GROUP REGISTRY
+
+def test_registry_upsert_is_idempotent_by_group_id(conn):
+    entry = {"group_id": "111@g.us", "exact_name": "Sebai Augusta Dispatch", "role": "TECH_DISPATCH",
+              "company": None, "service_area": "Augusta", "technician_id": None,
+              "is_active": True, "confirmed_by_owner": True, "source": "owner_manual"}
+    storage.upsert_group_registry_entry(conn, entry)
+    storage.upsert_group_registry_entry(conn, entry)
+    rows = storage.list_group_registry(conn)
+    assert len(rows) == 1
+    assert rows[0]["role"] == "TECH_DISPATCH"
+    assert rows[0]["confirmed_by_owner"] is True
+
+
+def test_registry_rejects_an_unknown_role(conn):
+    with pytest.raises(ValueError):
+        storage.upsert_group_registry_entry(conn, {"group_id": "x@g.us", "exact_name": "x", "role": "NOT_A_ROLE"})
+
+
+def test_registry_upsert_updates_existing_row_in_place(conn):
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "Old Name", "role": "UNMAPPED_WORK",
+        "confirmed_by_owner": False, "is_active": True,
+    })
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "Sebai Augusta Dispatch", "role": "TECH_DISPATCH",
+        "confirmed_by_owner": True, "is_active": True,
+    })
+    rows = storage.list_group_registry(conn)
+    assert len(rows) == 1
+    assert rows[0]["exact_name"] == "Sebai Augusta Dispatch"
+    assert rows[0]["role"] == "TECH_DISPATCH"
+
+
+def test_list_group_registry_active_only_filter(conn):
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "A", "role": "TECH_DISPATCH", "is_active": True,
+    })
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "222@g.us", "exact_name": "B", "role": "IGNORE", "is_active": False,
+    })
+    assert len(storage.list_group_registry(conn)) == 2
+    active = storage.list_group_registry(conn, active_only=True)
+    assert len(active) == 1
+    assert active[0]["group_id"] == "111@g.us"
+
+
+# ================================ PENDING OBSERVATIONS + REGISTRY ENRICHMENT
+
+def _seed_pending_observation(conn, **overrides):
+    obs = {
+        "message_id": "wamid.1", "group_id": "111@g.us", "group_name": "Sebai Augusta Dispatch",
+        "sender": "1555", "direction": "incoming", "timestamp": "1700000000",
+        "text": "k on the way", "extracted_ticket": None, "quoted_message_id": None,
+    }
+    obs.update(overrides)
+    storage.add_whatsapp_observation(conn, obs)
+
+
+def test_pending_observation_from_a_confirmed_registry_group_shows_confirmed_mapping(conn):
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "Sebai Augusta Dispatch", "role": "TECH_DISPATCH",
+        "service_area": "Augusta", "confirmed_by_owner": True, "is_active": True, "source": "owner_manual",
+    })
+    _seed_pending_observation(conn)
+    rows = storage.list_whatsapp_pending_observations(conn)
+    assert len(rows) == 1
+    assert rows[0]["group_role"] == "TECH_DISPATCH"
+    assert rows[0]["group_mapping_status"] == "CONFIRMED"
+    assert rows[0]["group_service_area"] == "Augusta"
+
+
+def test_pending_observation_from_an_unconfirmed_registry_group_shows_human_review(conn):
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "222@g.us", "exact_name": "Some Dispatch Group", "role": "UNMAPPED_WORK",
+        "confirmed_by_owner": False, "is_active": True, "source": "name_heuristic",
+        "notes": "offline guess: technician dispatch group",
+    })
+    _seed_pending_observation(conn, message_id="wamid.2", group_id="222@g.us", group_name="Some Dispatch Group")
+    rows = storage.list_whatsapp_pending_observations(conn)
+    assert rows[0]["group_role"] == "UNMAPPED_WORK"
+    assert rows[0]["group_mapping_status"] == "HUMAN_REVIEW"
+    assert rows[0]["group_offline_notes"] == "offline guess: technician dispatch group"
+
+
+def test_pending_observation_from_a_group_with_no_registry_row_fails_safe_to_human_review(conn):
+    # Should not happen in production (the bridge only forwards allowlisted
+    # groups) but the read path must not crash or silently omit review.
+    _seed_pending_observation(conn, message_id="wamid.3", group_id="333@g.us", group_name="Unregistered Group")
+    rows = storage.list_whatsapp_pending_observations(conn)
+    assert rows[0]["group_role"] == "UNMAPPED_WORK"
+    assert rows[0]["group_mapping_status"] == "HUMAN_REVIEW"
+
+
+def test_correcting_a_registry_role_later_updates_display_for_already_stored_observations(conn):
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "X", "role": "UNMAPPED_WORK",
+        "confirmed_by_owner": False, "is_active": True,
+    })
+    _seed_pending_observation(conn)
+    assert storage.list_whatsapp_pending_observations(conn)[0]["group_mapping_status"] == "HUMAN_REVIEW"
+
+    storage.upsert_group_registry_entry(conn, {
+        "group_id": "111@g.us", "exact_name": "Sebai Augusta Dispatch", "role": "TECH_DISPATCH",
+        "confirmed_by_owner": True, "is_active": True,
+    })
+    assert storage.list_whatsapp_pending_observations(conn)[0]["group_mapping_status"] == "CONFIRMED"
+
+
+# ============================================================ OUTGOING AUDIT
+
+def test_outgoing_audit_is_stored_in_its_own_table_never_in_pending_observations(conn):
+    storage.add_whatsapp_outgoing_audit(conn, {
+        "message_id": "wamid.out.1", "group_id": "111@g.us", "group_name": "Sebai Augusta Dispatch",
+        "timestamp": "1700000000", "text": "on my way",
+    })
+    assert storage.list_whatsapp_outgoing_audit(conn) != []
+    # The actionable queue must never see this -- structurally a different
+    # table with no code path connecting the two.
+    assert storage.list_whatsapp_pending_observations(conn, include_resolved=True) == []
+
+
+def test_outgoing_audit_dedupes_by_message_id(conn):
+    entry = {"message_id": "wamid.out.1", "group_id": "111@g.us", "group_name": "G", "text": "k"}
+    first = storage.add_whatsapp_outgoing_audit(conn, entry)
+    second = storage.add_whatsapp_outgoing_audit(conn, entry)
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    assert len(storage.list_whatsapp_outgoing_audit(conn)) == 1

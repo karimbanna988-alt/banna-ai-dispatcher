@@ -49,11 +49,13 @@ def cmd_check(db_path: Path) -> int:
     conn = storage.connect(db_path)
     status = storage.check_schema_status(conn)
     shadow_ready = storage.shadow_schema_present(conn)
+    whatsapp_registry_ready = storage.whatsapp_registry_schema_present(conn)
     conn.close()
 
     print(f"Current schema revision:  {status.current_revision}")
     print(f"Required schema revision: {status.required_revision}")
     print(f"Shadow Mode schema present (optional): {shadow_ready}")
+    print(f"WhatsApp group registry schema present (optional): {whatsapp_registry_ready}")
     if status.up_to_date:
         print("Core schema is up to date. No core migration required.")
     else:
@@ -62,7 +64,9 @@ def cmd_check(db_path: Path) -> int:
             print(f"  - {item}")
     if not shadow_ready:
         print("Shadow Mode's schema is not yet installed -- optional, run migrate to add it.")
-    if not status.up_to_date or not shadow_ready:
+    if not whatsapp_registry_ready:
+        print("WhatsApp group registry schema is not yet installed -- optional, run migrate to add it.")
+    if not status.up_to_date or not shadow_ready or not whatsapp_registry_ready:
         print()
         print("Run to apply:")
         print(f"  python scripts/manage_schema.py migrate --db {db_path}")
@@ -82,9 +86,10 @@ def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
     conn = storage.connect(db_path)
     status = storage.check_schema_status(conn)
     shadow_ready = storage.shadow_schema_present(conn)
-    if status.up_to_date and shadow_ready:
+    whatsapp_registry_ready = storage.whatsapp_registry_schema_present(conn)
+    if status.up_to_date and shadow_ready and whatsapp_registry_ready:
         conn.close()
-        print("Schema is already up to date (core and Shadow Mode). Nothing to do.")
+        print("Schema is already up to date (core, Shadow Mode, and WhatsApp registry). Nothing to do.")
         return 0
 
     if not status.up_to_date:
@@ -93,6 +98,8 @@ def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
             print(f"  - {item}")
     if not shadow_ready:
         print("Pending optional migration: Shadow Mode schema (shadow_episodes, shadow_events)")
+    if not whatsapp_registry_ready:
+        print("Pending optional migration: WhatsApp group registry schema (whatsapp_group_registry, whatsapp_outgoing_audit)")
     print()
 
     if not assume_yes:
@@ -107,16 +114,21 @@ def cmd_migrate(db_path: Path, assume_yes: bool) -> int:
 
     result = storage.migrate_schema(conn)
     shadow_ready_after = storage.shadow_schema_present(conn)
+    whatsapp_registry_ready_after = storage.whatsapp_registry_schema_present(conn)
     conn.close()
 
-    if result.up_to_date and shadow_ready_after:
-        print(f"Migration complete. Core schema revision is now {result.current_revision}; Shadow Mode schema present: {shadow_ready_after}.")
+    if result.up_to_date and shadow_ready_after and whatsapp_registry_ready_after:
+        print(f"Migration complete. Core schema revision is now {result.current_revision}; "
+              f"Shadow Mode schema present: {shadow_ready_after}; "
+              f"WhatsApp group registry schema present: {whatsapp_registry_ready_after}.")
         return 0
     print("Migration finished but the schema is still not fully up to date:")
     for item in result.missing:
         print(f"  - {item}")
     if not shadow_ready_after:
         print("  - Shadow Mode schema still missing")
+    if not whatsapp_registry_ready_after:
+        print("  - WhatsApp group registry schema still missing")
     print("Re-run this command to resume -- migrate_schema() is idempotent and resumable.")
     return 1
 
@@ -158,6 +170,14 @@ def cmd_verify(db_path: Path) -> int:
         shadow_event_count = conn.execute("SELECT COUNT(*) FROM shadow_events").fetchone()[0]
         print(f"  shadow_episodes rows: {shadow_episode_count}")
         print(f"  shadow_events rows: {shadow_event_count}")
+
+    whatsapp_registry_ready = storage.whatsapp_registry_schema_present(conn)
+    print(f"WhatsApp group registry schema present (optional): {whatsapp_registry_ready}")
+    if whatsapp_registry_ready:
+        registry_count = conn.execute("SELECT COUNT(*) FROM whatsapp_group_registry").fetchone()[0]
+        outgoing_count = conn.execute("SELECT COUNT(*) FROM whatsapp_outgoing_audit").fetchone()[0]
+        print(f"  whatsapp_group_registry rows: {registry_count}")
+        print(f"  whatsapp_outgoing_audit rows: {outgoing_count}")
 
     print("Row counts:")
     for table in ("jobs", "events", "quo_pending_messages", "technicians"):
