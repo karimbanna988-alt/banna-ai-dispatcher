@@ -282,10 +282,15 @@ def test_startup_scripts_fail_when_start_crm_no_longer_references_operator_api(t
 
 # This confirms the actual repo state matches what the check expects to find
 # (a real regression test, not just a mocked-filesystem unit test).
-def test_startup_scripts_check_against_the_real_repo_reports_the_known_gap():
+def test_startup_scripts_check_against_the_real_repo_now_passes():
+    """Regression: this used to be
+    test_..._reports_the_known_gap (asserting ACTION REQUIRED) --
+    tools/windows_launcher/launcher.py was fixed to start operator_api.py
+    instead of the retired luxor_desk.py, so the real repo now passes
+    this check structurally. If this ever regresses back to FAIL/ACTION
+    REQUIRED, that's a real reintroduction of the old bug."""
     result = sr.check_startup_scripts_current()
-    assert result.level == "ACTION REQUIRED"
-    assert "windows_launcher" in result.detail
+    assert result.level == "PASS"
 
 
 # -------------------------------------------------------- technician mappings

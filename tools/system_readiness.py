@@ -312,11 +312,12 @@ def _read_env_var_from_file(env_path: Path, var_name: str) -> Optional[str]:
 
 
 def check_startup_scripts_current() -> Check:
-    """The known gap this repeatedly documents: tools/windows_launcher/
-    still launches the retired `streamlit run luxor_desk.py`, not the
-    canonical operator_api.py CRM that scripts/start_crm.ps1 starts.
-    See scripts/start_crm.ps1's own docstring, which already discloses
-    this."""
+    """Confirms tools/windows_launcher/launcher.py starts the canonical
+    operator_api.py CRM (matching scripts/start_crm.ps1) rather than the
+    retired luxor_desk.py Streamlit interface. This was a real,
+    documented gap for several sprints -- fixed directly in launcher.py
+    itself, so this check now passes structurally rather than
+    permanently reporting the same known issue."""
     launcher = REPO_ROOT / "tools" / "windows_launcher" / "launcher.py"
     start_crm = REPO_ROOT / "scripts" / "start_crm.ps1"
 

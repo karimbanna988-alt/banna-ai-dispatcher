@@ -1,5 +1,6 @@
 """Tests for tools/windows_launcher/launcher.py -- the Windows one-click
-launcher for luxor_desk.py + its Cloudflare tunnel. Every test uses a
+launcher for operator_api.py (the canonical CRM) + its Cloudflare
+tunnel. Every test uses a
 fake ProcessBackend; no real process is ever started, stopped, or
 network-called, and PID/log files are always written under a temporary
 directory, never the project's real .deploy_logs/launcher/. Launcher.py
@@ -108,11 +109,14 @@ def test_start_when_nothing_running(isolated_paths):
     assert launcher.TUNNEL_PID_FILE.exists()
     assert launcher.TUNNEL_URL_FILE.read_text(encoding="utf-8") == "https://one-two-three.trycloudflare.com"
 
-    # Exactly one of each process was actually started.
-    streamlit_calls = [c for c in fake.popen_calls if "streamlit" in c]
+    # Exactly one of each process was actually started, and it's the
+    # canonical operator_api.py CRM -- not the retired luxor_desk.py
+    # Streamlit interface this launcher used to start.
+    streamlit_calls = [c for c in fake.popen_calls if "operator_api.py" in c]
     tunnel_calls = [c for c in fake.popen_calls if "cloudflared" in c]
     assert len(streamlit_calls) == 1
     assert len(tunnel_calls) == 1
+    assert not any("streamlit" in c or "luxor_desk.py" in c for c in fake.popen_calls)
 
 
 def test_repeated_start_does_not_create_duplicates(isolated_paths):
@@ -124,7 +128,7 @@ def test_repeated_start_does_not_create_duplicates(isolated_paths):
     assert second["streamlit_pid"] == first["streamlit_pid"]
     assert second["tunnel_pid"] == first["tunnel_pid"]
     assert any("already running" in m for m in second["messages"])
-    streamlit_calls = [c for c in fake.popen_calls if "streamlit" in c]
+    streamlit_calls = [c for c in fake.popen_calls if "operator_api.py" in c]
     tunnel_calls = [c for c in fake.popen_calls if "cloudflared" in c]
     assert len(streamlit_calls) == 1  # not started a second time
     assert len(tunnel_calls) == 1
@@ -144,7 +148,7 @@ def test_streamlit_startup_failure_reported_not_crashed(isolated_paths):
 
 def test_missing_python_environment_reported_cleanly(isolated_paths):
     fake = FakeOS()
-    fake.raise_on_popen_containing = "streamlit"
+    fake.raise_on_popen_containing = "operator_api.py"
     result = launcher.start(backend=fake.backend(), sleep_fn=NO_SLEEP)
 
     assert result["streamlit_pid"] is None

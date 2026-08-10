@@ -1,9 +1,18 @@
 """Windows one-click launcher for the LUXOR dispatcher app.
 
 Starts/stops/reports on exactly two processes -- the canonical
-`luxor_desk.py` Streamlit server and one `cloudflared` tunnel pointed at
-it -- for a non-technical user who should never need to open a
-terminal. This module contains only process-lifecycle logic; it never
+`operator_api.py` CRM (a plain stdlib http.server process, not
+Streamlit -- see scripts/start_crm.ps1, the reference invocation this
+matches) and one `cloudflared` tunnel pointed at it -- for a
+non-technical user who should never need to open a terminal. Prior to
+this fix, this module started the retired `luxor_desk.py` Streamlit
+interface instead (a known, documented gap --
+docs/CURRENT_SPRINT_CHECKPOINT.md and tools/system_readiness.py's own
+"Startup scripts point to current CRM" check both flagged it). Internal
+identifiers below (STREAMLIT_PID_FILE, streamlit_pid, etc.) are kept
+as-is post-fix -- purely internal naming, not user-facing, and
+renaming them everywhere would be a larger diff than this fix needs.
+This module contains only process-lifecycle logic; it never
 imports `dispatcher.*`, never reads `.env`, and never touches the
 SQLite database. All real OS interaction (starting a process, checking
 whether a PID is alive, reading its command line, terminating it,
@@ -50,10 +59,13 @@ TUNNEL_URL_FILE = RUN_DIR / "tunnel_url.txt"
 # Matched as a substring against a live process's actual command line --
 # never a bare process-name match. Keep in sync with the real command
 # lines built in _start_streamlit()/_start_tunnel() below.
-STREAMLIT_SIGNATURE = "streamlit run luxor_desk.py"
+STREAMLIT_SIGNATURE = "operator_api.py"
 TUNNEL_SIGNATURE = "cloudflared"
 
-DEFAULT_PORT = 8506
+# Matches operator_api.py's own default (`--port` argparse default) and
+# scripts/start_crm.ps1 / tools/system_readiness.py's port-8512 checks --
+# keep all three in sync if this ever changes.
+DEFAULT_PORT = 8512
 HEALTH_CHECK_TIMEOUT_SECONDS = 30
 HEALTH_CHECK_INTERVAL_SECONDS = 1
 TUNNEL_URL_WAIT_TIMEOUT_SECONDS = 20
@@ -179,13 +191,15 @@ def _tracked_pid_if_alive(pid_file: Path, expected_signature: str, backend: Proc
 
 # ------------------------------------------------------------------- start
 def _start_streamlit(backend: ProcessBackend, port: int) -> int:
-    args = [
-        sys.executable, "-m", "streamlit", "run", "luxor_desk.py",
-        "--server.port", str(port), "--server.headless", "true",
-        "--theme.base", "dark", "--theme.primaryColor", "#2563eb",
-        "--theme.backgroundColor", "#0b1220", "--theme.secondaryBackgroundColor", "#111a2e",
-        "--theme.textColor", "#e5e9f0",
-    ]
+    # operator_api.py is a plain stdlib http.server process (see its own
+    # main()/argparse block) -- no Streamlit-specific flags apply. Never
+    # passes --no-bridge-adapter here: a real one-click launch is meant
+    # to behave like scripts/start_crm.ps1's `python operator_api.py`,
+    # which starts the WhatsApp bridge *adapter* (the receive-only
+    # Python listener on port 8513) normally -- this is unrelated to
+    # the separate Node WhatsApp Shadow Bridge process/pairing, which
+    # this launcher has never started or touched.
+    args = [sys.executable, "operator_api.py", "--port", str(port)]
     return backend.popen(args, PROJECT_ROOT, STREAMLIT_OUT_LOG, STREAMLIT_ERR_LOG)
 
 
