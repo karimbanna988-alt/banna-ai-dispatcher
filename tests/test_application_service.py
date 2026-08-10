@@ -142,6 +142,52 @@ def test_double_click_complete_job_is_idempotent(service, job_id):
     assert len(completed) == 1
 
 
+def test_double_click_record_closing_is_idempotent(service, job_id):
+    """record_closing uses the exact same compute_idempotency_key +
+    was_replay pattern as the other actions on this page (see
+    application.py) -- this test just proves it for this specific
+    action, which had no explicit double-click test even though the
+    mechanism itself was already proven elsewhere."""
+    cmd = ClosingCommand(job_id=job_id, raw_closing="Closed $150 CC", final_amount="150", payment_method="CC")
+    r1 = service.record_closing(cmd)
+    r2 = service.record_closing(cmd)
+    assert r1.success and r2.success
+    assert r1.idempotent_replay is False
+    assert r2.idempotent_replay is True
+    events = service.get_job_history(job_id)
+    closing_events = [e for e in events if e["message_type"] == MessageType.CLOSING.value]
+    assert len(closing_events) == 1
+
+
+def test_double_click_prepare_company_closing_is_idempotent(service, job_id):
+    service.record_closing(ClosingCommand(job_id=job_id, raw_closing="Closed $150 CC", final_amount="150", payment_method="CC"))
+    r1 = service.prepare_company_closing(job_id)
+    r2 = service.prepare_company_closing(job_id)
+    assert r1.success and r2.success
+    assert r1.idempotent_replay is False
+    assert r2.idempotent_replay is True
+    assert r1.prepared_text == r2.prepared_text
+
+
+def test_double_click_confirm_company_closing_sent_is_idempotent(service, job_id):
+    service.record_closing(ClosingCommand(job_id=job_id, raw_closing="Closed $150 CC", final_amount="150", payment_method="CC"))
+    prepared = service.prepare_company_closing(job_id)
+    assert prepared.success
+    r1 = service.confirm_company_closing_sent(job_id, prepared.prepared_text)
+    r2 = service.confirm_company_closing_sent(job_id, prepared.prepared_text)
+    assert r1.success and r2.success
+    assert r1.idempotent_replay is False
+    assert r2.idempotent_replay is True
+
+
+def test_complete_job_fails_before_closing_recorded(service, job_id):
+    """"Complete cannot happen prematurely": complete_job must refuse a
+    job that has no recorded closing at all yet -- a real gate, not
+    just a UI convention."""
+    result = service.complete_job(job_id)
+    assert result.success is False
+
+
 # ------------------------------------------------- technician K accept ---
 def _seed_observation(conn, message_id="wamid.1", text="K", group_name="Ref Group", extracted_ticket=None, quoted_message_id=None):
     storage.add_whatsapp_observation(conn, {
