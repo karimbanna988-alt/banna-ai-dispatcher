@@ -1106,20 +1106,50 @@ async function loadWhatsappPending() {
   } catch (e) { /* bridge/adapter unreachable -- CRM keeps working normally */ }
 }
 
+const ROLE_LABELS = {
+  COMPANY_JOB_INTAKE: "Company job intake",
+  COMPANY_CLOSINGS: "Company closings",
+  TECH_DISPATCH: "Technician dispatch",
+  TECH_CLOSINGS: "Technician closings",
+  UNMAPPED_WORK: "Unmapped work group",
+  IGNORE: "Ignore",
+};
+
+function whatsappNextAction(o) {
+  if (o.group_mapping_status === "HUMAN_REVIEW") return "Needs mapping — confirm this group's company/technician, then attach or ignore.";
+  if (o.human_review_needed) return "Bare acknowledgement — check context, then attach or ignore.";
+  if (o.correlated_job_id) return `Likely reply to job #${o.correlated_job_id} — verify, then attach.`;
+  return "Review and attach to the matching job, or ignore.";
+}
+
 function renderWhatsappPending() {
   const section = document.getElementById("whatsappPendingSection");
   const list = document.getElementById("whatsappPendingList");
   if (!whatsappPending.length) { section.style.display = "none"; list.innerHTML = ""; return; }
   section.style.display = "block";
-  list.innerHTML = whatsappPending.map(o => `
+  list.innerHTML = whatsappPending.map(o => {
+    const roleLabel = ROLE_LABELS[o.group_role] || o.group_role || "Unmapped work group";
+    const statusChip = o.group_mapping_status === "CONFIRMED"
+      ? `<span class="chip chip-settled">CONFIRMED</span>`
+      : `<span class="chip chip-needs-action">HUMAN REVIEW</span>`;
+    const who = [o.group_company, o.group_technician_name].filter(Boolean).join(" · ");
+    const whoLine = who ? `<div class="detail-meta">${esc(who)}${o.group_service_area ? " · " + esc(o.group_service_area) : ""}</div>` : "";
+    return `
     <div class="mobile-row" data-mid="${esc(o.message_id)}">
-      <div class="row-top"><strong>${esc(o.group_name)}</strong> <span class="age">${esc(o.extracted_ticket || "no ticket guess")}</span></div>
+      <div class="row-top">
+        <strong>${esc(o.group_name)}</strong>
+        <span class="age">${esc(o.extracted_ticket || "no ticket guess")}</span>
+      </div>
+      <div class="detail-meta">${esc(roleLabel)} ${statusChip} <span class="chip">${o.direction === "outgoing" ? "OUTGOING (audit only)" : "INCOMING"}</span></div>
+      ${whoLine}
       <div class="row-bottom">${esc(o.text)}</div>
+      <div class="detail-meta">${esc(whatsappNextAction(o))}</div>
       <div class="action-secondary-row" style="margin-top:6px;">
         <button class="btn btn-primary" data-whatsappaction="attach" data-mid="${esc(o.message_id)}">Attach to selected job</button>
         <button class="btn btn-secondary" data-whatsappaction="ignore" data-mid="${esc(o.message_id)}">Ignore</button>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   list.querySelectorAll("[data-whatsappaction]").forEach(el => {
     el.addEventListener("click", () => handleWhatsappPendingAction(el.dataset.whatsappaction, el.dataset.mid));
   });
