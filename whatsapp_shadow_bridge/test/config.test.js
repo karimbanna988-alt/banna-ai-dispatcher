@@ -27,3 +27,11 @@ test("local admin port defaults away from the tunneled connected-CRM port", () =
   const config = loadConfig({});
   assert.notEqual(config.localAdminPort, 8512);
 });
+
+test("puppeteer protocol timeout has a generous default and is env-overridable", () => {
+  assert.equal(loadConfig({}).puppeteerProtocolTimeoutMs, 300000);
+  assert.equal(
+    loadConfig({ WHATSAPP_SHADOW_PUPPETEER_PROTOCOL_TIMEOUT_MS: "600000" }).puppeteerProtocolTimeoutMs,
+    600000
+  );
+});

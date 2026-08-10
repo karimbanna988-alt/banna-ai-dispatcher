@@ -86,4 +86,60 @@ async function handleIncomingMessage(message, deps) {
   return { forwarded: true, reason: "ok", extractedTicket };
 }
 
-module.exports = { handleIncomingMessage };
+/**
+ * Audit-only capture of a self-sent (fromMe) message in an allowlisted
+ * group -- e.g. the dispatcher manually typing a company update or a
+ * closing directly in WhatsApp. Deliberately posts with a different
+ * event_type ("outgoing_message") than handleIncomingMessage, which the
+ * Python adapter routes to a completely separate audit table. This
+ * function never enqueues to the incoming retry queue, never calls
+ * postObservation, and never returns anything an actionable pipeline
+ * could mistake for a real observation -- it only ever calls
+ * postOutgoingObservation.
+ *
+ * @param {object} message - same shape as handleIncomingMessage, but fromMe must be true
+ * @param {object} deps - { config, isApproved, isSeen, markSeen, postOutgoingObservation, log }
+ */
+async function handleOutgoingMessage(message, deps) {
+  const { config, isApproved, isSeen, markSeen, postOutgoingObservation, log } = deps;
+  const logger = log || (() => {});
+
+  if (!message.fromMe) {
+    // Defense in depth -- this function must never be reachable for an
+    // incoming message. Caller (client.js) already filters on fromMe
+    // before invoking this, but a wrong call here must be a safe no-op,
+    // not a silent misclassification.
+    logger("ignored: handleOutgoingMessage called with a non-outgoing message (defensive no-op)");
+    return { audited: false, reason: "not_outgoing" };
+  }
+  if (!message.isGroupMessage) {
+    return { audited: false, reason: "not_group_message" };
+  }
+  if (!isApproved(config.allowlistFile, message.groupId)) {
+    return { audited: false, reason: "group_not_allowlisted" };
+  }
+  if (isSeen(config.dedupeFile, message.id)) {
+    return { audited: false, reason: "duplicate" };
+  }
+
+  const observation = {
+    messageId: message.id,
+    groupId: message.groupId,
+    groupName: message.groupName,
+    timestamp: message.timestamp,
+    text: message.text,
+  };
+
+  try {
+    await postOutgoingObservation(config, observation);
+  } catch (err) {
+    logger(`outgoing audit delivery failed for ${message.id}: ${err.message}`);
+    return { audited: false, reason: "adapter_delivery_failed" };
+  }
+
+  markSeen(config.dedupeFile, message.id);
+  logger(`audited outgoing message ${message.id}`);
+  return { audited: true, reason: "ok" };
+}
+
+module.exports = { handleIncomingMessage, handleOutgoingMessage };

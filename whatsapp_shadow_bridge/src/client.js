@@ -17,11 +17,11 @@
 
 "use strict";
 
-const { handleIncomingMessage } = require("./messageHandler");
+const { handleIncomingMessage, handleOutgoingMessage } = require("./messageHandler");
 const { isApproved } = require("./allowlist");
 const { isSeen, markSeen } = require("./dedupeStore");
 const { enqueue: enqueueRetry, dequeue: dequeueRetry } = require("./deliveryQueue");
-const { postObservation } = require("./adapterClient");
+const { postObservation, postOutgoingObservation } = require("./adapterClient");
 
 function initializeBridge(config, options = {}) {
   if (!config.enabled) {
@@ -38,6 +38,7 @@ function initializeBridge(config, options = {}) {
     // browser instance whatsapp-web.js itself manages for the WhatsApp
     // Web protocol -- this is the library's own implementation, not
     // additional automation code written here.
+    puppeteer: { protocolTimeout: config.puppeteerProtocolTimeoutMs },
   });
 
   client.on("qr", (qr) => {
@@ -92,6 +93,32 @@ function initializeBridge(config, options = {}) {
       await handleIncomingMessage(message, { config, isApproved, isSeen, markSeen, enqueueRetry, dequeueRetry, postObservation, log });
     } catch (err) {
       log(`WhatsApp Shadow Bridge: error handling incoming message: ${err.message}`);
+    }
+  });
+
+  // "message_create" fires for BOTH incoming and self-sent messages
+  // (unlike "message" above, which whatsapp-web.js only emits for
+  // incoming ones). This listener exists solely to capture the
+  // dispatcher's own outgoing messages for audit -- it explicitly
+  // no-ops on every message that isn't fromMe, so it can never
+  // duplicate or interfere with the incoming pipeline above, which
+  // keeps listening on "message" exactly as before, unchanged.
+  client.on("message_create", async (msg) => {
+    try {
+      if (!msg.fromMe) return; // incoming messages are handled by "message" above, not here
+      const chat = await msg.getChat();
+      const message = {
+        id: msg.id && msg.id._serialized,
+        groupId: chat.isGroup ? chat.id._serialized : null,
+        groupName: chat.isGroup ? chat.name : null,
+        timestamp: msg.timestamp,
+        text: msg.body,
+        isGroupMessage: !!chat.isGroup,
+        fromMe: true,
+      };
+      await handleOutgoingMessage(message, { config, isApproved, isSeen, markSeen, postOutgoingObservation, log });
+    } catch (err) {
+      log(`WhatsApp Shadow Bridge: error handling outgoing message audit: ${err.message}`);
     }
   });
 

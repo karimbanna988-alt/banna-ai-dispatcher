@@ -36,7 +36,7 @@ ADAPTER_SECRET_ENV_VAR = "WHATSAPP_BRIDGE_ADAPTER_SECRET"
 ADAPTER_PORT_ENV_VAR = "WHATSAPP_BRIDGE_ADAPTER_PORT"
 DEFAULT_ADAPTER_PORT = 8513
 
-ALLOWED_EVENT_TYPES = {"incoming_message"}
+ALLOWED_EVENT_TYPES = {"incoming_message", "outgoing_message"}
 MAX_BODY_BYTES = 20_000
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 120  # generous for a single low-volume bridge; still bounded
@@ -113,6 +113,47 @@ def validate_observation(payload: dict) -> dict:
         "extracted_ticket": payload.get("extracted_ticket"),
         "quoted_message_id": quoted_message_id,
     }
+
+
+def validate_outgoing_audit(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise AdapterError(400, "Body must be a JSON object.")
+    if payload.get("event_type") != "outgoing_message":
+        raise AdapterError(400, "event_type must be 'outgoing_message'.")
+    required = ("message_id", "group_id", "group_name", "text")
+    for field in required:
+        value = payload.get(field)
+        if not value or not isinstance(value, str):
+            raise AdapterError(400, f"{field!r} is required and must be a non-empty string.")
+    if len(payload.get("text", "")) > 4000:
+        raise AdapterError(400, "text exceeds maximum length.")
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (str, int, float)) or timestamp == "":
+        raise AdapterError(400, "'timestamp' is required and must be a string or number.")
+    return {
+        "message_id": payload["message_id"],
+        "group_id": payload["group_id"],
+        "group_name": payload["group_name"],
+        "timestamp": str(timestamp),
+        "text": payload["text"],
+    }
+
+
+def add_outgoing_audit(payload: dict, conn=None) -> dict:
+    """Stores a self-sent (dispatcher-typed) message for audit/correlation
+    ONLY. Deliberately calls storage.add_whatsapp_outgoing_audit -- a
+    completely separate table/function from add_whatsapp_observation --
+    so there is no code path by which an outgoing message can land in
+    the actionable pending-observations queue, get attached to a job, or
+    be mistaken for a technician update."""
+    entry = validate_outgoing_audit(payload)
+    owns_conn = conn is None
+    conn = conn or _conn()
+    try:
+        return storage.add_whatsapp_outgoing_audit(conn, entry)
+    finally:
+        if owns_conn:
+            conn.close()
 
 
 def _acknowledgement_only(text: str) -> bool:
@@ -240,7 +281,10 @@ class BridgeAdapterHandler(BaseHTTPRequestHandler):
             # once this call returns success, so a DB-level failure here
             # surfaces as a non-2xx to the bridge, which then does not
             # mark the message as seen and will retry it.
-            result = add_observation(payload)
+            if payload.get("event_type") == "outgoing_message":
+                result = add_outgoing_audit(payload)
+            else:
+                result = add_observation(payload)
             self._send_json(200, result)
         except AdapterError as exc:
             self._send_json(exc.status, {"error": exc.message})

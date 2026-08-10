@@ -60,6 +60,14 @@ function loadConfig(env = process.env) {
     adapterSecret: env.WHATSAPP_SHADOW_ADAPTER_SECRET || "",
 
     maxMessageBytes: intEnv(env, "WHATSAPP_SHADOW_MAX_MESSAGE_BYTES", 8000),
+
+    // Puppeteer's own internal CDP call timeout. whatsapp-web.js's
+    // getChats() serializes the entire in-page chat store in one call --
+    // on an account with many chats/groups this can exceed Puppeteer's
+    // 180s default, failing group discovery even though the session is
+    // healthy and connected. Read-only knob: does not change what the
+    // bridge does, only how long it waits for one internal call.
+    puppeteerProtocolTimeoutMs: intEnv(env, "WHATSAPP_SHADOW_PUPPETEER_PROTOCOL_TIMEOUT_MS", 300000),
   };
 }
 

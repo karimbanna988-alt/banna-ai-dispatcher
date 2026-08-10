@@ -46,6 +46,46 @@ async function postObservation(config, observation, fetchImpl = fetch) {
   return res.json();
 }
 
+function validateOutgoingAudit(observation, maxBytes) {
+  const required = ["messageId", "groupId", "groupName", "text", "timestamp"];
+  for (const field of required) {
+    if (!observation[field]) throw new Error(`observation.${field} is required`);
+  }
+  const size = Buffer.byteLength(JSON.stringify(observation), "utf8");
+  if (size > maxBytes) throw new Error(`observation exceeds max size (${size} > ${maxBytes} bytes)`);
+}
+
+/* Posts a self-sent (fromMe) message for audit/correlation only. Always
+ * sends event_type: "outgoing_message" -- the Python adapter routes that
+ * to a separate audit-only table with no path into the actionable
+ * pending-observations queue (see whatsapp_bridge_adapter.py). This
+ * function has no more send capability than postObservation above: it
+ * is still only ever a POST describing a message that was already sent
+ * by the human dispatcher through WhatsApp itself, never a send. */
+async function postOutgoingObservation(config, observation, fetchImpl = fetch) {
+  validateOutgoingAudit(observation, config.maxMessageBytes);
+  const res = await fetchImpl(`${config.adapterUrl}/observation`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Secret": config.adapterSecret,
+    },
+    body: JSON.stringify({
+      event_type: "outgoing_message",
+      group_id: observation.groupId,
+      group_name: observation.groupName,
+      timestamp: observation.timestamp,
+      message_id: observation.messageId,
+      text: observation.text,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`adapter rejected outgoing audit: ${res.status} ${body}`.trim());
+  }
+  return res.json();
+}
+
 async function checkHealth(config, fetchImpl = fetch) {
   try {
     const res = await fetchImpl(`${config.adapterUrl}/health`, { method: "GET" });
@@ -55,4 +95,4 @@ async function checkHealth(config, fetchImpl = fetch) {
   }
 }
 
-module.exports = { postObservation, checkHealth, validateObservation };
+module.exports = { postObservation, postOutgoingObservation, checkHealth, validateObservation, validateOutgoingAudit };

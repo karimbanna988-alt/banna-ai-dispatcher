@@ -451,3 +451,90 @@ def test_stored_observation_direction_is_always_incoming(clean_adapter_state):
     adapter.add_observation(valid_payload())
     stored = adapter.get_observation("wamid.ABC123")
     assert stored["direction"] == "incoming"
+
+
+# ==================================================== OUTGOING/SELF AUDIT ==
+def outgoing_payload(**overrides):
+    payload = {
+        "event_type": "outgoing_message",
+        "message_id": "wamid.OUT1",
+        "group_id": "111@g.us",
+        "group_name": "Sebai Augusta Dispatch",
+        "timestamp": "1700000000",
+        "text": "ok sending tech now",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_validate_outgoing_audit_accepts_a_well_formed_payload(clean_adapter_state):
+    cleaned = adapter.validate_outgoing_audit(outgoing_payload())
+    assert cleaned["message_id"] == "wamid.OUT1"
+
+
+def test_validate_outgoing_audit_rejects_wrong_event_type(clean_adapter_state):
+    with pytest.raises(adapter.AdapterError):
+        adapter.validate_outgoing_audit(outgoing_payload(event_type="incoming_message"))
+
+
+@pytest.mark.parametrize("field", ["message_id", "group_id", "group_name", "text"])
+def test_validate_outgoing_audit_rejects_missing_required_field(clean_adapter_state, field):
+    payload = outgoing_payload()
+    del payload[field]
+    with pytest.raises(adapter.AdapterError):
+        adapter.validate_outgoing_audit(payload)
+
+
+def test_add_outgoing_audit_never_appears_in_the_actionable_pending_queue(clean_adapter_state):
+    """The core safety guarantee for Phase 4: an outgoing/self message can
+    never become inbound work. Verified at the real storage layer, not
+    mocked -- add_outgoing_audit routes to a completely separate table
+    from add_observation."""
+    adapter.add_outgoing_audit(outgoing_payload())
+    assert adapter.list_pending(include_resolved=True) == []
+
+
+def test_add_outgoing_audit_persists_and_dedupes(clean_adapter_state):
+    from dispatcher import storage as storage_module
+
+    conn = adapter._conn()
+    try:
+        first = adapter.add_outgoing_audit(outgoing_payload(), conn=conn)
+        second = adapter.add_outgoing_audit(outgoing_payload(), conn=conn)
+        assert first["duplicate"] is False
+        assert second["duplicate"] is True
+        assert len(storage_module.list_whatsapp_outgoing_audit(conn)) == 1
+    finally:
+        conn.close()
+
+
+def test_http_endpoint_routes_outgoing_message_to_audit_not_observations(bridge_server):
+    port = bridge_server.server_address[1]
+    status, body = _http(
+        port, "POST", "/observation", outgoing_payload(), headers={"X-Bridge-Secret": "test-bridge-secret"}
+    )
+    assert status == 200
+    assert body["accepted"] is True
+    assert adapter.list_pending() == []
+
+
+def test_http_endpoint_still_routes_incoming_message_to_the_normal_pending_queue(bridge_server):
+    port = bridge_server.server_address[1]
+    status, body = _http(
+        port, "POST", "/observation", valid_payload(), headers={"X-Bridge-Secret": "test-bridge-secret"}
+    )
+    assert status == 200
+    assert len(adapter.list_pending()) == 1
+
+
+def test_outgoing_audit_module_never_calls_resolve_or_attach_style_functions():
+    """Static guard: the outgoing-audit code path must not reference any
+    of the job-attaching/resolving functions, so a future edit can't
+    accidentally wire outgoing traffic into the actionable flow without
+    this test failing."""
+    import inspect
+
+    src = inspect.getsource(adapter.add_outgoing_audit)
+    body_only = src.split('"""', 2)[-1]  # drop the docstring, which legitimately names these for explanation
+    for forbidden in ("resolve_whatsapp_observation(", "add_whatsapp_observation(", "resolve_observation("):
+        assert forbidden not in body_only
