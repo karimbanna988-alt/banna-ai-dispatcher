@@ -47,7 +47,7 @@ test("state.paired is false before the ready callback fires", () => {
 });
 
 test("state.paired becomes true only after the ready callback fires", () => {
-  const { runPairing, getHooks } = fakeRunPairingFactory();
+  const { runPairing, getHooks, fakeClient } = fakeRunPairingFactory();
   const { state } = main(["--pair"], {
     runPairing,
     initializeBridge: () => {},
@@ -56,13 +56,13 @@ test("state.paired becomes true only after the ready callback fires", () => {
     config: fakeConfig(),
   });
   assert.equal(state.paired, false);
-  getHooks().onReady();
+  getHooks().onReady(fakeClient);
   assert.equal(state.paired, true);
   assert.equal(typeof state.getGroups, "function");
 });
 
 test("getGroups is not exposed until after ready", () => {
-  const { runPairing, getHooks } = fakeRunPairingFactory();
+  const { runPairing, getHooks, fakeClient } = fakeRunPairingFactory();
   const { state } = main(["--pair"], {
     runPairing,
     initializeBridge: () => {},
@@ -71,12 +71,12 @@ test("getGroups is not exposed until after ready", () => {
     config: fakeConfig(),
   });
   assert.equal(state.getGroups, null, "getGroups must be null before ready");
-  getHooks().onReady();
+  getHooks().onReady(fakeClient);
   assert.notEqual(state.getGroups, null, "getGroups must exist after ready");
 });
 
 test("disconnect resets paired to false and clears getGroups", () => {
-  const { runPairing, getHooks } = fakeRunPairingFactory();
+  const { runPairing, getHooks, fakeClient } = fakeRunPairingFactory();
   const { state } = main(["--pair"], {
     runPairing,
     initializeBridge: () => {},
@@ -84,7 +84,7 @@ test("disconnect resets paired to false and clears getGroups", () => {
     startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
-  getHooks().onReady();
+  getHooks().onReady(fakeClient);
   assert.equal(state.paired, true);
   getHooks().onDisconnected("NAVIGATION");
   assert.equal(state.paired, false);
@@ -92,7 +92,7 @@ test("disconnect resets paired to false and clears getGroups", () => {
 });
 
 test("auth failure resets paired to false and clears getGroups", () => {
-  const { runPairing, getHooks } = fakeRunPairingFactory();
+  const { runPairing, getHooks, fakeClient } = fakeRunPairingFactory();
   const { state } = main(["--pair"], {
     runPairing,
     initializeBridge: () => {},
@@ -100,7 +100,7 @@ test("auth failure resets paired to false and clears getGroups", () => {
     startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
-  getHooks().onReady();
+  getHooks().onReady(fakeClient);
   assert.equal(state.paired, true);
   getHooks().onAuthFailure("bad session");
   assert.equal(state.paired, false);
@@ -108,18 +108,14 @@ test("auth failure resets paired to false and clears getGroups", () => {
 });
 
 test("getGroups, once ready, returns only id and name for groups (no history/participants/etc)", async () => {
-  const { runPairing, getHooks } = fakeRunPairingFactory();
-  const runPairingWithChats = (config, initializeBridge, log, hooks) => {
-    hooks.onReady && null; // no-op reference to keep lints quiet
-    return {
-      getChats: async () => ([
-        { isGroup: true, id: { _serialized: "111@g.us" }, name: "Kabaka Dispatch", participants: ["should not leak"], msgs: ["should not leak"] },
-        { isGroup: false, id: { _serialized: "222@c.us" }, name: "Some Person" },
-      ]),
-    };
+  const fakeClientWithChats = {
+    getChats: async () => ([
+      { isGroup: true, id: { _serialized: "111@g.us" }, name: "Kabaka Dispatch", participants: ["should not leak"], msgs: ["should not leak"] },
+      { isGroup: false, id: { _serialized: "222@c.us" }, name: "Some Person" },
+    ]),
   };
   const captured = {};
-  const wrapped = (config, initializeBridge, log, hooks) => { captured.hooks = hooks; return runPairingWithChats(config, initializeBridge, log, hooks); };
+  const wrapped = (config, initializeBridge, log, hooks) => { captured.hooks = hooks; return fakeClientWithChats; };
   const { state } = main(["--pair"], {
     runPairing: wrapped,
     initializeBridge: () => {},
@@ -127,11 +123,41 @@ test("getGroups, once ready, returns only id and name for groups (no history/par
     startRetryDrainLoop: () => {},
     config: fakeConfig(),
   });
-  captured.hooks.onReady();
+  captured.hooks.onReady(fakeClientWithChats);
   const groups = await state.getGroups();
   assert.deepEqual(groups, [{ id: "111@g.us", name: "Kabaka Dispatch" }]);
   const serialized = JSON.stringify(groups);
   assert.ok(!serialized.includes("should not leak"));
+});
+
+// Regression coverage for the real live-pilot bug: runPairing can retry
+// pairing internally with a FRESH Client instance per attempt (see
+// pairing.js) after a browser-injection crash. Before this fix,
+// getGroups() closed over main()'s own `client` variable (bound once,
+// synchronously, to runPairing()'s return value) instead of whichever
+// client instance actually reached "ready" -- so a client that
+// succeeded on a retry would report ready, but getGroups() would still
+// call into a stale/wrong client reference.
+test("getGroups uses the client instance that actually became ready, not main()'s own outer client reference", async () => {
+  const staleClient = { getChats: async () => { throw new Error("must never be called -- this is the stale pre-retry client"); } };
+  const liveClient = { getChats: async () => ([{ isGroup: true, id: { _serialized: "999@g.us" }, name: "Real Group" }]) };
+  const captured = {};
+  // Simulates runPairing() returning its FIRST attempt's client
+  // synchronously (as a fake test double would if unaware of retries),
+  // while the real ready event later fires for a DIFFERENT (retried)
+  // client instance -- exactly what happens for real when attempt 1
+  // crashes and attempt 2 succeeds.
+  const wrapped = (config, initializeBridge, log, hooks) => { captured.hooks = hooks; return staleClient; };
+  const { state } = main(["--pair"], {
+    runPairing: wrapped,
+    initializeBridge: () => {},
+    createHealthServer: fakeCreateHealthServer,
+    startRetryDrainLoop: () => {},
+    config: fakeConfig(),
+  });
+  captured.hooks.onReady(liveClient);
+  const groups = await state.getGroups();
+  assert.deepEqual(groups, [{ id: "999@g.us", name: "Real Group" }]);
 });
 
 test("bridge disabled: paired stays false, getGroups stays null, no pairing attempted", () => {

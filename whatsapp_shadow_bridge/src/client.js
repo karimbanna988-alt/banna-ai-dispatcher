@@ -49,7 +49,7 @@ function initializeBridge(config, options = {}) {
 
   client.on("ready", () => {
     log("WhatsApp Shadow Bridge: linked-device session ready (read-only, incoming-only).");
-    if (options.onReady) options.onReady();
+    if (options.onReady) options.onReady(client);
   });
 
   client.on("disconnected", (reason) => {

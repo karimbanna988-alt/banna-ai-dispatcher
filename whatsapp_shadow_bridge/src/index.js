@@ -51,11 +51,18 @@ function main(argv = process.argv.slice(2), deps = {}) {
   // usable at that point (this was the bug: /groups could be called,
   // and would throw a confusing internal error, before the session was
   // actually ready).
+  //
+  // onReady receives the live client explicitly, rather than this
+  // function closing over its own `client` variable below -- runPairing
+  // may retry pairing internally with a fresh Client instance per
+  // attempt (see pairing.js), so the client that actually reached
+  // "ready" is not reliably the same object this function's own
+  // `client` binding ends up holding.
   const client = runPairing(config, initializeBridge, console.log, {
-    onReady: () => {
+    onReady: (liveClient) => {
       state.paired = true;
       state.getGroups = async () => {
-        const chats = await client.getChats();
+        const chats = await liveClient.getChats();
         return chats.filter((c) => c.isGroup).map((c) => ({ id: c.id._serialized, name: c.name }));
       };
     },
