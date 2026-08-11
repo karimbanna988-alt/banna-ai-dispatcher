@@ -173,14 +173,65 @@ explicit instruction not to guess this exact distinction.
    unexpected crash the owner should know about independently of this
    session).
 
+## Update -- pairing-crash root cause found and fixed, but a new QR is now required (`b28b042`)
+
+Root cause of the repeated `ProtocolError: Execution context was
+destroyed` crash: `pairing.js` called `client.initialize()` with
+**no `.catch()` at all** -- an unhandled promise rejection, which
+crashes the whole Node process by default (this is why the health
+server died too, even though it has no real dependency on WhatsApp
+pairing). Fixed with a bounded in-process retry (3 attempts, fresh
+`Client` instance each time, `client.destroy()` cleans up the crashed
+browser only -- never touches on-disk session files, never calls
+`.logout()`) so a transient injection race no longer takes the whole
+bridge down. 12 new tests in `test/pairing.test.js` (previously zero
+coverage on this file) plus a regression test in `index.test.js`
+proving `getGroups` uses the client that actually became ready, not a
+stale reference -- a real bug the retry design would otherwise have
+reintroduced. 118/118 Node tests pass.
+
+**Live-tested against the real paired session, per explicit
+authorization to restart 8514 as needed.** The fix worked exactly as
+designed: attempt 1 crashed (`Execution context was destroyed`),
+caught and retried; attempt 2 crashed again (`...most likely because
+of a navigation`), caught and retried; attempt 3 did **not** crash --
+but LocalAuth decided the existing session was no longer usable and
+requested a **new QR code**. Per the explicit safety rule ("if a QR
+becomes unavoidable, STOP and tell the owner exactly what to scan"),
+stopped immediately: did not scan/approve/simulate anything, cleanly
+killed the pending pairing process (`node.exe` + its Chromium child),
+verified no orphaned processes remain, and left the on-disk session
+directory completely untouched.
+
+Working theory (not confirmed): the two abrupt browser kills, both
+happening mid-navigation during WhatsApp Web's own session-restore
+bootstrap, may have themselves contributed to the session degrading by
+the 3rd attempt -- i.e. the retry fix's own corrective action might be
+what tipped this particular session into needing re-auth, rather than
+the session being independently dead before I touched it. This is a
+real, disclosed uncertainty, not a confirmed root cause -- there's no
+way to know from the logs alone whether the same QR requirement would
+have appeared on a single careful un-retried attempt too.
+
+## Current live state at checkpoint time
+
+- CRM (8512) + Python adapter (8513): running, healthy.
+- Bridge (8514): **stopped** (not paired, not attempting to reconnect)
+  -- deliberately halted after the QR appeared, awaiting owner
+  direction. Session files at
+  `.runtime/whatsapp-shadow-session/session/` are untouched.
+- HEAD: `b28b042`.
+
 ## Exact next task if continuing
 
-1. Confirm the bridge (8514) actually reached "ready" after the
-   `.wwebjs_cache` clear + retry (check the live log/monitoring
-   windows) -- if it's still crashing identically, that's the next
-   real blocker: likely needs a `whatsapp-web.js` dependency bump,
-   which should be flagged rather than attempted silently.
-2. Once reconnected, resume passive observation and keep applying the
-   same OBSERVE -> ANALYZE -> FIND BUG -> FIX -> TEST -> COMMIT loop.
-3. Continue the no-guessing evidence pass on the 58 unmapped groups as
-   new traffic arrives.
+**Blocked on the owner.** Do not scan a new QR, and do not attempt
+another pairing run, until the owner decides how to proceed. Options
+to present: (a) scan a fresh QR now (accepting this device's linked
+session needs re-establishing), (b) check the WhatsApp app itself
+first (Settings > Linked Devices) to see whether the old session is
+still listed as active before deciding, or (c) have the owner
+authorize one more careful, deliberately slow, single (non-retried)
+pairing attempt to see if that alone reaches "ready" without a QR --
+useful mainly to test the "the retries themselves caused this" theory,
+but this is still a real live pairing attempt against the account and
+needs explicit sign-off first, not silent action.
