@@ -89,6 +89,8 @@ function initializeBridge(config, options = {}) {
         isGroupMessage: !!chat.isGroup,
         fromMe: !!msg.fromMe,
         quotedMessageId,
+        mediaType: msg.type || null,
+        hasMedia: !!msg.hasMedia,
       };
       await handleIncomingMessage(message, { config, isApproved, isSeen, markSeen, enqueueRetry, dequeueRetry, postObservation, log });
     } catch (err) {
@@ -115,6 +117,8 @@ function initializeBridge(config, options = {}) {
         text: msg.body,
         isGroupMessage: !!chat.isGroup,
         fromMe: true,
+        mediaType: msg.type || null,
+        hasMedia: !!msg.hasMedia,
       };
       await handleOutgoingMessage(message, { config, isApproved, isSeen, markSeen, postOutgoingObservation, log });
     } catch (err) {

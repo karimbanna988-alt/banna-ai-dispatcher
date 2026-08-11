@@ -64,54 +64,123 @@ existed.
 - No console errors after login. `route_whatsapp_shadow_feed` latency:
   ~11ms for 100 items.
 
+## Update -- "Live Shift Shadow Mode" round (owner: Safe is dispatching live; do not interfere)
+
+Owner mapping batches 2 (`1847778`) and 3 (`83f7fbd`) landed since the
+section above was written, plus Toto/Joe added as real technicians
+(`3014fb4`) and two correlation-labeling bug fixes (`7c2d5c9`,
+`a4911a5`). Registry is now **27 owner-confirmed / 58 `UNMAPPED_WORK`**
+(not 15/70 as stated above -- that count is stale, kept for history).
+
+**Real finding this round: the entire shadow stack was down for ~15.4
+hours before this round started** (last captured observation
+2026-08-11 03:05 UTC / 06:05 local; discovered at ~18:29 UTC). No
+process (CRM, adapter, or bridge) was running. Root cause unknown --
+not something this round's code changes caused (they hadn't been made
+yet). Real live-shift WhatsApp traffic during that ~15.4h window was
+**not captured**. CRM+adapter restarted cleanly (fresh `technician_id`/
+registry data loads live, no code change needed there). The bridge
+(8514) would not reconnect: two consecutive crashes with an identical
+stack (`ProtocolError: Runtime.callFunctionOn -- Execution context was
+destroyed` inside whatsapp-web.js's `Client.initialize` -> `Client.inject`),
+before ever reaching the QR or ready event -- so this says nothing
+about session validity, only that Puppeteer/Chromium page injection is
+failing. Cleared `.wwebjs_cache/` (whatsapp-web.js's cached copy of
+WhatsApp's own web-client JS bundle -- NOT the LocalAuth session/pairing
+data, which lives separately in `.runtime/whatsapp-shadow-session/session/`
+and was never touched) as the standard first mitigation for this exact
+error class, then retried. See "Current live state" below for the
+outcome of that retry -- if it's still failing, this is a real blocker
+that may need either a `whatsapp-web.js` version bump (a real dependency
+change, not attempted without flagging it first) or owner awareness
+that shadow capture has a gap.
+
+**Fixed this round (`whatsapp_shadow_bridge`, no DB change):** a media
+message with no caption (photo, voice note, sticker, etc.) arrived with
+`msg.body === ""`, which could never satisfy `adapterClient.js`'s
+"text is required" validation -- so it failed locally on every retry,
+forever, and piled up unrecoverably in the retry queue (confirmed: 25
+stuck items, 100% of the real queue, all empty-text). Fixed by
+capturing `msg.type`/`msg.hasMedia` in `client.js` and, only when real
+text is empty, substituting an honest, generic, metadata-only label
+(e.g. `[media message, no caption -- type: image]`) in
+`messageHandler.js` -- never invents what the media contains, never
+overrides real caption text. Applied to both the incoming pipeline and
+the outgoing/self-message audit pipeline. 7 new Node tests (24/24 in
+`messageHandler.test.js`, 104/104 across the full Node suite). Full
+Python suite: 1636/1639 passing (3 failures were a self-inflicted
+concurrent-process port collision + one pre-existing flaky rate-limit
+test, both confirmed to pass cleanly in isolation -- not caused by this
+change).
+
+**Fresh mapping-evidence pass (read-only, before the outage was found):**
+re-checked all 58 `UNMAPPED_WORK` groups against real accumulated
+traffic (251 pending observations, 74 outgoing-audit rows at that
+point). Zero exact `dispatch_group`/`closing_group` name matches (fully
+deterministic check). Only two unmapped groups have any real message
+traffic at all: **Ashraf Charlotte Dispatch** (12 messages -- K/ETA/
+no-answer/price-negotiation content, classic TECH_DISPATCH shape, but
+sender is an opaque WhatsApp `@lid` id with no self-identifying name in
+any message text, and no ticket number ties it to a specific job) and
+**Tarek Savannah Dispatch** (3 messages, same limitation). Both remain
+STRONG_PROPOSAL_NEEDS_OWNER, not auto-confirmed -- name match plus
+content shape is exactly the "not enough" bar this session has held to
+throughout (a single sender identity or content shape is not proof).
+Tarek Savannah Dispatch is notable: it's plausibly Tarek's *permanent*
+home-area group (distinct from the already-confirmed *temporary*
+Columbia coverage group) -- still owner-confirmation-only, per the
+explicit instruction not to guess this exact distinction.
+
 ## Current live state at checkpoint time
 
-- CRM (8512) + Python adapter (8513): PID 18140, restarted once this
-  sprint to load code (Node bridge untouched throughout, PID 15844,
-  resumed the existing paired session -- no QR needed).
-- Registry: 85 groups (15 owner-confirmed, 70 `UNMAPPED_WORK`).
-- jobs=6, events=10, unchanged all sprint; integrity OK; 0 FK
-  violations.
-- 3 read-only PowerShell monitoring windows open (bridge log tail, CRM
-  log tail, DB observation poll) -- owner-requested visibility, no
-  restart involved in opening them.
+- CRM (8512) + Python adapter (8513): restarted, both responding
+  (`/health` on 8513 returns `{"status":"ok"}`; CRM root returns 200).
+- Bridge (8514): see outage/crash finding above -- status as of the
+  last retry attempt should be checked in the live PowerShell/log
+  windows, not assumed from this doc.
+- Registry: 85 groups total, 27 owner-confirmed, 58 `UNMAPPED_WORK`.
+- jobs=6, events=17; DB untouched by this round's diagnostic queries
+  (all read-only).
 
 ## Explicitly not done (disclosed, not silently skipped)
 
-- No correlation example with a real STRONG/EXACT match has been
-  naturally observed yet -- none of the 6 real jobs are currently
-  assigned to a confirmed-registry technician (Sebai/Toto/Joe/Ashraf/
-  Kabaka). The logic is unit-tested and proven correct; a live example
-  needs either real dispatch activity or an owner-assigned job to
-  appear naturally.
-- `COMPANY_CLOSINGS` interpretation path is unit-tested but hasn't
-  naturally appeared in the live feed window yet.
-- No dedicated outgoing-audit UI view -- that data is captured and
-  queryable (`whatsapp_outgoing_audit`) but not yet surfaced as its own
-  screen.
-- Toto and Joe are real, owner-confirmed technicians but are not yet
-  rows in the `technicians` table -- their registry entries carry
-  `technician_name_unconfirmed` instead of a real `technician_id`, so
-  they can never match an open job (always UNMATCHED) until added.
+- The full "shadow evidence/trace-correlation learning system" asked
+  for in the "Live Shift Shadow Mode" brief (persistent SHADOW TRACE
+  read-model with EXACT/STRONG/AMBIGUOUS/UNMATCHED chain confidence,
+  continuous 5-category A-E evidence table, deterministic
+  pattern-learning from repeated message formats) was **not built** this
+  round. That is genuinely multi-session scope, and the same brief
+  explicitly says not to build new dashboards/frameworks -- building it
+  well would mean a new persistent schema and read-model, which is a
+  bigger step than "keep observing and fix bugs as you find them." What
+  *was* done instead: the concrete, well-defined, high-value bug found
+  during observation (media/empty-body retry churn) was fixed with
+  tests, and a fresh no-guessing evidence pass was run across all 58
+  unmapped groups.
+- No dedicated outgoing-audit UI view (unchanged from before).
+- Toto and Joe are now real `technicians` rows (this is no longer
+  outstanding -- corrects the stale note directly above).
 
-## Remaining owner decisions (see `docs/WHATSAPP_ROUTING_MAP_REVIEW.md` section 6 for the full list)
+## Remaining owner decisions
 
-1. Add Toto and Joe as real `technicians` rows (or confirm they're
-   aliases of existing Greenville technicians Mohamed Shabaan/Kimo/
-   Youssef Sweillam).
-2. Confirm/reject the 70 `UNMAPPED_WORK` groups' offline-guessed
-   company/technician identities (Adam-Charlotte-NC, Adam-Asheville-NC,
-   Beeko/Bekoo, Joy Locksmith, Osos, Hashem, Ahmed, Bassam, Farouk, and
-   all the plain technician-named dispatch/closing groups not yet
-   confirmed).
-3. Where AGN/Main Leads/Lucky intake actually arrives (no WhatsApp
-   group name matched any of them except AGN's closing group).
+1. Ashraf Charlotte Dispatch and Tarek Savannah Dispatch (see evidence
+   above) -- strong name/content-shape candidates, not deterministically
+   confirmable from message content alone.
+2. The rest of the 58 `UNMAPPED_WORK` groups with no traffic yet --
+   nothing to evidence until they produce real messages.
+3. Whether the ~15.4h stack outage this round found needs any owner
+   action (e.g. was this a deliberate stop, a machine restart, or an
+   unexpected crash the owner should know about independently of this
+   session).
 
 ## Exact next task if continuing
 
-Nothing blocking remains for continued safe engineering work. Highest-
-value next steps, in order: (a) get an owner decision on Toto/Joe so
-TECH_DISPATCH/TECH_CLOSINGS correlation can produce a real STRONG/EXACT
-match live; (b) confirm/reject more `UNMAPPED_WORK` groups to shrink
-that 70-group backlog; (c) a dedicated outgoing-audit view if the owner
-wants to review the dispatcher's own sent messages in-CRM.
+1. Confirm the bridge (8514) actually reached "ready" after the
+   `.wwebjs_cache` clear + retry (check the live log/monitoring
+   windows) -- if it's still crashing identically, that's the next
+   real blocker: likely needs a `whatsapp-web.js` dependency bump,
+   which should be flagged rather than attempted silently.
+2. Once reconnected, resume passive observation and keep applying the
+   same OBSERVE -> ANALYZE -> FIND BUG -> FIX -> TEST -> COMMIT loop.
+3. Continue the no-guessing evidence pass on the 58 unmapped groups as
+   new traffic arrives.

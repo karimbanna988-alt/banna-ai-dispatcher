@@ -22,8 +22,25 @@
 
 const { extractTicket } = require("./ticketExtractor");
 
+/* A media message (photo, voice note, sticker, etc.) with no caption
+ * arrives from whatsapp-web.js with an empty msg.body -- there is no
+ * text to forward. Without this, such a message can never satisfy
+ * adapterClient's "text is required" validation, so it fails locally on
+ * every single retry attempt forever (the retry queue can never drain
+ * it) and its arrival is never recorded anywhere. This never reads or
+ * downloads the actual media -- it only labels the fact that a
+ * non-text message arrived, using metadata whatsapp-web.js already
+ * handed this bridge on the message object (type, hasMedia), so the
+ * observation is still 100% honest: it never claims to know what the
+ * media contains. */
+function describeNonTextMessage(message) {
+  if (message.hasMedia) return `[media message, no caption -- type: ${message.mediaType || "unknown"}]`;
+  if (message.mediaType && message.mediaType !== "chat") return `[non-text message -- type: ${message.mediaType}]`;
+  return "[empty message, no text content]";
+}
+
 /**
- * @param {object} message - { id, groupId, groupName, sender, timestamp, text, isGroupMessage, fromMe, quotedMessageId }
+ * @param {object} message - { id, groupId, groupName, sender, timestamp, text, isGroupMessage, fromMe, quotedMessageId, mediaType, hasMedia }
  * @param {object} deps - { config, isApproved, isSeen, markSeen, enqueueRetry, dequeueRetry, postObservation, log }
  * @returns {Promise<{forwarded: boolean, reason: string}>}
  */
@@ -62,7 +79,7 @@ async function handleIncomingMessage(message, deps) {
     groupName: message.groupName,
     sender: message.sender,
     timestamp: message.timestamp,
-    text: message.text,
+    text: message.text || describeNonTextMessage(message),
     extractedTicket,
     quotedMessageId: message.quotedMessageId || null,
   };
@@ -127,7 +144,7 @@ async function handleOutgoingMessage(message, deps) {
     groupId: message.groupId,
     groupName: message.groupName,
     timestamp: message.timestamp,
-    text: message.text,
+    text: message.text || describeNonTextMessage(message),
   };
 
   try {

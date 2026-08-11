@@ -177,6 +177,74 @@ test("never changes job status or attaches to anything -- this module has no suc
   assert.ok(!/attach/i.test(source) || /never attach/i.test(source));
 });
 
+// ===================================== MEDIA / EMPTY-BODY OBSERVATIONS ====
+// A media message with no caption arrives from whatsapp-web.js with an
+// empty text body. Before this fix, such a message could never satisfy
+// adapterClient's "text is required" validation, so postObservation
+// threw on every single retry forever and the message piled up
+// unrecoverably in the retry queue. These pin the fix: a synthetic,
+// honest, metadata-only label is used instead of empty text, so the
+// observation is captured and delivered like any other.
+
+test("a media message with no caption is forwarded with an honest metadata-only label, not dropped or endlessly retried", async () => {
+  const deps = fakeDeps();
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "", timestamp: 1, hasMedia: true, mediaType: "image" },
+    deps,
+  );
+  assert.equal(result.forwarded, true);
+  assert.equal(deps._posted[0].text, "[media message, no caption -- type: image]");
+  assert.deepEqual(deps._dequeued, ["m1"]); // successfully drained from the retry queue, not stuck
+});
+
+test("a media message with a caption keeps the real caption text -- the fallback never overrides real content", async () => {
+  const deps = fakeDeps();
+  await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "PDL: A100 here's the door", timestamp: 1, hasMedia: true, mediaType: "image" },
+    deps,
+  );
+  assert.equal(deps._posted[0].text, "PDL: A100 here's the door");
+});
+
+test("a non-text, non-media system message (e.g. a voice call notice) still gets a metadata label, never a thrown validation error", async () => {
+  const deps = fakeDeps();
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "", timestamp: 1, hasMedia: false, mediaType: "call_log" },
+    deps,
+  );
+  assert.equal(result.forwarded, true);
+  assert.equal(deps._posted[0].text, "[non-text message -- type: call_log]");
+});
+
+test("an empty message with no media metadata at all still gets a non-empty, honest fallback label", async () => {
+  const deps = fakeDeps();
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "", timestamp: 1 },
+    deps,
+  );
+  assert.equal(result.forwarded, true);
+  assert.equal(deps._posted[0].text, "[empty message, no text content]");
+});
+
+test("the media fallback never invents ticket, price, or customer content -- extractedTicket stays null", async () => {
+  const deps = fakeDeps();
+  const result = await handleIncomingMessage(
+    { id: "m1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", sender: "s", text: "", timestamp: 1, hasMedia: true, mediaType: "ptt" },
+    deps,
+  );
+  assert.equal(result.extractedTicket, null);
+});
+
+test("an outgoing media message (Safe sending a job photo with no caption) is still audited with a metadata-only label", async () => {
+  const deps = fakeOutgoingDeps();
+  const result = await handleOutgoingMessage(
+    { id: "out1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", text: "", timestamp: 1, fromMe: true, hasMedia: true, mediaType: "image" },
+    deps,
+  );
+  assert.equal(result.audited, true);
+  assert.equal(deps._posted[0].text, "[media message, no caption -- type: image]");
+});
+
 // ==================================================== handleOutgoingMessage
 function fakeOutgoingDeps(overrides = {}) {
   const posted = [];
