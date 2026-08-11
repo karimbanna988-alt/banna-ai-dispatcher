@@ -70,6 +70,22 @@ further code work:
   INTEGRATION, secrets never printed.
 - **Test suite**: 1500+ tests, real database verified unchanged every
   run via a session-wide tripwire fixture.
+- **Multi-group WhatsApp shadow dispatcher** (`whatsapp_group_registry`,
+  `route_whatsapp_shadow_feed`): watches 85 real WhatsApp groups
+  (exact-ID registry, never inferred from a group's name at runtime),
+  classifying each observation's role and, for the 15 owner-confirmed
+  groups, interpreting it by reusing existing business logic --
+  `extract_job`/`classify_incoming` for company job intake, a
+  generalized `technician_ack` EXACT/STRONG/AMBIGUOUS/UNMATCHED
+  correlation for technician-group messages. A human still clicks
+  "Promote to job" (reuses the exact existing
+  `confirm_whatsapp_dispatch` commit path, idempotent by WhatsApp
+  message_id) or "Attach" (existing flow) before anything becomes real
+  job state -- nothing is auto-created, auto-accepted, or auto-closed.
+  Outgoing/self messages are captured to a separate audit-only table
+  with no path into the actionable queue. See
+  `docs/WHATSAPP_ROUTING_MAP_REVIEW.md` for the full group-by-group
+  mapping review and open owner decisions.
 
 ## OWNER CONFIGURATION REQUIRED
 
