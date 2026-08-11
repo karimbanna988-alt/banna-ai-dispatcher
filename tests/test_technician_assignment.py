@@ -484,3 +484,68 @@ def test_update_technician_destinations_does_not_create_or_touch_any_job(conn, v
     after = storage.get_job_by_id(conn, job_id)
     assert before == after
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+
+
+# --------------------------------------- update_technician_areas() ---
+
+def test_update_technician_areas_replaces_the_area_list(conn):
+    tech_id = storage.add_technician(conn, "Kimo", areas=["Greenville"])
+
+    result = storage.update_technician_areas(conn, tech_id, ["Alabama"])
+
+    assert result["previous_areas"] == ["Greenville"]
+    assert result["areas"] == ["Alabama"]
+    tech = storage.get_technician(conn, tech_id)
+    assert tech["areas"] == ["Alabama"]
+
+
+def test_update_technician_areas_changes_only_areas(conn):
+    tech_id = storage.add_technician(
+        conn, "Kimo", areas=["Greenville"], skills=["car lockout"],
+        dispatch_group="Old Dispatch", closing_group="Old Closing",
+    )
+    before = storage.get_technician(conn, tech_id)
+
+    storage.update_technician_areas(conn, tech_id, ["Alabama"])
+
+    after = storage.get_technician(conn, tech_id)
+    assert after["name"] == before["name"]
+    assert after["skills"] == before["skills"]
+    assert after["dispatch_group"] == before["dispatch_group"]
+    assert after["closing_group"] == before["closing_group"]
+    assert after["active"] == before["active"]
+
+
+def test_update_technician_areas_raises_for_unknown_technician(conn):
+    with pytest.raises(ValueError):
+        storage.update_technician_areas(conn, 999999, ["Alabama"])
+
+
+def test_update_technician_areas_writes_non_job_audit_event_preserving_previous_value(conn):
+    tech_id = storage.add_technician(conn, "Kimo", areas=["Greenville"])
+
+    result = storage.update_technician_areas(conn, tech_id, ["Alabama"])
+
+    row = conn.execute(
+        "SELECT job_id, message_type, final_action, raw_message FROM events WHERE id = ?",
+        (result["audit_event_id"],),
+    ).fetchone()
+    assert row[0] is None
+    assert row[1] == storage.MessageType.OPERATIONAL_NOTE.value
+    assert row[2] == "Technician Configuration Updated"
+    payload = json.loads(row[3])
+    assert payload["technician_id"] == tech_id
+    assert payload["previous"]["areas"] == ["Greenville"]
+    assert payload["new"]["areas"] == ["Alabama"]
+
+
+def test_update_technician_areas_does_not_touch_any_job_or_other_technician(conn, vehicle_rules):
+    job_id = make_job(conn, vehicle_rules)
+    tech_id = storage.add_technician(conn, "Kimo", areas=["Greenville"])
+    other_id = storage.add_technician(conn, "Sam", areas=["OtherArea"])
+    before_job = storage.get_job_by_id(conn, job_id)
+
+    storage.update_technician_areas(conn, tech_id, ["Alabama"])
+
+    assert storage.get_job_by_id(conn, job_id) == before_job
+    assert storage.get_technician(conn, other_id)["areas"] == ["OtherArea"]

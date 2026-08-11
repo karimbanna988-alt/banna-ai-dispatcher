@@ -2598,6 +2598,60 @@ def update_technician_destinations(
     }
 
 
+def update_technician_areas(conn: sqlite3.Connection, technician_id: int, areas: List[str]) -> dict:
+    """Same audited pattern as update_technician_destinations() above --
+    changes a technician's CURRENT service-area assignment (e.g. an
+    owner-confirmed reassignment like Kimo moving from Greenville to
+    Alabama) without touching any historical jobs/events row. Those
+    tables record what was true when each job happened; this only
+    changes what's true going forward. The previous areas are captured
+    in the audit event, not silently discarded."""
+    existing = get_technician(conn, technician_id)
+    if existing is None:
+        raise ValueError(f"No technician with id {technician_id}")
+
+    previous_areas = existing["areas"]
+    now = _now()
+    audit_payload = json.dumps({
+        "technician_id": technician_id,
+        "technician_name": existing["name"],
+        "previous": {"areas": previous_areas},
+        "new": {"areas": areas},
+    })
+
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            "UPDATE technicians SET areas_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(areas or []), now, technician_id),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO events (
+                job_id, ticket_number, raw_message, message_type, source,
+                final_action, created_at, channel, schema_version
+            ) VALUES (NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_payload, MessageType.OPERATIONAL_NOTE.value, "internal",
+                ActionName.TECHNICIAN_CONFIGURATION_UPDATED.value, now, "manual", EVENT_SCHEMA_VERSION,
+            ),
+        )
+        audit_event_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "technician_id": technician_id,
+        "name": existing["name"],
+        "previous_areas": previous_areas,
+        "areas": areas,
+        "audit_event_id": audit_event_id,
+    }
+
+
 def list_technicians(conn: sqlite3.Connection, active_only: bool = False) -> List[dict]:
     sql = "SELECT * FROM technicians" + (" WHERE active = 1" if active_only else "") + " ORDER BY name ASC"
     cur = conn.execute(sql)

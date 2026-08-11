@@ -2026,6 +2026,7 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             next_action = "REVIEW CLOSING"
         base.update({
             "interpretation": interp,
+            "technician": technician["name"] if technician else base["technician"],
             "proposed_job_id": job["id"] if job else None,
             "proposed_ticket": job["ticket_number"] if job else None,
             "confidence": suggestion["category"],

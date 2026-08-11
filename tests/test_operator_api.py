@@ -2092,6 +2092,19 @@ def test_shadow_feed_tech_dispatch_k_with_exactly_one_open_job_is_strong_confide
     assert item["next_action"] == "CONFIRM TECHNICIAN ACCEPTED"
 
 
+def test_shadow_feed_shows_the_resolved_technician_name_when_registry_uses_a_real_technician_id(api_env):
+    """Regression: a registry row confirmed via a real technicians.id
+    (e.g. Ziyadah/Falcon/Kimo -- DB-backed, not the Toto/Joe
+    technician_name_unconfirmed fallback) must still display the
+    technician's name, not blank it out."""
+    tech_id = add_configured_technician(api_env, name="Real Tech", dispatch_group="Real Dispatch")
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_id=tech_id, service_area="Faketown")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Real Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["technician"] == "Real Tech"
+
+
 def test_shadow_feed_tech_dispatch_with_no_open_job_is_unmatched_and_human_review(api_env):
     _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Nobody Assigned")
     _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Nobody Dispatch", "k")
