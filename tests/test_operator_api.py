@@ -2070,6 +2070,23 @@ def test_shadow_feed_company_job_intake_with_good_data_is_ready_to_promote(api_e
     assert item["next_action"] == "REVIEW -- READY TO PROMOTE"
 
 
+def test_shadow_feed_company_job_intake_correlating_to_an_existing_job_is_not_labeled_new(api_env):
+    """Real gap this closes: a WhatsApp intake message whose ticket+source
+    already exists as a committed job (a correction/duplicate/status
+    update arriving in the intake group) must not say "NEW JOB DETECTED"
+    -- that's misleading even though the underlying promote path already
+    correctly attaches to the existing job rather than duplicating it."""
+    job_id = _seed_active_job(api_env)  # dispatches a real job, ticket "A200", source AGN
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="AGN")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "AGN Intake", agn_message("A200"))
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["existing_job_id"] == job_id
+    assert "NEW JOB DETECTED" not in item["interpretation"]
+    assert f"JOB #{job_id}" in item["interpretation"]
+    assert str(job_id) in item["next_action"]
+
+
 def test_shadow_feed_company_job_intake_with_unparseable_text_shows_missing_fields(api_env):
     _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Adam - Greenville", "hey can you take this one")

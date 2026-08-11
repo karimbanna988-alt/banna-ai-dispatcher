@@ -1996,11 +1996,27 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
         core = {"ticket": job.ticket_number.value, "phone": job.phone.value, "address": job.address.value, "service": job.service_type.value}
         missing = [k for k, v in core.items() if not v]
         needs_review = bool(missing) or bool(classify_result.conflicting_fields)
+        # A message correlating to an ALREADY-existing job (correction/
+        # duplicate/status update/closing text arriving in an intake group)
+        # must never be labeled "NEW JOB DETECTED" -- that's misleading even
+        # though the underlying promote action (confirm_whatsapp_dispatch ->
+        # save_audit_entry) already correctly attaches to the existing job
+        # rather than creating a second one. Label reflects what
+        # classify_incoming() actually determined, not an assumption.
+        if classify_result.existing_job_id is not None:
+            interpretation = f"{classify_result.message_type.value} -- CORRELATES TO JOB #{classify_result.existing_job_id}"
+            next_action = "REVIEW" if needs_review else f"REVIEW -- MATCHES JOB #{classify_result.existing_job_id}"
+        elif job.ticket_number.value:
+            interpretation = "NEW JOB DETECTED"
+            next_action = "REVIEW" if needs_review else "REVIEW -- READY TO PROMOTE"
+        else:
+            interpretation = "MESSAGE RECEIVED -- INSUFFICIENT DATA"
+            next_action = "REVIEW"
         base.update({
-            "interpretation": "NEW JOB DETECTED" if job.ticket_number.value else "MESSAGE RECEIVED -- INSUFFICIENT DATA",
+            "interpretation": interpretation,
             "proposed_ticket": job.ticket_number.value, "missing_fields": missing,
             "confidence": "LOW" if needs_review else "OK",
-            "next_action": "REVIEW" if needs_review else "REVIEW -- READY TO PROMOTE",
+            "next_action": next_action,
             "existing_job_id": classify_result.existing_job_id,
         })
         return base
