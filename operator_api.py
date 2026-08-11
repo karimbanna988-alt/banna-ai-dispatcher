@@ -2020,7 +2020,20 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
                 interp = "TECHNICIAN ETA/UPDATE"
             else:
                 interp = "TECHNICIAN UPDATE"
-            next_action = "CONFIRM TECHNICIAN ACCEPTED" if interp == "TECHNICIAN K" and job else "CONFIRM MATCH / REVIEW"
+            # Distinct, unambiguous next_action per interpretation -- a decline
+            # must never read like an ordinary match-confirmation prompt (a
+            # dispatcher skimming this must not mistake "the technician said
+            # no" for "just confirm and move on"). UPDATE_COMPANY reuses the
+            # existing workflow_projection.NEXT_ACTIONS vocabulary rather than
+            # inventing a parallel phrase for the same real-world step.
+            if interp == "TECHNICIAN K" and job:
+                next_action = "CONFIRM TECHNICIAN ACCEPTED"
+            elif interp == "TECHNICIAN DECLINE" and job:
+                next_action = "TECHNICIAN DECLINED -- REASSIGN"
+            elif interp in ("TECHNICIAN ETA/UPDATE", "TECHNICIAN UPDATE") and job:
+                next_action = "UPDATE_COMPANY"
+            else:
+                next_action = "CONFIRM MATCH / REVIEW"
         else:
             interp = "CLOSING RECEIVED"
             next_action = "REVIEW CLOSING"
@@ -2031,7 +2044,12 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             "proposed_ticket": job["ticket_number"] if job else None,
             "confidence": suggestion["category"],
             "missing_fields": ["amount", "payment_method"] if role == "TECH_CLOSINGS" else [],
-            "next_action": next_action if job or suggestion["category"] != _SUGGEST_UNMATCHED else "HUMAN_REVIEW_NEEDED",
+            # _suggest_job_for_technician only ever returns a job for
+            # EXACT/STRONG -- AMBIGUOUS and UNMATCHED both return job=None,
+            # and both genuinely need a human to pick/find the right job,
+            # so both get the same HUMAN_REVIEW_NEEDED next_action rather
+            # than the misleadingly specific match-confirmation phrasing.
+            "next_action": next_action if job else "HUMAN_REVIEW_NEEDED",
         })
         return base
 

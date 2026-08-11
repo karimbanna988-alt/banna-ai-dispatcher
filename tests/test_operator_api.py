@@ -2105,6 +2105,63 @@ def test_shadow_feed_shows_the_resolved_technician_name_when_registry_uses_a_rea
     assert item["technician"] == "Real Tech"
 
 
+def test_shadow_feed_tech_dispatch_ambiguous_when_technician_has_two_open_jobs_and_no_ticket_named(api_env):
+    """Real gap this closes: with 2+ open jobs for the same technician and
+    no ticket named in the message, neither job may be silently picked --
+    must surface AMBIGUOUS, not guess STRONG for either one."""
+    from dispatcher.rules.service_areas import load_service_areas
+    tech_id = add_configured_technician(api_env)
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A300"))
+    api.route_acknowledge(None, {"message_id": "m1"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m1"}, {})
+    job1_id = api.route_confirm_dispatch(None, {"message_id": "m1"}, {})["job_id"]
+    seed_pending(api_env, "m2", agn_message("A301"))
+    api.route_acknowledge(None, {"message_id": "m2"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m2"}, {})
+    job2_id = api.route_confirm_dispatch(None, {"message_id": "m2"}, {})["job_id"]
+    conn = storage.connect(api_env)
+    storage.assign_technician(conn, job1_id, tech_id, load_service_areas())
+    storage.assign_technician(conn, job2_id, tech_id, load_service_areas())
+    conn.close()
+
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "wa1", "disp@g.us", "Fab Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "wa1")
+    assert item["confidence"] == "AMBIGUOUS"
+    assert item["proposed_job_id"] is None  # neither job auto-selected
+    assert item["next_action"] == "HUMAN_REVIEW_NEEDED"
+
+
+def test_shadow_feed_tech_dispatch_exact_when_message_names_the_ticket_among_two_open_jobs(api_env):
+    """The other half of the same gap: when the message DOES name a
+    ticket, it must correctly disambiguate to the named job, not fall
+    back to AMBIGUOUS just because the technician has multiple open jobs."""
+    from dispatcher.rules.service_areas import load_service_areas
+    tech_id = add_configured_technician(api_env)
+    seed_live_boundary(api_env)
+    seed_pending(api_env, "m1", agn_message("A400"))
+    api.route_acknowledge(None, {"message_id": "m1"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m1"}, {})
+    job1_id = api.route_confirm_dispatch(None, {"message_id": "m1"}, {})["job_id"]
+    seed_pending(api_env, "m2", agn_message("A401"))
+    api.route_acknowledge(None, {"message_id": "m2"}, {})
+    api.route_prepare_dispatch(None, {"message_id": "m2"}, {})
+    job2_id = api.route_confirm_dispatch(None, {"message_id": "m2"}, {})["job_id"]
+    conn = storage.connect(api_env)
+    storage.assign_technician(conn, job1_id, tech_id, load_service_areas())
+    storage.assign_technician(conn, job2_id, tech_id, load_service_areas())
+    conn.close()
+
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "wa1", "disp@g.us", "Fab Dispatch", "on my way for A401", extracted_ticket="A401")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "wa1")
+    assert item["confidence"] == "EXACT"
+    assert item["proposed_job_id"] == job2_id
+
+
 def test_shadow_feed_tech_dispatch_with_no_open_job_is_unmatched_and_human_review(api_env):
     _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Nobody Assigned")
     _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Nobody Dispatch", "k")
@@ -2123,6 +2180,21 @@ def test_shadow_feed_tech_dispatch_eta_message_is_labeled_and_matched(api_env):
     item = next(i for i in result["items"] if i["message_id"] == "m1")
     assert item["interpretation"] == "TECHNICIAN ETA/UPDATE"
     assert item["proposed_job_id"] == job_id
+    assert item["next_action"] == "UPDATE_COMPANY"
+
+
+def test_shadow_feed_tech_dispatch_decline_with_a_matched_job_says_reassign_not_confirm(api_env):
+    """A decline must never read like an ordinary match-confirmation --
+    it needs to visibly tell the dispatcher to find someone else."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "can't")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN DECLINE"
+    assert item["proposed_job_id"] == job_id
+    assert item["next_action"] == "TECHNICIAN DECLINED -- REASSIGN"
+    assert "confirm" not in item["next_action"].lower()
 
 
 def test_shadow_feed_tech_closings_never_invents_amount(api_env):
