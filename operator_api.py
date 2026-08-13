@@ -2017,6 +2017,16 @@ _ETA_TIME_RE = re.compile(
     r"\b(eta|min|mins|minute|minutes|hour|hours|hr|hrs)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE,
 )
 
+# The technician reporting they are travelling to the job. Deliberately
+# anchored to FIRST PERSON ("on my way"/"omw") or a leading "on the
+# way", because live traffic contains a real false positive that a looser
+# rule would swallow: "She has someone on the way" is the CUSTOMER having
+# arranged another locksmith -- close to the opposite of this technician
+# being en route. Also deliberately does not match "heading", whose only
+# observed use was about a different, future job ("I will go to her after
+# i'm done with the one i'm heading to").
+_EN_ROUTE_RE = re.compile(r"\b(on my way|omw)\b|^on the way\b", re.IGNORECASE)
+
 # A price quoted to the customer ("quoted 125", "Quoted 150 he's gonna
 # call back"). Operationally distinct from an ETA and worth surfacing on
 # its own -- a price is a commercial fact a human may need to act on.
@@ -2186,6 +2196,8 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
                     interp = "TECHNICIAN PRICE QUOTE"
                 elif has_time:
                     interp = "TECHNICIAN ETA/UPDATE"
+                elif _EN_ROUTE_RE.search(raw_text):
+                    interp = "TECHNICIAN EN ROUTE"
                 else:
                     interp = "TECHNICIAN UPDATE"
             # Distinct, unambiguous next_action per interpretation -- a decline
@@ -2208,7 +2220,7 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
                 # A quoted price is a commercial fact; flag it as such
                 # rather than folding it into a generic company update.
                 next_action = "REVIEW -- PRICE QUOTED TO CUSTOMER"
-            elif interp in ("TECHNICIAN ETA/UPDATE", "TECHNICIAN UPDATE") and job:
+            elif interp in ("TECHNICIAN ETA/UPDATE", "TECHNICIAN UPDATE", "TECHNICIAN EN ROUTE") and job:
                 next_action = "UPDATE_COMPANY"
             else:
                 next_action = "CONFIRM MATCH / REVIEW"

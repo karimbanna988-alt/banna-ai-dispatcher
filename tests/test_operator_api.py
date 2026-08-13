@@ -2353,7 +2353,10 @@ def test_shadow_feed_no_answer_check_does_not_disturb_k_decline_or_eta(api_env):
         ("a2", "can't", "TECHNICIAN DECLINE"),
         ("a3", "eta 20 minutes", "TECHNICIAN ETA/UPDATE"),
         ("a4", "1:30 hours", "TECHNICIAN ETA/UPDATE"),
-        ("a5", "on my way", "TECHNICIAN UPDATE"),
+        # "on my way" was this slot's generic example until first-person
+        # travel became its own EN ROUTE category; "cx waiting" is a real
+        # observed message that genuinely belongs in the catch-all.
+        ("a5", "cx waiting", "TECHNICIAN UPDATE"),
     ]:
         _seed_whatsapp_obs(api_env, msg_id, "disp@g.us", "Fab Dispatch", text)
     result = api.route_whatsapp_shadow_feed(None, {}, {})
@@ -2441,6 +2444,53 @@ def test_shadow_feed_price_quote_never_parses_an_amount_into_a_field(api_env):
     item = next(i for i in result["items"] if i["message_id"] == "m1")
     assert item.get("closing_amount") is None
     assert item.get("closing_payment_method") is None
+
+
+@pytest.mark.parametrize("text", ["On my way", "Cuz on my way", "On the way still", "Called back on my way to him"])
+def test_shadow_feed_first_person_travel_is_labeled_en_route(api_env, text):
+    """Each string is a real observed message. "The technician is
+    travelling" is operationally distinct from a generic update."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", text)
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN EN ROUTE"
+
+
+def test_shadow_feed_customer_arranging_another_locksmith_is_not_en_route(api_env):
+    """Real observed false positive a looser rule would swallow: "She has
+    someone on the way" is the CUSTOMER having arranged another
+    locksmith -- close to the opposite of this technician travelling."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "She has someone on the way")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN UPDATE"
+
+
+def test_shadow_feed_heading_to_a_different_future_job_is_not_en_route(api_env):
+    """Real observed message about a DIFFERENT, later job -- must not be
+    read as travelling to this one."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch",
+                       "I will go to her after i'm done with the one i'm heading to")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN UPDATE"
+
+
+def test_shadow_feed_en_route_does_not_outrank_an_explicit_eta(api_env):
+    """A message stating a time is more specific than "on my way" and must
+    keep the ETA label."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "on my way, 20 minutes")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN ETA/UPDATE"
 
 
 def test_shadow_feed_tech_closings_never_invents_amount(api_env):
