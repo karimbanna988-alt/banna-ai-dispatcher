@@ -2003,6 +2003,28 @@ _NO_ANSWER_RE = re.compile(
     r"(no answer|didn'?t answer|doesn'?t answer|not answering|no reply|voice ?mail)", re.IGNORECASE,
 )
 
+# A WhatsApp @mention with no other content ("@2632865341592"). Someone
+# tagging a person carries no status information at all. Measured on live
+# traffic: 33 of the 105 messages the old heuristic called an ETA were
+# exactly this.
+_MENTION_ONLY_RE = re.compile(r"^@\d+$")
+
+# Real time language. The rule this replaces was "any digit means ETA",
+# which was wrong ~94% of the time on live traffic -- it swept up phone
+# numbers, street numbers, a VIN, price quotes and @mentions. Only 6 of
+# 105 such messages actually stated a time.
+_ETA_TIME_RE = re.compile(
+    r"\b(eta|min|mins|minute|minutes|hour|hours|hr|hrs)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE,
+)
+
+# A price quoted to the customer ("quoted 125", "Quoted 150 he's gonna
+# call back"). Operationally distinct from an ETA and worth surfacing on
+# its own -- a price is a commercial fact a human may need to act on.
+# Never parses the number into an amount; only labels that a quote was
+# discussed, since quoting language is far less structured than the
+# closing-report format.
+_QUOTE_RE = re.compile(r"\b(quote|quoted|quoting)\b", re.IGNORECASE)
+
 # Checked only AFTER _NO_ANSWER_RE has already matched, to separate
 # "the customer didn't answer, I'll retry" from "I'm dropping this job
 # because they didn't answer" -- different real outcomes (wait/update vs.
@@ -2149,10 +2171,23 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
                     "TECHNICIAN DECLINE -- CUSTOMER NO ANSWER" if _PASS_PREFIX_RE.search(raw_text)
                     else "TECHNICIAN NO ANSWER -- CUSTOMER UNREACHABLE"
                 )
-            elif "eta" in text_lower or any(ch.isdigit() for ch in text_lower):
-                interp = "TECHNICIAN ETA/UPDATE"
+            elif _MENTION_ONLY_RE.match(raw_text):
+                interp = "MENTION ONLY -- no status content"
             else:
-                interp = "TECHNICIAN UPDATE"
+                # Replaces "any digit means ETA". See each pattern's own
+                # comment for the live measurement that motivated it.
+                has_time = bool(_ETA_TIME_RE.search(raw_text))
+                has_quote = bool(_QUOTE_RE.search(raw_text))
+                if has_time and has_quote:
+                    # Real observed shape: "40 minutes away, quoted 195$".
+                    # Both facts matter, so neither is dropped.
+                    interp = "TECHNICIAN ETA + PRICE QUOTE"
+                elif has_quote:
+                    interp = "TECHNICIAN PRICE QUOTE"
+                elif has_time:
+                    interp = "TECHNICIAN ETA/UPDATE"
+                else:
+                    interp = "TECHNICIAN UPDATE"
             # Distinct, unambiguous next_action per interpretation -- a decline
             # must never read like an ordinary match-confirmation prompt (a
             # dispatcher skimming this must not mistake "the technician said
@@ -2165,6 +2200,14 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
                 next_action = "TECHNICIAN DECLINED -- REASSIGN"
             elif interp.startswith("TECHNICIAN NO ANSWER") and job:
                 next_action = "UPDATE_COMPANY"
+            elif interp.startswith("MENTION ONLY"):
+                # Carries no status content, so there is nothing for a
+                # dispatcher to relay -- never dressed up as actionable.
+                next_action = "REVIEW -- MENTION ONLY"
+            elif "PRICE QUOTE" in interp and job:
+                # A quoted price is a commercial fact; flag it as such
+                # rather than folding it into a generic company update.
+                next_action = "REVIEW -- PRICE QUOTED TO CUSTOMER"
             elif interp in ("TECHNICIAN ETA/UPDATE", "TECHNICIAN UPDATE") and job:
                 next_action = "UPDATE_COMPANY"
             else:

@@ -2365,6 +2365,84 @@ def test_shadow_feed_no_answer_check_does_not_disturb_k_decline_or_eta(api_env):
     assert got["a5"] == "TECHNICIAN UPDATE"
 
 
+def test_shadow_feed_bare_mention_is_not_an_eta(api_env):
+    """Real live-traffic finding: the old rule was "any digit means ETA",
+    which swept up 105 messages of which only 6 actually stated a time.
+    33 of them were a bare WhatsApp @mention carrying no status at all."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "@2632865341592")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "MENTION ONLY -- no status content"
+    assert item["next_action"] == "REVIEW -- MENTION ONLY"
+
+
+@pytest.mark.parametrize("text", ["8039446929", "1009 florence st", "3N1CN7AP9FL803116", "926"])
+def test_shadow_feed_digits_without_time_language_are_not_an_eta(api_env, text):
+    """Each string is a real observed message -- a phone number, a street
+    address, a VIN, a bare number. None is an ETA."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", text)
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN UPDATE"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("eta 20 minutes", "TECHNICIAN ETA/UPDATE"),
+    ("1:30 hours", "TECHNICIAN ETA/UPDATE"),
+    ("He just told me 2 mins", "TECHNICIAN ETA/UPDATE"),
+    ("It's gonna take 1.5 hours from now", "TECHNICIAN ETA/UPDATE"),
+])
+def test_shadow_feed_real_time_language_is_still_recognized_as_an_eta(api_env, text, expected):
+    """Tightening the rule must not lose the genuine ETAs -- each of these
+    is a real observed message that does state a time."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", text)
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == expected
+
+
+def test_shadow_feed_price_quote_is_surfaced_as_a_commercial_fact(api_env):
+    """A quoted price needs a human's attention, not a generic company
+    update. Real observed messages: "quoted 125", "Quoted 150 he's gonna
+    call back"."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "quoted 125")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN PRICE QUOTE"
+    assert item["next_action"] == "REVIEW -- PRICE QUOTED TO CUSTOMER"
+
+
+def test_shadow_feed_message_with_both_eta_and_quote_reports_both(api_env):
+    """Real observed shape: "40 minutes away, quoted 195$". Dropping
+    either fact would lose something the dispatcher needs."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "40 minutes away, quoted 195$ cx says ok")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN ETA + PRICE QUOTE"
+
+
+def test_shadow_feed_price_quote_never_parses_an_amount_into_a_field(api_env):
+    """Quoting language is far less structured than a closing report, so
+    a quote must never populate a closing amount."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "quoted 125 cash")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item.get("closing_amount") is None
+    assert item.get("closing_payment_method") is None
+
+
 def test_shadow_feed_tech_closings_never_invents_amount(api_env):
     job_id = _seed_active_job_with_technician(api_env)
     _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")
