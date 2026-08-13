@@ -99,7 +99,38 @@ so the deterministic linking rule correctly refuses them.
 
 ---
 
-## 5. Freeform job postings without a ticket block  *(OPEN, evidence thin)*
+## 5. Technician records with no destinations  *(OPEN — and DO NOT automate)*
+
+Three technicians are confirmed against a group in the registry but have
+no matching `dispatch_group`/`closing_group` on their own `technicians`
+row. This looks like a uniform gap that a "backfill destinations from
+confirmed registry rows" script could close. **It is not, and that
+script must not be written.**
+
+| technician | own record | registry-confirmed | disposition |
+|---|---|---|---|
+| Falcon | both `None` | `Vancouver Dispatch` | genuinely missing; safe to backfill *if the owner wants it*, but it unlocks nothing on its own |
+| Osos | dispatch set, closing `None` | `Osos NJ dispatch` only | **correct as-is** — his closings group (`Osos nj Closings`) was deliberately left unconfirmed by the owner |
+| Tarek | both `None` | `Tarek columbia dispatch` + `closings` | **deliberately empty — must stay that way** |
+
+Tarek is the trap. The owner explicitly ruled that the Columbia groups
+are *temporary coverage while Ismail is off*, that Tarek's permanent home
+area remains Savannah, and that his own technician record must not be
+rewritten to say otherwise. An automated backfill would silently convert
+that temporary arrangement into a permanent one — exactly the corruption
+the temporary/permanent split was designed to prevent.
+
+**Question for the owner:** should Falcon's `dispatch_group` be set to
+`Vancouver Dispatch`? (Falcon alone, not as a general rule.)
+
+**Related:** `Vancouver Closings` has now produced traffic and is
+plausibly Falcon's closings group, but Falcon's record configures no
+closing group, so there is nothing to prove it against. It stays
+`UNMAPPED_WORK`.
+
+---
+
+## 6. Freeform job postings without a ticket block  *(OPEN, evidence thin)*
 
 **Question:** Are messages like `843-379-2370 car key 2005 ford f-150`
 and `843-321-2187 house lockout 229 johnson...` genuine job postings
