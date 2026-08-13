@@ -252,6 +252,32 @@ class BridgeAdapterHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain_request_body(self) -> None:
+        """Reads and discards any unread request body before an early
+        error response.
+
+        Rate-limit and auth rejections happen BEFORE the body is read.
+        Responding and closing while the client's body is still sitting
+        unread in the socket buffer makes the client see a connection
+        reset (WinError 10053 on Windows) instead of the actual status
+        code -- so a genuine 429 or 401 surfaces to the bridge as an
+        opaque network error rather than "rate limited" or "bad secret".
+        That ambiguity is exactly what made the historical adapter-secret
+        mismatch hard to diagnose (see the .env loading fix, dfa9a59).
+
+        Bounded by MAX_BODY_BYTES: a rejected request can never make this
+        process read an unbounded amount from an unauthenticated peer."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return
+        remaining = min(max(length, 0), MAX_BODY_BYTES)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 8192))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def do_GET(self) -> None:
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
@@ -260,8 +286,10 @@ class BridgeAdapterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path != "/observation":
+            self._drain_request_body()
             self._send_json(404, {"error": "Not found"})
             return
+        body_read = False
         try:
             _check_rate_limit()
             secret = os.environ.get(ADAPTER_SECRET_ENV_VAR, "")
@@ -272,6 +300,7 @@ class BridgeAdapterHandler(BaseHTTPRequestHandler):
             if length <= 0 or length > MAX_BODY_BYTES:
                 raise AdapterError(400, "Invalid request body size.")
             raw = self.rfile.read(length)
+            body_read = True
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -287,8 +316,12 @@ class BridgeAdapterHandler(BaseHTTPRequestHandler):
                 result = add_observation(payload)
             self._send_json(200, result)
         except AdapterError as exc:
+            if not body_read:
+                self._drain_request_body()
             self._send_json(exc.status, {"error": exc.message})
         except Exception as exc:  # noqa: BLE001
+            if not body_read:
+                self._drain_request_body()
             self._send_json(500, {"error": "Internal error."})
 
 

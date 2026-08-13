@@ -183,6 +183,56 @@ def test_rate_limit_kicks_in_after_repeated_requests(bridge_server, monkeypatch)
     assert 429 in statuses
 
 
+# ============ EARLY-REJECT PATHS MUST STILL RETURN A READABLE RESPONSE ====
+# Regression coverage for a real intermittent failure: rate-limit and auth
+# rejections happen BEFORE the request body is read, and responding while
+# the client's body is still unread in the socket buffer made the client
+# see a connection reset (WinError 10053) instead of the status code. It
+# reproduced roughly 1 run in 3, which is exactly why it had previously
+# been dismissed as an environment flake. The loops below make the race
+# deterministic enough to catch: without the body drain these raise
+# ConnectionAbortedError/RemoteDisconnected instead of asserting.
+
+def test_rate_limited_requests_always_return_a_readable_429_never_a_reset(bridge_server, monkeypatch):
+    monkeypatch.setattr(adapter, "RATE_LIMIT_MAX_REQUESTS", 1)
+    port = bridge_server.server_address[1]
+    seen = []
+    for i in range(12):
+        status, _ = _http(port, "POST", "/observation", valid_payload(message_id=f"rl-{i}"),
+                          headers={"X-Bridge-Secret": "test-bridge-secret"})
+        seen.append(status)
+    assert seen.count(429) >= 10, f"expected repeated clean 429s, got {seen}"
+
+
+def test_bad_secret_always_returns_a_readable_401_never_a_reset(bridge_server):
+    """The 401 path rejects before reading the body too. A bridge hitting
+    this must be told 'bad secret', not handed an opaque network error --
+    that ambiguity is what made the historical .env secret mismatch hard
+    to diagnose."""
+    port = bridge_server.server_address[1]
+    for i in range(12):
+        status, payload = _http(port, "POST", "/observation", valid_payload(message_id=f"auth-{i}"),
+                                headers={"X-Bridge-Secret": "wrong-secret"})
+        assert status == 401, f"iteration {i} returned {status}"
+        assert "error" in payload
+
+
+def test_unknown_post_path_returns_a_readable_404_never_a_reset(bridge_server):
+    port = bridge_server.server_address[1]
+    for i in range(8):
+        status, _ = _http(port, "POST", "/not-a-real-path", valid_payload(message_id=f"p-{i}"),
+                          headers={"X-Bridge-Secret": "test-bridge-secret"})
+        assert status == 404
+
+
+def test_draining_a_rejected_body_is_bounded_by_max_body_bytes(bridge_server):
+    """A rejected request must never let an unauthenticated peer make this
+    process read an unbounded amount."""
+    import inspect
+    source = inspect.getsource(adapter.BridgeAdapterHandler._drain_request_body)
+    assert "MAX_BODY_BYTES" in source
+
+
 def test_no_customer_data_in_server_logs(bridge_server, capsys):
     port = bridge_server.server_address[1]
     _http(port, "POST", "/observation", valid_payload(text="Customer Jane Doe, phone 555-1234"), headers={"X-Bridge-Secret": "test-bridge-secret"})
