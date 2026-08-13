@@ -222,16 +222,90 @@ have appeared on a single careful un-retried attempt too.
   `.runtime/whatsapp-shadow-session/session/` are untouched.
 - HEAD: `b28b042`.
 
+## Update -- RESOLVED: re-paired, and the session now survives a full reboot
+
+The owner authorized and completed a fresh QR pairing. Outcome, verified:
+
+- Paired successfully via `scripts/start_pairing.ps1` (took 9 QR
+  refreshes before the owner reached it; each refresh was re-rendered
+  and re-verified as genuinely scannable against an independent QR
+  decoder before being shown, and the raw payload was never logged).
+- **Controlled process-restart test: PASSED** -- stopped the bridge,
+  restarted via `scripts/start_normal.ps1`, reconnected straight to
+  `paired:true` with zero QR prompts.
+- **Unplanned full-laptop-reboot test: PASSED** -- the machine restarted
+  on its own; on restart the bridge reconnected from the on-disk session
+  with zero QR prompts. This is a materially stronger durability result
+  than the process-restart test and supersedes the earlier open question
+  about session fragility.
+- Post-reboot DB check: `integrity_check` = ok, 0 FK violations, no
+  leftover WAL/journal files -- the unclean shutdown caused no damage.
+
+The earlier "did our own retries degrade the session?" theory remains
+**unresolved but no longer blocking** -- the session has now survived
+two clean restarts and one hard reboot without incident.
+
+## Update -- live shadow round: three interpretation gaps found and fixed
+
+All three were found by reading real captured traffic, and in each case
+the pattern was counted across the corpus BEFORE any code was written --
+never generalized from a single example.
+
+1. **`0982ffe` -- forwarded job blocks misread as technician updates.**
+   A dispatcher forwarding the full job posting into a technician's
+   dispatch group was classified as a "TECHNICIAN ETA/UPDATE", because
+   that branch only expected short replies and its "any digit means ETA"
+   heuristic swallowed the ticket block. Evidence: 17 such observations
+   across 3 different confirmed dispatch groups/companies. Now labeled
+   as the SEND_JOB_TO_TECHNICIAN step and correlated to the existing job
+   by exact ticket number. Live count after the fix: 23 occurrences
+   correctly labeled.
+2. **`0982ffe` -- closing amounts always reported missing.** TECH_CLOSINGS
+   hardcoded `missing_fields = ["amount","payment_method"]` for every
+   message, even ones plainly stating both. Evidence: 5 of 8 real
+   closing messages carried an unambiguous adjacent `$AMOUNT METHOD`
+   shape. Now parsed deterministically. Live result: 5 extracted, 19
+   still honestly reported as missing -- never invented.
+3. **`81699af` -- customer-no-answer had no category.** Operationally
+   distinct from decline/ETA/update: the job is stalling and the company
+   needs telling. Evidence: 6 genuine standalone instances across 4
+   groups and 4 technicians. Two ordering subtleties the real data
+   forced: it must be checked before the digit heuristic (a real message
+   contained "...after I drive 1 hour"), and a leading "No" must not be
+   read as the bare `no` decline token ("No answer sent a text" is a
+   report, not a refusal).
+
+Also added `scripts/monitor_whatsapp_shadow_decisions_live.py`
+(`2c85c91`) -- a read-only terminal view of the live interpretation
+decisions, calling the same `_interpret_whatsapp_observation()` the CRM
+uses so the two can never drift.
+
+## Current live state at checkpoint time
+
+- CRM (8512) + Python adapter (8513): **running, healthy**.
+- Bridge (8514): **running, `paired:true, status:connected`**.
+- HEAD: `81699af`.
+- Registry: 85 groups, 27 confirmed, 58 `UNMAPPED_WORK` (unchanged --
+  no mapping was auto-confirmed this round; see below).
+- Business truth untouched all round: jobs=6, events=17, technicians=18.
+- Live acceptance re-verified: 0 duplicate message_ids, 0 outgoing/self
+  messages leaked into the inbound actionable queue, all unmapped-group
+  observations still `GROUP_MAPPING_REQUIRED`, media/no-body messages
+  captured as metadata instead of retrying forever.
+
 ## Exact next task if continuing
 
-**Blocked on the owner.** Do not scan a new QR, and do not attempt
-another pairing run, until the owner decides how to proceed. Options
-to present: (a) scan a fresh QR now (accepting this device's linked
-session needs re-establishing), (b) check the WhatsApp app itself
-first (Settings > Linked Devices) to see whether the old session is
-still listed as active before deciding, or (c) have the owner
-authorize one more careful, deliberately slow, single (non-retried)
-pairing attempt to see if that alone reaches "ready" without a QR --
-useful mainly to test the "the retries themselves caused this" theory,
-but this is still a real live pairing attempt against the account and
-needs explicit sign-off first, not silent action.
+Keep shadowing. No blocker. Open items, in priority order:
+
+1. Continue the observe -> evidence -> test -> fix -> commit loop on
+   live traffic as it arrives.
+2. Two unmapped groups now carry real traffic and remain the strongest
+   mapping candidates, still **owner-decision-only** (name similarity
+   plus content shape is deliberately not sufficient): `Ashraf Charlotte
+   Dispatch` and `Tarek Savannah Dispatch`.
+3. ~25 legacy empty-body items sit in the retry queue from before the
+   media fix. They are inert (not blocking current ingestion) and were
+   deliberately left alone this round: the bridge is live and writing to
+   that same JSON file with no locking, so running the quarantine script
+   concurrently risks racing real in-flight messages. Do it during a
+   planned bridge stop, not while shadowing.
