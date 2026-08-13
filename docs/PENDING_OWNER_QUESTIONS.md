@@ -57,7 +57,14 @@ technician-dispatch shaped (including a no-answer report).
 ## 3. Sender identity of the multi-group dispatcher account  *(OPEN, low urgency)*
 
 **Question:** Is WhatsApp sender `149245868920864@lid` the human
-dispatcher currently working the shift (referred to as "Safe")?
+dispatcher currently working the shift (Seif)?
+
+**Naming note:** the owner corrected the dispatcher's name from "Safe"
+to **Seif**. That correction is naming/context only -- it deliberately
+changed no sender-ID logic and no correlation behavior. This sender is
+still classified as dispatcher-*shaped* purely on behavioral evidence
+(see below), and is still NOT asserted to be Seif, because that exact
+WhatsApp sender ID has not been owner-confirmed as his.
 
 **Why it matters:** this sender posts in **11 distinct groups** and has
 posted **22 full job blocks** — a shape no technician has (technicians

@@ -64,7 +64,7 @@ existed.
 - No console errors after login. `route_whatsapp_shadow_feed` latency:
   ~11ms for 100 items.
 
-## Update -- "Live Shift Shadow Mode" round (owner: Safe is dispatching live; do not interfere)
+## Update -- "Live Shift Shadow Mode" round (owner: Seif is dispatching live; do not interfere)
 
 Owner mapping batches 2 (`1847778`) and 3 (`83f7fbd`) landed since the
 section above was written, plus Toto/Joe added as real technicians

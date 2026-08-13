@@ -235,7 +235,7 @@ test("the media fallback never invents ticket, price, or customer content -- ext
   assert.equal(result.extractedTicket, null);
 });
 
-test("an outgoing media message (Safe sending a job photo with no caption) is still audited with a metadata-only label", async () => {
+test("an outgoing media message (the dispatcher sending a job photo with no caption) is still audited with a metadata-only label", async () => {
   const deps = fakeOutgoingDeps();
   const result = await handleOutgoingMessage(
     { id: "out1", isGroupMessage: true, groupId: "g@g.us", groupName: "G", text: "", timestamp: 1, fromMe: true, hasMedia: true, mediaType: "image" },
