@@ -1973,6 +1973,33 @@ _ROLE_LABELS = {
     "UNMAPPED_WORK": "UNMAPPED WORK", "IGNORE": "IGNORE",
 }
 
+# A dollar amount immediately followed by a known payment-method word --
+# confirmed as a real, repeated closing-report pattern by checking actual
+# live TECH_CLOSINGS traffic (5 of 8 real closing messages contained this
+# exact adjacent shape: "$200 cash abozeid", "$720 cash", "$379.50 cc
+# joy", "$415 venmo to hazem"). Deliberately narrow: requires the amount
+# and method to be directly adjacent, so it does NOT match a dollar
+# figure mentioned elsewhere in the message with no payment word next to
+# it (e.g. a real observed false-positive risk: "Da keda additional to
+# the $150", which is not a closing report at all) and does NOT attempt
+# to interpret the more complex multi-line Fees/Parts/Total breakdown
+# format seen in 2 other real messages -- there wasn't enough repeated,
+# unambiguous evidence for that shape to build a rule from it yet.
+_CLOSING_AMOUNT_RE = re.compile(
+    r"\$\s*([\d,]+\.?\d*)\s+(cash|cc|card|venmo|zelle|check)\b", re.IGNORECASE,
+)
+
+
+def _extract_closing_amount_and_method(text: str):
+    """Returns (amount, payment_method) as the exact substrings matched,
+    or (None, None) if the message doesn't contain this specific,
+    high-confidence adjacent pattern. Never guesses a value from a less
+    certain shape -- see _CLOSING_AMOUNT_RE's comment."""
+    match = _CLOSING_AMOUNT_RE.search(text or "")
+    if not match:
+        return None, None
+    return match.group(1), match.group(2).lower()
+
 
 def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rules) -> dict:
     role = obs.get("group_role") or "UNMAPPED_WORK"
@@ -2021,6 +2048,37 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
         })
         return base
 
+    if role == "TECH_DISPATCH":
+        # A message in a technician's dispatch group is usually a short
+        # reply (K / decline / ETA) -- but it can also be the dispatcher
+        # forwarding the full job posting itself (same "Ticket:.../Name:.../
+        # Phone:..." block shape company-intake groups use, just relayed
+        # into the technician's group). Confirmed as a real, repeated
+        # pattern by checking actual live traffic (17 real observations
+        # across 3 different confirmed dispatch groups/companies), not
+        # built from a single example. Checked first and returns early --
+        # a ticket block's digits/labels must never fall through to the
+        # ETA/UPDATE text-matching below, which would misread it as a
+        # technician status update instead of what it actually is: the
+        # SEND_JOB_TO_TECHNICIAN step of the workflow.
+        forwarded_job = extract_job(obs.get("text") or "", vehicle_rules)
+        if forwarded_job.ticket_number.value and (forwarded_job.phone.value or forwarded_job.address.value):
+            matched_job = next((j for j in all_jobs if j.get("ticket_number") == forwarded_job.ticket_number.value), None)
+            if matched_job:
+                interpretation = f"JOB FORWARDED TO TECHNICIAN -- CORRELATES TO JOB #{matched_job['id']}"
+                next_action = f"REVIEW -- MATCHES JOB #{matched_job['id']}"
+            else:
+                interpretation = f"JOB FORWARDED TO TECHNICIAN -- TICKET {forwarded_job.ticket_number.value} (no matching job on record)"
+                next_action = "REVIEW"
+            base.update({
+                "interpretation": interpretation,
+                "proposed_job_id": matched_job["id"] if matched_job else None,
+                "proposed_ticket": forwarded_job.ticket_number.value,
+                "confidence": "OK",
+                "next_action": next_action,
+            })
+            return base
+
     if role in ("TECH_DISPATCH", "TECH_CLOSINGS"):
         registry_row = storage.get_group_registry_entry(conn, obs["group_id"])
         technician = _resolve_registry_technician(conn, registry_row) if registry_row else None
@@ -2051,7 +2109,8 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             else:
                 next_action = "CONFIRM MATCH / REVIEW"
         else:
-            interp = "CLOSING RECEIVED"
+            closing_amount, closing_payment_method = _extract_closing_amount_and_method(obs.get("text"))
+            interp = f"CLOSING RECEIVED -- ${closing_amount} {closing_payment_method}" if closing_amount else "CLOSING RECEIVED"
             next_action = "REVIEW CLOSING"
         base.update({
             "interpretation": interp,
@@ -2059,7 +2118,15 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             "proposed_job_id": job["id"] if job else None,
             "proposed_ticket": job["ticket_number"] if job else None,
             "confidence": suggestion["category"],
-            "missing_fields": ["amount", "payment_method"] if role == "TECH_CLOSINGS" else [],
+            # Only a field this message's text genuinely lacks counts as
+            # "missing" -- see _extract_closing_amount_and_method's own
+            # comment for exactly which real-world shape this recognizes
+            # and which it deliberately doesn't (never invents a value
+            # for the shapes it doesn't recognize; those still show as
+            # missing, same as before this fix).
+            "missing_fields": (
+                ([] if closing_amount else ["amount"]) + ([] if closing_payment_method else ["payment_method"])
+            ) if role == "TECH_CLOSINGS" else [],
             # _suggest_job_for_technician only ever returns a job for
             # EXACT/STRONG -- AMBIGUOUS and UNMATCHED both return job=None,
             # and both genuinely need a human to pick/find the right job,
@@ -2067,6 +2134,9 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             # than the misleadingly specific match-confirmation phrasing.
             "next_action": next_action if job else "HUMAN_REVIEW_NEEDED",
         })
+        if role == "TECH_CLOSINGS":
+            base["closing_amount"] = closing_amount
+            base["closing_payment_method"] = closing_payment_method
         return base
 
     if role == "COMPANY_CLOSINGS":

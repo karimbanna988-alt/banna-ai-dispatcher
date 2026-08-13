@@ -2214,6 +2214,48 @@ def test_shadow_feed_tech_dispatch_decline_with_a_matched_job_says_reassign_not_
     assert "confirm" not in item["next_action"].lower()
 
 
+def test_shadow_feed_tech_dispatch_full_job_block_is_labeled_as_a_forward_not_a_technician_reply(api_env):
+    """Real live-traffic finding: a dispatcher forwarding the full job
+    posting into a technician's dispatch group (same Ticket:/Name:/Phone:
+    shape company-intake groups use) was previously misread as a
+    technician ETA/UPDATE, because the branch only ever expected short
+    technician replies. Confirmed as a repeated pattern (17 real
+    observations across 3 different dispatch groups/companies) before
+    fixing -- this locks in the fix with a matched-existing-job case."""
+    job_id = _seed_active_job_with_technician(api_env)  # dispatches ticket "A200"
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", main_leads_message("A200"))
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == f"JOB FORWARDED TO TECHNICIAN -- CORRELATES TO JOB #{job_id}"
+    assert item["proposed_job_id"] == job_id
+    assert item["proposed_ticket"] == "A200"
+    assert item["next_action"] == f"REVIEW -- MATCHES JOB #{job_id}"
+
+
+def test_shadow_feed_tech_dispatch_full_job_block_with_no_matching_job_still_labeled_as_a_forward(api_env):
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", main_leads_message("NOJOB1"))
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "JOB FORWARDED TO TECHNICIAN -- TICKET NOJOB1 (no matching job on record)"
+    assert item["proposed_job_id"] is None
+    assert item["proposed_ticket"] == "NOJOB1"
+    assert item["next_action"] == "REVIEW"
+
+
+def test_shadow_feed_tech_dispatch_short_k_reply_is_unaffected_by_the_forwarded_job_check(api_env):
+    """A short reply like "k" never parses as a ticket+phone block, so it
+    must keep going through the normal K/decline/ETA path unchanged."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "k")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN K"
+    assert item["proposed_job_id"] == job_id
+
+
 def test_shadow_feed_tech_closings_never_invents_amount(api_env):
     job_id = _seed_active_job_with_technician(api_env)
     _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")
@@ -2224,6 +2266,39 @@ def test_shadow_feed_tech_closings_never_invents_amount(api_env):
     assert "amount" in item["missing_fields"]
     assert item["next_action"] == "REVIEW CLOSING"
     assert item["proposed_job_id"] == job_id
+
+
+def test_shadow_feed_tech_closings_extracts_amount_and_payment_method_when_directly_adjacent(api_env):
+    """Real live-traffic finding: TECH_CLOSINGS previously always claimed
+    amount/payment_method were missing, even for messages that plainly
+    state them (e.g. real observed text "$200 cash abozeid", "$720 cash",
+    "$379.50 cc joy", "$415 venmo to hazem" -- 5 of 8 real closing
+    messages checked had this exact adjacent shape). Fixed to parse this
+    specific, repeated, high-confidence pattern -- never a looser guess."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "close@g.us", "Fab Closings", "Closed\n$200 cash abozeid")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "CLOSING RECEIVED -- $200 cash"
+    assert item["missing_fields"] == []
+    assert item["closing_amount"] == "200"
+    assert item["closing_payment_method"] == "cash"
+    assert item["proposed_job_id"] == job_id
+
+
+def test_shadow_feed_tech_closings_does_not_match_a_dollar_figure_with_no_adjacent_payment_word(api_env):
+    """Real observed false-positive risk: "Da keda additional to the
+    $150" mentions a dollar figure but is not a closing report at all --
+    must never be picked up as a closing amount."""
+    _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "close@g.us", "Fab Closings", "Da keda additional to the $150")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "CLOSING RECEIVED"
+    assert item["missing_fields"] == ["amount", "payment_method"]
+    assert item["closing_amount"] is None
+    assert item["closing_payment_method"] is None
 
 
 def test_shadow_feed_company_closings_is_destination_context_only(api_env):
