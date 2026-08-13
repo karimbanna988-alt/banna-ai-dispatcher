@@ -2042,6 +2042,31 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
         return base
 
     if role == "COMPANY_JOB_INTAKE":
+        # A bare acknowledgement in a company intake group is the
+        # dispatcher acknowledging the company's job -- an actual step of
+        # the workflow, not a job posting that failed to parse. Without
+        # this it fell through to the extractor below and was reported as
+        # "INSUFFICIENT DATA" with ticket/phone/address/service all
+        # "missing", which reads like a broken job and buries the real
+        # ones in noise. Confirmed against live traffic: every short
+        # reply observed in confirmed intake groups came from the same
+        # sender that also posts across 11 other groups (dispatcher-
+        # shaped), and three were a bare "K".
+        #
+        # Reuses technician_ack.ACKNOWLEDGEMENT_TEXTS -- the same explicit,
+        # never-inferred-beyond-this vocabulary the technician side uses,
+        # rather than inventing a second list. Deliberately does NOT
+        # assert WHO sent it: sender identity is not owner-confirmed, so
+        # the label describes the message, not the person.
+        if (obs.get("text") or "").strip().lower() in technician_ack.ACKNOWLEDGEMENT_TEXTS:
+            base.update({
+                "interpretation": "ACKNOWLEDGEMENT -- not a job posting",
+                "confidence": "OK",
+                "missing_fields": [],
+                "next_action": "REVIEW -- ACKNOWLEDGEMENT ONLY",
+            })
+            return base
+
         job = extract_job(obs["text"], vehicle_rules)
         classify_result = storage.classify_incoming(conn, job)
         core = {"ticket": job.ticket_number.value, "phone": job.phone.value, "address": job.address.value, "service": job.service_type.value}

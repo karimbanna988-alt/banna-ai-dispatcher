@@ -2256,6 +2256,43 @@ def test_shadow_feed_tech_dispatch_short_k_reply_is_unaffected_by_the_forwarded_
     assert item["proposed_job_id"] == job_id
 
 
+def test_shadow_feed_company_intake_acknowledgement_is_not_reported_as_a_broken_job(api_env):
+    """Real live-traffic finding: a bare "K" in a company intake group is
+    the dispatcher acknowledging the job -- a real workflow step. It was
+    being reported as INSUFFICIENT DATA with ticket/phone/address/service
+    all missing, which reads like a broken job posting and buries the
+    real ones. Three bare "K"s were observed in confirmed intake groups."""
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Fabricated Co")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Fab Intake", "K")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "ACKNOWLEDGEMENT -- not a job posting"
+    assert item["missing_fields"] == []
+    assert item["next_action"] == "REVIEW -- ACKNOWLEDGEMENT ONLY"
+    assert item["proposed_ticket"] is None
+
+
+def test_shadow_feed_company_intake_real_job_posting_is_unaffected_by_the_ack_check(api_env):
+    """Regression guard: a genuine job posting must still parse normally."""
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Fabricated Co")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Fab Intake", main_leads_message("NEWJOB1"))
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "NEW JOB DETECTED"
+    assert item["proposed_ticket"] == "NEWJOB1"
+
+
+def test_shadow_feed_company_intake_freeform_chatter_still_reports_missing_fields(api_env):
+    """Only an exact acknowledgement short-circuits. Genuine freeform text
+    that is trying to be a job must still surface its missing fields."""
+    _seed_registry(api_env, "intake@g.us", "COMPANY_JOB_INTAKE", company="Fabricated Co")
+    _seed_whatsapp_obs(api_env, "m1", "intake@g.us", "Fab Intake", "customer is waiting outside")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "MESSAGE RECEIVED -- INSUFFICIENT DATA"
+    assert "ticket" in item["missing_fields"]
+
+
 def test_shadow_feed_tech_dispatch_no_answer_is_its_own_category_not_a_generic_update(api_env):
     """Real live-traffic finding: "customer didn't answer" is operationally
     distinct from every existing category -- not a decline (the technician
