@@ -2082,8 +2082,8 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
         # across 3 different confirmed dispatch groups/companies), not
         # built from a single example. Checked first and returns early --
         # a ticket block's digits/labels must never fall through to the
-        # ETA/UPDATE text-matching below, which would misread it as a
-        # technician status update instead of what it actually is: the
+        # ETA-or-update text matching below, which would misread it as a
+        # technician status report instead of what it actually is: the
         # SEND_JOB_TO_TECHNICIAN step of the workflow.
         forwarded_job = extract_job(obs.get("text") or "", vehicle_rules)
         if forwarded_job.ticket_number.value and (forwarded_job.phone.value or forwarded_job.address.value):
