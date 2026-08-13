@@ -2256,6 +2256,78 @@ def test_shadow_feed_tech_dispatch_short_k_reply_is_unaffected_by_the_forwarded_
     assert item["proposed_job_id"] == job_id
 
 
+def test_shadow_feed_tech_dispatch_no_answer_is_its_own_category_not_a_generic_update(api_env):
+    """Real live-traffic finding: "customer didn't answer" is operationally
+    distinct from every existing category -- not a decline (the technician
+    isn't refusing), not an ETA, not an ordinary update. It means the job
+    is stalling and the company needs telling. Confirmed as a repeated
+    cross-group pattern (6 genuine instances, 4 groups, 4 technicians)
+    before adding."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", "No answer will try to call again")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN NO ANSWER -- CUSTOMER UNREACHABLE"
+    assert item["proposed_job_id"] == job_id
+    assert item["next_action"] == "UPDATE_COMPANY"
+
+
+@pytest.mark.parametrize("text", [
+    "Its going to voicemail left a voicemail and texted them",
+    "No answer sent a text",
+    "Cx doesn't answer, voice mail",
+    "Customer didn't answer so how I'm going to be on my way",
+])
+def test_shadow_feed_recognizes_every_real_observed_no_answer_phrasing(api_env, text):
+    """Each string here is a real message observed in live traffic. A
+    leading "No" must NOT be mistaken for the bare "no" decline token --
+    "No answer sent a text" is a no-answer report, not a refusal."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch", text)
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN NO ANSWER -- CUSTOMER UNREACHABLE"
+
+
+def test_shadow_feed_pass_because_of_no_answer_is_treated_as_a_decline_needing_reassignment(api_env):
+    """Real observed message combining both facts. The actionable outcome
+    is a reassignment, so it must not read as "just waiting on the
+    customer" -- but the no-answer reason is preserved in the label."""
+    job_id = _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    _seed_whatsapp_obs(api_env, "m1", "disp@g.us", "Fab Dispatch",
+                       "Pass he's too far now not worth them not answering after I drive 1 hour")
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    item = next(i for i in result["items"] if i["message_id"] == "m1")
+    assert item["interpretation"] == "TECHNICIAN DECLINE -- CUSTOMER NO ANSWER"
+    assert item["next_action"] == "TECHNICIAN DECLINED -- REASSIGN"
+    assert item["proposed_job_id"] == job_id
+
+
+def test_shadow_feed_no_answer_check_does_not_disturb_k_decline_or_eta(api_env):
+    """Regression guard: adding the no-answer branch must leave every
+    pre-existing category classified exactly as before."""
+    _seed_active_job_with_technician(api_env)
+    _seed_registry(api_env, "disp@g.us", "TECH_DISPATCH", technician_name_unconfirmed="Fabricated Tech")
+    for msg_id, text, expected in [
+        ("a1", "k", "TECHNICIAN K"),
+        ("a2", "can't", "TECHNICIAN DECLINE"),
+        ("a3", "eta 20 minutes", "TECHNICIAN ETA/UPDATE"),
+        ("a4", "1:30 hours", "TECHNICIAN ETA/UPDATE"),
+        ("a5", "on my way", "TECHNICIAN UPDATE"),
+    ]:
+        _seed_whatsapp_obs(api_env, msg_id, "disp@g.us", "Fab Dispatch", text)
+    result = api.route_whatsapp_shadow_feed(None, {}, {})
+    got = {i["message_id"]: i["interpretation"] for i in result["items"]}
+    assert got["a1"] == "TECHNICIAN K"
+    assert got["a2"] == "TECHNICIAN DECLINE"
+    assert got["a3"] == "TECHNICIAN ETA/UPDATE"
+    assert got["a4"] == "TECHNICIAN ETA/UPDATE"
+    assert got["a5"] == "TECHNICIAN UPDATE"
+
+
 def test_shadow_feed_tech_closings_never_invents_amount(api_env):
     job_id = _seed_active_job_with_technician(api_env)
     _seed_registry(api_env, "close@g.us", "TECH_CLOSINGS", technician_name_unconfirmed="Fabricated Tech")

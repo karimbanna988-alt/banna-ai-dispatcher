@@ -1990,6 +1990,30 @@ _CLOSING_AMOUNT_RE = re.compile(
 )
 
 
+# A technician reporting the CUSTOMER could not be reached. Confirmed as
+# a real, repeated, cross-group pattern before being added: 6 genuine
+# standalone instances across 4 different confirmed/unmapped dispatch
+# groups and 4 different technicians ("No answer will try to call again",
+# "Cx doesn't answer, voice mail", "Its going to voicemail left a
+# voicemail and texted them", "No answer sent a text", ...). Operationally
+# distinct from every existing category: it is NOT a decline (the
+# technician isn't refusing the job), NOT an ETA, and NOT an ordinary
+# update -- it means the job is stalling and the company needs telling.
+_NO_ANSWER_RE = re.compile(
+    r"(no answer|didn'?t answer|doesn'?t answer|not answering|no reply|voice ?mail)", re.IGNORECASE,
+)
+
+# Checked only AFTER _NO_ANSWER_RE has already matched, to separate
+# "the customer didn't answer, I'll retry" from "I'm dropping this job
+# because they didn't answer" -- different real outcomes (wait/update vs.
+# reassign). Deliberately anchored to a leading "pass": a bare leading
+# "no" cannot be used as the decline signal here, because the real
+# messages "No answer sent a text" and "No answer will try to call again"
+# both begin with "No" as part of the phrase "No answer" and are NOT
+# declines.
+_PASS_PREFIX_RE = re.compile(r"^\s*pass\b", re.IGNORECASE)
+
+
 def _extract_closing_amount_and_method(text: str):
     """Returns (amount, payment_method) as the exact substrings matched,
     or (None, None) if the message doesn't contain this specific,
@@ -2086,10 +2110,20 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
         job = suggestion["job"]
         text_lower = (obs.get("text") or "").strip().lower()
         if role == "TECH_DISPATCH":
+            raw_text = (obs.get("text") or "").strip()
             if text_lower in technician_ack.ACKNOWLEDGEMENT_TEXTS:
                 interp = "TECHNICIAN K"
             elif text_lower in technician_ack.DECLINE_TEXTS:
                 interp = "TECHNICIAN DECLINE"
+            elif _NO_ANSWER_RE.search(raw_text):
+                # Checked before the digit heuristic below: a real message
+                # like "Pass he's too far now not worth them not answering
+                # after I drive 1 hour" contains a digit and would
+                # otherwise be misfiled as an ETA.
+                interp = (
+                    "TECHNICIAN DECLINE -- CUSTOMER NO ANSWER" if _PASS_PREFIX_RE.search(raw_text)
+                    else "TECHNICIAN NO ANSWER -- CUSTOMER UNREACHABLE"
+                )
             elif "eta" in text_lower or any(ch.isdigit() for ch in text_lower):
                 interp = "TECHNICIAN ETA/UPDATE"
             else:
@@ -2102,8 +2136,10 @@ def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rul
             # inventing a parallel phrase for the same real-world step.
             if interp == "TECHNICIAN K" and job:
                 next_action = "CONFIRM TECHNICIAN ACCEPTED"
-            elif interp == "TECHNICIAN DECLINE" and job:
+            elif interp.startswith("TECHNICIAN DECLINE") and job:
                 next_action = "TECHNICIAN DECLINED -- REASSIGN"
+            elif interp.startswith("TECHNICIAN NO ANSWER") and job:
+                next_action = "UPDATE_COMPANY"
             elif interp in ("TECHNICIAN ETA/UPDATE", "TECHNICIAN UPDATE") and job:
                 next_action = "UPDATE_COMPANY"
             else:
