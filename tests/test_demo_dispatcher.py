@@ -197,6 +197,40 @@ def test_unrecognized_chat_is_ignored(vr):
     assert decisions[0].needs_human is True
 
 
+def test_the_exact_owner_demo_sequence(vr):
+    """The precise sequence the owner will type tonight, pinned so it
+    cannot silently break: job -> K -> "20 min" -> "Done 180 cash"."""
+    decisions, job = dd.run_sequence([
+        (dd.ROLE_COMPANY, demo_job_message()),
+        (dd.ROLE_TECHNICIAN, "K"),
+        (dd.ROLE_TECHNICIAN, "20 min"),
+        (dd.ROLE_TECHNICIAN, "Done 180 cash"),
+    ], vr)
+    assert decisions[0].proposed_action == "SEND_TO_TECHNICIAN"
+    assert decisions[1].detected == "Technician accepted the job"
+    assert decisions[2].state_after == dd.STATE_EN_ROUTE
+    assert "20 min" in decisions[2].detected
+    assert job.state == dd.STATE_COMPLETED
+    assert job.closing_amount == "180"
+    assert job.closing_payment_method == "cash"
+
+
+def test_the_exact_owner_negative_case_bare_done(vr):
+    """The owner will type a bare "Done" to prove the system refuses to
+    invent a price. This must stay true."""
+    decisions, job = dd.run_sequence([
+        (dd.ROLE_COMPANY, demo_job_message()),
+        (dd.ROLE_TECHNICIAN, "K"),
+        (dd.ROLE_TECHNICIAN, "Done"),
+    ], vr)
+    d = decisions[2]
+    assert job.closing_amount is None
+    assert job.closing_payment_method is None
+    assert d.proposed_action == "HUMAN_REVIEW_NEEDED"
+    assert set(d.missing_fields) == {"amount", "payment_method"}
+    assert job.state != dd.STATE_COMPLETED
+
+
 def test_every_decision_carries_a_reason(vr):
     """The demo's whole point is visible reasoning -- no step may be
     silent."""
