@@ -286,7 +286,11 @@ def _code_only(module) -> str:
 # came back as a dispatch request.
 
 def test_an_already_dispatched_job_is_not_offered_for_dispatch_again():
-    c = base(dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai"}])
+    # The dispatch must be timestamped AFTER the intake: without a
+    # usable order the correct answer is human review, not suppression
+    # (see tests/test_correlation_safety.py).
+    c = base(dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai",
+                             "received_at": "2026-08-14T21:00:12+00:00"}])
     assert c["status"] == dc.STATUS_ALREADY_DISPATCHED
     assert c["status"] != dc.STATUS_WAITING_HUMAN
     assert c["proposed_message"] is None, "nothing may be offered to send for work already sent"
@@ -295,26 +299,30 @@ def test_an_already_dispatched_job_is_not_offered_for_dispatch_again():
 def test_an_already_dispatched_job_becomes_routing_verification():
     """Observing it downstream still has value -- it proves the rules
     agree with what the human actually did."""
-    c = base(dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai"}])
+    c = base(dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai",
+                             "received_at": "2026-08-14T21:00:12+00:00"}])
     assert c["actual_destination"] == "Sebai"
     assert c["recommended"] == "Sebai"
     assert c["routing_match"] == dc.ROUTING_MATCH
 
 
 def test_a_routing_disagreement_is_reported_not_hidden():
-    c = base(dispatched_to=[{"group_name": "Joe Greenville Dispatch", "technician": "Joe"}])
+    c = base(dispatched_to=[{"group_name": "Joe Greenville Dispatch", "technician": "Joe",
+                             "received_at": "2026-08-14T21:00:12+00:00"}])
     assert c["routing_match"] == dc.ROUTING_MISMATCH
     assert any("expected Sebai" in w for w in c["why"])
 
 
 def test_routing_is_unverified_when_the_rules_could_not_recommend():
-    c = base(eligible=[], dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai"}])
+    c = base(eligible=[], dispatched_to=[{"group_name": "Sebai Augusta Dispatch", "technician": "Sebai",
+                                         "received_at": "2026-08-14T21:00:12+00:00"}])
     assert c["routing_match"] == dc.ROUTING_UNVERIFIED
     assert c["status"] == dc.STATUS_ALREADY_DISPATCHED
 
 
 def test_a_closing_observation_is_never_a_dispatch_candidate():
-    c = base(closing_seen_in=[{"group_name": "Sebai augusta closing", "technician": "Sebai"}])
+    c = base(closing_seen_in=[{"group_name": "Sebai augusta closing", "technician": "Sebai",
+                               "received_at": "2026-08-14T21:00:12+00:00"}])
     assert c["status"] == dc.STATUS_CLOSING_OBSERVED
     assert c["status"] != dc.STATUS_WAITING_HUMAN
     assert c["proposed_message"] is None
@@ -322,8 +330,10 @@ def test_a_closing_observation_is_never_a_dispatch_candidate():
 
 def test_only_a_genuinely_undispatched_intake_job_waits_for_human_dispatch():
     assert base(dispatched_to=None, closing_seen_in=None)["status"] == dc.STATUS_WAITING_HUMAN
-    for kw in ({"dispatched_to": [{"technician": "Sebai"}]},
-               {"closing_seen_in": [{"technician": "Sebai"}]}):
+    for kw in ({"dispatched_to": [{"technician": "Sebai", "received_at": "2026-08-14T21:00:12+00:00"}]},
+               {"closing_seen_in": [{"technician": "Sebai", "received_at": "2026-08-14T21:00:12+00:00"}]},
+               # Undated evidence must also keep it off the board.
+               {"dispatched_to": [{"technician": "Sebai"}]}):
         assert base(**kw)["status"] != dc.STATUS_WAITING_HUMAN
 
 
@@ -331,7 +341,7 @@ def test_downstream_evidence_only_counts_confirmed_technician_groups():
     """An unconfirmed group's traffic must not be treated as proof that a
     job was dispatched -- nor as proof that it was not."""
     source = _route_source("route_whatsapp_candidates")
-    marker = source.index("dispatched_by_ticket")
+    marker = source.index("dispatched_by_scope")
     window = source[marker:marker + 900]
     assert "group_mapping_confirmed" in window
     assert "TECH_DISPATCH" in window and "TECH_CLOSINGS" in window
@@ -359,7 +369,7 @@ def test_an_ignore_group_produces_no_candidate():
     source = _route_source("route_whatsapp_candidates")
     intake_guard = 'group_role\') == \'COMPANY_JOB_INTAKE\''
     assert intake_guard in source or '"COMPANY_JOB_INTAKE"' in source
-    evidence = source[source.index("dispatched_by_ticket"):]
+    evidence = source[source.index("dispatched_by_scope"):]
     assert "IGNORE" not in evidence, "IGNORE groups must not be dispatch evidence"
 
 

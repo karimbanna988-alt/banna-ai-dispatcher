@@ -100,6 +100,8 @@ from dispatcher.workflow_projection import (  # noqa: E402
 STATIC_DIR = REPO_ROOT / "operator_ui_v2_connected"
 DISPATCHER_ACTOR = "dispatcher"
 LIVE_WINDOW_MINUTES = luxor_desk_shared.NEW_JOBS_LIVE_WINDOW_SECONDS // 60  # 60 -- single source of truth
+# What parser.extract_job reports when it cannot identify the company.
+UNRESOLVED_SOURCE = "Unknown"
 
 # get_live_dispatch_queue()'s "live" bucket is bounded only by the one-time
 # console-activation boundary (console_activation_state.live_queue_started_at,
@@ -2588,24 +2590,45 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         # on its way is worse than showing nothing.
         #
         # Only OWNER-CONFIRMED technician groups count as evidence, and
-        # correlation is by exact ticket only -- never by timing.
-        dispatched_by_ticket: dict = {}
-        closings_by_ticket: dict = {}
+        # correlation requires the SAME COMPANY plus the exact ticket --
+        # never timing proximity.
+        #
+        # Scoping by source matters because a bare ticket string is not
+        # unique across companies. The canonical path already knows this:
+        # storage.classify_incoming looks up
+        # `WHERE ticket_number = ? AND source = ?` precisely so that "a
+        # bare ticket_number lookup could match the wrong company's job
+        # if two happened to share the same ticket string". This uses the
+        # same parser-derived source rather than a second normalisation,
+        # and technician-group registry rows carry no company of their
+        # own, so the source comes from the forwarded message itself.
+        dispatched_by_scope: dict = {}
+        closings_by_scope: dict = {}
+        unscoped_by_ticket: dict = {}
         for obs in observations:
             role = obs.get("group_role")
             if role not in ("TECH_DISPATCH", "TECH_CLOSINGS"):
                 continue
             if not obs.get("group_mapping_confirmed"):
                 continue
-            seen = extract_job(obs.get("text") or "", vehicle_rules).ticket_number.value
+            downstream = extract_job(obs.get("text") or "", vehicle_rules)
+            seen = downstream.ticket_number.value
             if not seen:
                 continue
-            bucket = dispatched_by_ticket if role == "TECH_DISPATCH" else closings_by_ticket
-            bucket.setdefault(seen, []).append({
+            evidence = {
                 "group_name": obs.get("group_name"),
                 "technician": obs.get("group_technician_name"),
                 "received_at": obs.get("received_at"),
-            })
+            }
+            seen_source = downstream.source.value
+            if not seen_source or seen_source == UNRESOLVED_SOURCE:
+                # Same ticket string, unknown company. This cannot prove
+                # the jobs are the same, so it never suppresses -- it
+                # only raises a human review.
+                unscoped_by_ticket.setdefault(seen, []).append(evidence)
+                continue
+            bucket = dispatched_by_scope if role == "TECH_DISPATCH" else closings_by_scope
+            bucket.setdefault((seen_source, seen), []).append(evidence)
 
         candidates = []
         seen_tickets = set()
@@ -2617,14 +2640,17 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
 
             job = extract_job(obs.get("text") or "", vehicle_rules)
 
-            # One candidate per ticket. The same job is often posted more
-            # than once in an intake group (repost, correction, chase-up),
-            # and each repost must not become another board row.
+            # One candidate per (company, ticket). The same job is often
+            # posted more than once in an intake group (repost,
+            # correction, chase-up) and each repost must not become
+            # another board row -- but two companies sharing a ticket
+            # string are two different jobs and must both survive.
             ticket = job.ticket_number.value
-            if ticket:
-                if ticket in seen_tickets:
+            scope = (job.source.value, ticket) if ticket else None
+            if scope:
+                if scope in seen_tickets:
                     continue
-                seen_tickets.add(ticket)
+                seen_tickets.add(scope)
 
             resolution, eligible, _market = rm.resolve_job_routing(conn, job, obs.get("text") or "")
             proposed = formatter.format_technician_message(job)
@@ -2644,8 +2670,9 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 missing_fields=interp.get("missing_fields") or [],
                 proposed_message=proposed,
                 correlated_job_id=interp.get("existing_job_id"),
-                dispatched_to=dispatched_by_ticket.get(ticket) if ticket else None,
-                closing_seen_in=closings_by_ticket.get(ticket) if ticket else None,
+                dispatched_to=dispatched_by_scope.get(scope) if scope else None,
+                closing_seen_in=closings_by_scope.get(scope) if scope else None,
+                ambiguous_source_matches=unscoped_by_ticket.get(ticket) if ticket else None,
             ))
 
         def count(status):
@@ -2655,6 +2682,7 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
             "candidates": candidates,
             "waiting_for_human_dispatch": count(dispatch_candidates.STATUS_WAITING_HUMAN),
             "already_dispatched": count(dispatch_candidates.STATUS_ALREADY_DISPATCHED),
+            "repost_after_prior_dispatch": count(dispatch_candidates.STATUS_REPOST_AFTER_DISPATCH),
             "closing_observed": count(dispatch_candidates.STATUS_CLOSING_OBSERVED),
             "human_review_needed": count(dispatch_candidates.STATUS_HUMAN_REVIEW),
             "mapping_required": count(dispatch_candidates.STATUS_MAPPING_REQUIRED),
