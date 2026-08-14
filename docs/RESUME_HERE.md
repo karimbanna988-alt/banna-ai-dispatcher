@@ -1,205 +1,148 @@
 # Resume Here
 
-Written before an overnight break so the next session (or a different
-engineer, or a different AI) can pick this up cold. Everything below was
-verified, not assumed.
+Written before an overnight break so the next session — a new chat, a
+different engineer, or a different AI — can pick this up cold.
+Everything below was verified, not assumed.
 
-**HEAD when this was written:** `3bd458b`
-**Working tree:** clean — every change is committed.
-**Live stack:** left RUNNING deliberately (see "What is running" below).
-
----
-
-## 1. What this system is doing right now
-
-A **receive-only WhatsApp shadow dispatcher**. It watches the real
-locksmith operation — the human dispatcher **Seif** works the actual
-shift — captures every message from the registered WhatsApp groups,
-interprets it, correlates it into job traces, and shows a human what it
-concluded.
-
-It has never sent a WhatsApp message, never written to Quo, and never
-created, closed or modified a real job. That is structural, not
-policy: `whatsapp_shadow_bridge/test/no-send-static-check.test.js`
-greps the whole bridge source and fails the build if a send-capable
-call ever appears.
+**Product:** Banna Dispatch · **Tenant:** Luxor Locksmith
+**HEAD:** `6bfabf9` · **Tag:** `rc-2026-08-15-correlation-safety`
+**Working tree:** clean. All owner untracked files preserved.
 
 ---
 
-## 2. What is running (leave it alone unless it breaks)
+## 1. What is running (leave it alone unless it breaks)
 
-| Port | Service | How it was started |
+| Port | What | State when this was written |
 |---|---|---|
-| 8512 | CRM API + UI (`operator_api.py`) | `Start-Process python operator_api.py --port 8512` (detached, minimized) |
-| 8513 | WhatsApp adapter | embedded thread inside the 8512 process |
-| 8514 | Node WhatsApp bridge | `scripts/start_normal.ps1` in its own window |
+| 8512 | Console + operator API | 200 |
+| 8513 | WhatsApp adapter (a thread inside 8512) | ok |
+| 8514 | WhatsApp Shadow Bridge | `paired: true, connected` |
 
-Plus three visible monitor windows on the desktop:
-`LUXOR - LIVE OBSERVATIONS`, `LUXOR - SHADOW DECISIONS`, and the bridge
-window.
+**Passive capture continues while nobody is working.** WhatsApp → 8514 →
+8513 → SQLite → 8512. No model call is involved, so observations keep
+accumulating overnight with Claude completely idle. Proven this session:
+10 new observations landed during a window when no analysis ran, and all
+10 appeared in the Live Operations feed.
 
-**Health check (all three):**
-```
-curl -s http://127.0.0.1:8512/ -o /dev/null -w "%{http_code}\n"
-curl -s http://127.0.0.1:8513/health
-curl -s http://127.0.0.1:8514/health
-```
-Expect `200`, `{"status":"ok"}`, and
-`{"enabled":true,"paired":true,"status":"connected"}`.
+Leave all three running. To stop or restart, see
+`docs/BANNA_DISPATCH_OPERATIONS.md` — do not improvise commands.
 
-**If 8514 is down:** restart with `scripts/start_normal.ps1` from
-`whatsapp_shadow_bridge/`. It reuses the on-disk session — the session
-has now survived three machine reboots and two process restarts with
-**zero** QR prompts. Only ask for a new QR if normal reuse genuinely
-fails.
+## 2. State at the checkpoint
 
-**If 8512/8513 are down:** restart `operator_api.py`. The bridge's
-durable retry queue protects observations across the gap.
+- Observations: **1724** and climbing
+- Retry queue: **0**
+- DB integrity `ok`, FK violations `0`
+- Business tables: jobs 6, events 19, technicians 18, registry 85
+- `whatsapp_outgoing_audit`: 74 — unchanged all session, i.e. **0 sends**
+- Backup taken: `C:\Users\child\Desktop\ai-dispatcher-db-backups\dispatcher.db.pre-overnight-2026-08-15-*.bak`
+  (integrity ok, 0 FK, schema current)
 
----
+## 3. Tests
 
-## 3. Ground truth: verified numbers
+Python **1974 passed / 0 failed** · Node **121 / 0**.
+Canonical suite is `tests/`, scoped by `pytest.ini`; the root
+`conftest.py` production-database tripwire is active on every run.
 
-| | |
-|---|---|
-| WhatsApp observations captured | 526 |
-| Outgoing/self audit rows | 74 (frozen — see §5) |
-| Registry | 85 groups: **27 owner-confirmed / 58 UNMAPPED_WORK** |
-| Jobs / events / technicians | **6 / 17 / 18 — untouched all session** |
-| Ticket traces | 113 tickets, **23 multi-group chains** |
-| DB integrity | ok, 0 FK violations |
-| Python tests | see `.runtime/pytest_overnight.log` |
-| Node tests | 118/118 |
+## 4. Where the product actually stands
 
-Registry counts did **not** move this session. Nothing was auto-mapped.
+**Works and is verified:**
+- Phone-first console: three stages, one per viewport, ≥44px targets, no
+  horizontal scroll, offline banner, safe-area handling
+- Live Operations feed + real health bar (real sources only)
+- Read-only Apprentice suggestions (no approval path exists)
+- WhatsApp understanding → routing → WHY → confidence → prepared message
+- Stale open jobs separated from current work without deletion or status
+  mutation
 
----
+**Not verified, and not claimed:**
+- **Owner iPhone acceptance against the current build.** Every item
+  needing a real authenticated session on the owner's device is
+  NOT OBSERVED. This is the one blocker to calling the LAN pilot ready.
+- Service worker runtime behaviour (unavailable in the test browser; also
+  inert over LAN http, which is not a secure context)
+- PWA install
 
-## 4. What was built this session (15 commits, `6e3c3d4..3bd458b`)
+**Phone URL** — re-read it, it is DHCP and changes:
 
-**Interpretation fixes — each measured against real traffic first:**
-- `0982ffe` — forwarded job blocks were misread as technician ETAs (17
-  real instances, 3 groups); closing amounts always claimed "missing"
-  even when stated (5 of 8 real closings had an unambiguous
-  `$AMOUNT METHOD` shape).
-- `81699af` — customer-no-answer had no category (6 instances, 4 groups).
-- `076d2d4` — a bare "K" in a company intake group is the dispatcher
-  acknowledging, not a broken job posting.
-- `00248b4` — **the big one.** The rule was literally "any digit means
-  ETA": 105 messages labeled ETA, only **6** actually stated a time
-  (~94% wrong). Split into bare @mention (33), price quote (6), and a
-  real ETA requiring time language.
-- `58f219d` — first-person travel → `TECHNICIAN EN ROUTE`, anchored
-  tightly because "She has someone on the way" is the *customer's* other
-  locksmith.
-
-**New capability:**
-- `f44b6e3` — `src/dispatcher/shadow_trace.py`: reconstructs end-to-end
-  job chains from observations alone, correlated by **exact ticket
-  only** (timing never establishes a link). Report:
-  `python scripts/report_whatsapp_shadow_traces.py`
-- `2c85c91` — `scripts/monitor_whatsapp_shadow_decisions_live.py`: live
-  terminal view of the actual interpretation decisions.
-
-**Real bugs fixed:**
-- `33544e7` — **adapter returned a connection reset instead of 429/401.**
-  Rate-limit and auth checks run before the body is read, so an early
-  rejection closed the connection with the body unread. I had earlier
-  dismissed the resulting flaky test as an environment artifact;
-  re-running it isolated failed 1 in 3, which disproved that. A bridge
-  hitting a bad secret would have seen an opaque network error instead
-  of the reason.
-- `8d1d0f8` — I broke the `owns_no_sql` guard with a comment containing
-  the literal `"UPDATE "`. Fixed the comment, **not** the guard.
-
-**Data (backed up, integrity-checked before and after):**
-- `2ebc236` — linked 4 owner-confirmed groups to their technician record,
-  only where mechanically provable (the technician's own record already
-  pointed back at that exact group name).
-
----
-
-## 5. Things a fresh reader will otherwise get wrong
-
-**Everything reads `UNMATCHED` — that is correct, not broken.**
-Technician correlation matches against an open job *assigned to that
-technician* in the `jobs` table. No WhatsApp job has ever been promoted
-into `jobs`, so there is nothing to match. The workflow evidence lives
-in the observations themselves — that is exactly why `shadow_trace.py`
-exists.
-
-**`whatsapp_outgoing_audit` is frozen at 74 — also correct.**
-It only captures `fromMe` messages from the *paired* account (the
-owner's). Seif dispatches from a **different** WhatsApp account, so his
-actions arrive as **incoming** messages. Not a capture failure.
-
-**The 25-item retry queue is inert legacy.**
-All 25 predate the media/empty-body fix (`8e549bd`) and can never
-deliver as-is. They do not block current ingestion.
-`scripts/quarantine_legacy_whatsapp_retry_observations.py` exists and is
-tested, but was **deliberately not run**: the bridge is live and writing
-to that same JSON file with no locking, so it should be run during a
-planned bridge stop, not while shadowing.
-
-**Don't run `pytest` from the repo root without `--ignore=Exports`** —
-an untracked `Exports/` copy of the repo collides on module names.
-
-**The DB tripwire in `conftest.py` will "fail" during a full test run
-while shadowing is live.** That is the live capture appending
-observations, not a test writing. Verify by checking
-jobs/events/technicians are still 6/17/18 — never by weakening the
-tripwire.
-
----
-
-## 6. Open owner questions (all queued, none blocking)
-
-Full detail with evidence in **`docs/PENDING_OWNER_QUESTIONS.md`**:
-
-1. **`Ashraf Charlotte Dispatch`** — most active unmapped group (24 in /
-   11 out). Its paired closings group is already confirmed, and ticket
-   `JOBW-ZZ3D` was observed flowing between them. But Ashraf's record
-   names `'Ashraf Charlotte Dispatch/ Saturday'` — a *different* string,
-   and `/Saturday` `/Sunday` suffixes are a real convention here (Joe,
-   Ziyadah, Khries all have them). **Left UNMAPPED, unguessed.**
-2. **Sender `149245868920864@lid`** — posts in 11 groups and forwarded 22
-   job blocks, so it is classified *dispatcher-shaped* on behaviour
-   alone. Whether it is Seif's account is **not** asserted.
-3. Two company-intake groups naming a technician (routing fact, not
-   ownership).
-4. **Technician-destination gap — do NOT automate.** Tarek's record is
-   deliberately empty; a general backfill would convert his
-   owner-declared *temporary* Columbia coverage into a permanent
-   assignment. Only Falcon is a genuine gap.
-5. Freeform job postings without a ticket block — 2–3 instances only,
-   too thin and too risky to parse.
-
----
-
-## 7. Where the shift stood
-
-All four workflow segments have been observed in real traffic:
-company intake → dispatcher forward (14 chains), dispatch → closing (4),
-technician closing → company closing (1). **No single ticket has
-traversed all four yet**, and the reason is measurable: those 14
-forwards happened 14–49 minutes before the check, so the jobs were
-still in flight. A complete four-stage chain should form naturally as
-the operation continues.
-
-To check:
-```
-python scripts/report_whatsapp_shadow_traces.py
+```bash
+python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print('http://%s:8512/'%s.getsockname()[0])"
 ```
 
----
+It was `http://192.168.1.105:8512/`. The start script prints it too.
 
-## 8. Suggested next steps
+## 5. The thing most likely to be misread tomorrow
 
-1. Answer the Ashraf mapping question — it is the single highest-value
-   unblock and cannot be resolved without the owner.
-2. Check whether a complete four-stage chain has formed overnight.
-3. Quarantine the 25 legacy retry items during a planned bridge stop.
-4. Keep the observe → measure → test → fix → commit loop going. The bar
-   held all session: a pattern needs repeated evidence across multiple
-   groups before it becomes a rule; group-name similarity is never
-   sufficient for a mapping.
+**The board is nearly empty, and that is correct.**
+
+- TO DISPATCH shows **0 WhatsApp candidates**. Not a bug: every WhatsApp
+  job observed had *already been forwarded* by the dispatcher, usually
+  within 10–100 seconds. Work that is already sent must never be offered
+  for dispatch again.
+- IN PROGRESS shows **0 current + 1 STALE — REVIEW NEEDED** (job #1,
+  E5X5N, ~19 days old, still stored and actionable in Admin).
+- TO CLOSE shows 0 because no closing candidates exist right now.
+
+Live candidate counts at checkpoint: 0 waiting · 6 already dispatched ·
+0 repost · 24 human review · 0 mapping required. Routing verification:
+1 MATCH, 0 MISMATCH, 5 UNVERIFIED.
+
+If tomorrow's board looks empty, check these counts before assuming
+something broke.
+
+## 6. Group mappings
+
+**32 owner-confirmed** of 85 registered. **Zero active unmapped groups** —
+the confirmation queue is empty. 53 unresolved groups are idle/historical
+and not blocking anything.
+
+Confirmed this session (batch 4, `scripts/apply_owner_mapping_batch_4.py`):
+Ashraf Charlotte Dispatch → Ashraf/Charlotte · Osos nj Closings →
+Osos/NJ · Vancouver Closings → Falcon/Vancouver · Luxor Savannah dispatch
+→ Savannah with **no technician** (shared workstream) · Trio Dispatch →
+`IGNORE` (internal chat).
+
+**Three facts that must not be quietly undone:**
+1. **Luxor Savannah dispatch has no technician on purpose.** The group
+   maps to an AREA; the current technician comes from routing. Binding a
+   person turns shared coverage into permanent ownership.
+2. **Tarek's technician record has no destinations on purpose.** That
+   empty record is what keeps his Columbia coverage temporary; his
+   permanent area is Savannah.
+3. **Osos is not Mohamed Osama.** Two different people, both NJ.
+
+## 7. Safety invariants (structural, not policy)
+
+0 WhatsApp sends · 0 Quo writes (GET-only) · no automatic job mutation ·
+no automatic reassignment · no guessed mappings · no invented price,
+amount, payment method or availability · ambiguous/unmatched →
+HUMAN_REVIEW_NEEDED. Candidate and operator projections are pure and
+cannot mutate `jobs.status`. The Apprentice has no approval endpoint.
+
+## 8. Rollback points
+
+| Tag | Commit | What it is |
+|---|---|---|
+| `rc-2026-08-15-correlation-safety` | `6bfabf9` | current |
+| `rc-2026-08-15-active-understanding` | `6a6f5f3` | before the correlation repair |
+| `rc-2026-08-14-banna-live-ops` | `5e499d9` | Live Operations + health |
+| `rc-2026-08-14-phone-pilot` | `3313214` | phone-first console |
+| `rc-2026-08-14-owner-demo-2` | `3edb5be` | protected pre-sprint RC (branch `rc2-safety-checkpoint`) |
+
+## 9. Next step — not more engineering
+
+The next action is **the owner opening the console on his iPhone** and
+running the 10-step script in `docs/PHONE_DISPATCH_PILOT.md`, step 10
+(Wi-Fi off → OFFLINE banner → Wi-Fi on → clears) being the one that
+matters most.
+
+Deferred by decision, not forgotten: remote HTTPS (`docs/BANNA_DISPATCH_DEPLOYMENT.md`
+Stage 2), PWA install, a display surface for routing verification, and
+the two demo group IDs for the isolated owner demo.
+
+## 10. Key documents
+
+`docs/BANNA_DISPATCH_OPERATIONS.md` — start/stop/recovery/backup
+`docs/BANNA_DISPATCH_DEPLOYMENT.md` — LAN pilot now, HTTPS next
+`docs/PHONE_DISPATCH_PILOT.md` — iPhone acceptance script
+`docs/PHONE_DISPATCH_PRODUCT_CONTRACT.md` — what the phone must answer
+`docs/PENDING_OWNER_QUESTIONS.md` — open owner-only questions
