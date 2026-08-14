@@ -157,6 +157,7 @@ const Api = {
   getLiveFeed() { return this._call("GET", "/api/live_feed"); },
   getLiveHealth() { return this._call("GET", "/api/live_health"); },
   getApprenticeSuggestions() { return this._call("GET", "/api/apprentice_suggestions"); },
+  getWhatsappCandidates() { return this._call("GET", "/api/whatsapp_candidates"); },
   promoteWhatsappToJob(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});
   },

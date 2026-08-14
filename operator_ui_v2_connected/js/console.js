@@ -35,6 +35,8 @@
 
   const state = {
     dispatch: [], progress: [], close: [],
+    progressStale: [],   // old open jobs, signposted not hidden
+    candidates: [],      // WhatsApp jobs understood but not committed
     stage: "dispatch",    // which stage owns the phone viewport
     selected: null,       // { col, id }
     detail: null,         // resolved detail payload
@@ -124,8 +126,11 @@
   async function load() {
     if (state.paused) return;
     try {
-      const [newJobs, active, closings] = await Promise.all([
+      const [newJobs, active, closings, wa] = await Promise.all([
         Api.getNewJobs(), Api.getActive(), Api.getClosings(),
+        // WhatsApp jobs understood and routed but NOT committed jobs.
+        // A failure here must never blank the real board.
+        Api.getWhatsappCandidates().catch(() => ({ candidates: [] })),
       ]);
 
       // TO DISPATCH: live bucket first. `older` is deliberately excluded
@@ -137,7 +142,14 @@
       state.staleCount = (newJobs.older || []).length;
 
       state.progress = (active.entries || []);
+      // Old open jobs are NOT dropped -- they are signposted separately so
+      // an 18-day-old record can never read as today's work.
+      state.progressStale = (active.stale || []);
       state.close = (closings.entries || []);
+      // Only the ones the routing rules actually resolved reach the
+      // board; the rest stay in Live Operations as human-review items.
+      state.candidates = (wa.candidates || []).filter(
+        (c) => c.status === "WAITING FOR HUMAN DISPATCH");
 
       state.failures = 0;
       state.lastGood = new Date();
@@ -372,6 +384,33 @@
     </div>`;
   }
 
+  // A WhatsApp job Banna understood and routed. Deliberately NOT a
+  // dispatchable card: the audited acknowledge -> prepare -> confirm flow
+  // belongs to a committed Quo message and there is none here. The
+  // operator copies the prepared message and sends it themselves, which
+  // is exactly the human-controlled step this product is built around.
+  function candidateCard(c) {
+    return `<div class="card candidate" data-col="candidate" data-id="${esc(c.message_id)}">
+      <div class="card-top">
+        <span class="ticket">${esc(c.ticket || "no ticket")}</span>
+        <span class="cand-tag">WhatsApp</span>
+        <span class="age">${esc(elapsedSince(c.received_at))}</span>
+      </div>
+      <div class="card-line"><b>${esc(c.service || "service not stated")}</b></div>
+      <div class="card-line">${esc(c.source || "source not stated")}</div>
+      <div class="card-line">${esc([c.city, c.state].filter(Boolean).join(", ") || "location not stated")}</div>
+      <div class="rec">
+        <span class="rec-l">Recommended</span>
+        <span class="rec-v">${esc(c.recommended)}</span>
+        ${confidenceChip(c.confidence)}
+      </div>
+      <span class="waiting act">${esc(c.status)}</span>
+      <div class="card-actions">
+        <button class="btn primary" data-act="copy-candidate" data-id="${esc(c.message_id)}">Copy message</button>
+      </div>
+    </div>`;
+  }
+
   function progressCard(e) {
     const sel = state.selected && state.selected.col === "progress" && state.selected.id === e.id;
     const w = waitingLabel(e);
@@ -436,13 +475,26 @@
      ["hdDispatch", d], ["hdProgress", p], ["hdClose", c],
      ["stDispatch", d], ["stProgress", p], ["stClose", c]]
       .forEach(([id, list]) => { const el = $(id); if (el) el.textContent = list.length; });
-    $("countDispatch").parentElement.classList.toggle("hot", d.length > 0);
+    const dispatchTotal = d.length + (state.candidates || []).length;
+    ["countDispatch", "hdDispatch", "stDispatch"].forEach((id) => {
+      const el = $(id); if (el) el.textContent = dispatchTotal;
+    });
+    $("countDispatch").parentElement.classList.toggle("hot", dispatchTotal > 0);
     $("countClose").parentElement.classList.toggle("hot", c.length > 0);
 
-    $("listDispatch").innerHTML = d.length ? d.map(dispatchCard).join("")
-      : `<div class="empty">Nothing waiting to dispatch.</div>`;
-    $("listProgress").innerHTML = p.length ? p.map(progressCard).join("")
-      : `<div class="empty">No active jobs.</div>`;
+    const cands = state.candidates || [];
+    $("listDispatch").innerHTML = (d.length ? d.map(dispatchCard).join("") : "")
+      + (cands.length ? cands.map(candidateCard).join("") : "")
+      + (!d.length && !cands.length
+          ? `<div class="empty">Nothing waiting to dispatch.</div>` : "");
+    const staleActive = state.progressStale || [];
+    $("listProgress").innerHTML = (p.length ? p.map(progressCard).join("") : "")
+      + (staleActive.length ? `<div class="stale-note">
+          <b>${staleActive.length} STALE &mdash; REVIEW NEEDED</b><br>
+          Open ${staleActive.length === 1 ? "job has" : "jobs have"} had no activity for over 24h.
+          Still stored and actionable in Admin &rsaquo; Active Jobs.
+        </div>` : "")
+      + (!p.length && !staleActive.length ? `<div class="empty">No active jobs.</div>` : "");
     $("listClose").innerHTML = c.length ? c.map(closeCard).join("")
       : `<div class="empty">Nothing to close.</div>`;
 
@@ -570,10 +622,42 @@
       </div>`;
   }
 
+  function renderCandidateDetail(c) {
+    return `
+      <div class="sec">
+        <div class="sec-h">Job (from WhatsApp)</div>
+        <div class="kv"><span class="k">Ticket</span><span class="v">${esc(c.ticket || "not stated")}</span></div>
+        <div class="kv"><span class="k">Company</span><span class="v">${esc(c.source || "not stated")}</span></div>
+        <div class="kv"><span class="k">Service</span><span class="v">${esc(c.service || "not stated")}</span></div>
+        <div class="kv"><span class="k">Area</span><span class="v">${esc([c.city, c.state].filter(Boolean).join(", ") || "not stated")}</span></div>
+        <div class="kv"><span class="k">Group</span><span class="v">${esc(c.group_name || "")}</span></div>
+      </div>
+      <div class="sec">
+        <div class="sec-h">Decision</div>
+        <div class="decision">
+          <div class="d-detected">${esc(c.detected)}</div>
+          ${(c.why || []).map((w) => `<div class="d-why">${esc(w)}</div>`).join("")}
+          <div style="margin-top:7px">${confidenceChip(c.confidence)}</div>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="missing">Not a committed job yet &mdash; this is what Banna understood
+          from WhatsApp. Copy the message and send it yourself.</div>
+      </div>
+      <div class="sec">
+        <div class="sec-h">Proposed technician message</div>
+        <div class="msgbox" id="msgBox">${esc(c.proposed_message || "")}</div>
+      </div>`;
+  }
+
   // The one primary action, pinned to the bottom of the sheet where a
   // thumb reaches it. Copy commits nothing; Dispatch is the only button
   // here that changes state, and it stays an explicit labelled tap.
   function detailBar(col, item) {
+    if (col === "candidate") {
+      return item.proposed_message
+        ? `<button class="btn primary" data-act="copy-candidate" data-id="${esc(item.message_id)}">Copy message</button>` : "";
+    }
     if (col === "dispatch") {
       const proposed = state.lastPrepared[item.message_id] || item.luxor_message || "";
       return `<button class="btn primary" data-act="dispatch" data-id="${esc(item.message_id)}">Dispatch &amp; copy</button>`
@@ -598,6 +682,9 @@
     } else if (col === "progress") {
       item = state.progress.find((e) => String(e.id) === String(id));
       if (item) { html = renderProgressDetail(item); title = item.ticket || "#" + item.id; }
+    } else if (col === "candidate") {
+      item = (state.candidates || []).find((c) => c.message_id === id);
+      if (item) { html = renderCandidateDetail(item); title = item.ticket || "WhatsApp job"; }
     } else {
       item = state.close.find((e) => String(e.id) === String(id));
       if (item) { html = renderCloseDetail(item); title = item.ticket || "#" + item.id; }
@@ -678,6 +765,10 @@
       const act = actEl.getAttribute("data-act");
       if (act === "dispatch") return doDispatch(actEl.getAttribute("data-id"));
       if (act === "copy-closing") return doCopyClosing(actEl.getAttribute("data-id"));
+      if (act === "copy-candidate") {
+        const c = (state.candidates || []).find((x) => x.message_id === actEl.getAttribute("data-id"));
+        return c && c.proposed_message ? copy(c.proposed_message, "Technician message") : null;
+      }
       if (act === "copy") {
         const box = $("msgBox");
         return box ? copy(box.textContent, "Message") : null;

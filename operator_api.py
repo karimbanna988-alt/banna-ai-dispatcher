@@ -78,6 +78,8 @@ from dispatcher import operator_stage  # noqa: E402
 from dispatcher import branding  # noqa: E402
 from dispatcher import live_feed  # noqa: E402
 from dispatcher import apprentice  # noqa: E402
+from dispatcher import dispatch_candidates  # noqa: E402
+from dispatcher import formatter  # noqa: E402
 from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.action_names import TECHNICIAN_UPDATE_TYPES  # noqa: E402
@@ -344,6 +346,27 @@ def _technician_dto(t: dict) -> dict:
         "closing_group": t["closing_group"],
         "configured": bool((t["dispatch_group"] or "").strip()) and bool((t["closing_group"] or "").strip()),
     }
+
+
+def _age_minutes_from_iso(iso: Optional[str]) -> Optional[float]:
+    """Minutes since an ISO TIMESTAMP, or None if missing/unparseable.
+
+    Deliberately a different name from _age_minutes(age_seconds) above,
+    which takes SECONDS. Reusing that name shadowed it and made
+    _new_job_dto pass a float into a string parser -- every TO DISPATCH
+    item would have come back with age_minutes=None and route_new_jobs
+    would then have compared None > 60 and 500'd the whole board.
+    None means UNKNOWN and is never treated as stale -- a job with no
+    usable timestamp must not silently vanish from the board."""
+    if not iso:
+        return None
+    try:
+        when = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 60
 
 
 def _action_result_dto(result) -> dict:
@@ -673,9 +696,11 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
             company_update_owed = _company_update_owed_dto(conn, j)
             next_action = _active_next_action_label(conn, j)
             bucket = luxor_desk_shared.active_job_bucket(j)
+            waiting_since = j.get("last_event_at") or j.get("updated_at")
             entries.append({
                 "id": j["id"],
                 "source": j["source"],
+                "age_minutes": _age_minutes_from_iso(waiting_since),
                 "ticket": j["ticket_number"],
                 "status": j["status"],
                 "technician_name": j.get("assigned_technician_name"),
@@ -697,7 +722,7 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                     latest_technician_update=j.get("latest_technician_update"),
                     company_update_owed=company_update_owed,
                 ),
-                "waiting_since": j.get("last_event_at") or j.get("updated_at"),
+                "waiting_since": waiting_since,
                 "shadow_episode": _episode_summary(episode) if episode else None,
                 "company_update_owed": company_update_owed,
                 "technician_k": technician_k,
@@ -707,7 +732,37 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                     pending_observations=pending_observations, waiting_by_technician=waiting_by_technician,
                 ),
             })
-        return {"entries": entries}
+
+        # An active job that has not moved for a day is not today's work.
+        #
+        # This is a PRESENTATION split only: nothing is deleted, no
+        # jobs.status is touched, and the stale items are returned in the
+        # same payload so the console can signpost them rather than hide
+        # them. It reuses ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES so the
+        # product has ONE definition of "still plausibly today's work"
+        # instead of a third competing threshold.
+        #
+        # Deliberately done here rather than inside
+        # rm.get_active_jobs_detailed(): that read model also backs the
+        # Streamlit Active Jobs workspace and Action Center, where an old
+        # job that has fallen behind MUST keep surfacing -- that is the
+        # whole point of those screens (see the comment on
+        # ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES). Filtering at the source
+        # would hide it everywhere, which is the opposite of what a job
+        # nobody has touched in 18 days needs.
+        #
+        # Age is measured from last activity (last_event_at/updated_at),
+        # not creation: a long-running job someone touched this morning is
+        # current work, and an untouched one is not.
+        current = [e for e in entries
+                   if e["age_minutes"] is None
+                   or e["age_minutes"] <= ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES]
+        stale = [e for e in entries if e not in current]
+        return {
+            "entries": current,
+            "stale": stale,
+            "stale_window_minutes": ACTION_CENTER_MESSAGE_LOOKBACK_MINUTES,
+        }
     finally:
         conn.close()
 
@@ -2494,6 +2549,122 @@ def route_apprentice_suggestions(handler: "Handler", match: dict, body: dict) ->
         conn.close()
 
 
+def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> dict:
+    """WhatsApp jobs, understood and routed, as TO DISPATCH candidates.
+
+    Runs entirely on already-persisted observations through the existing
+    deterministic path -- interpretation, parser, routing resolution and
+    message formatter are all reused, none reimplemented. No model call,
+    so this keeps working with Claude completely idle.
+
+    Writes nothing. A candidate is a read-model row; it never becomes a
+    `jobs` row here, and only a human acting on it can create one.
+    """
+    conn = get_conn()
+    try:
+        observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+        observations.sort(key=lambda o: o.get("received_at") or "", reverse=True)
+        all_jobs = shared.fetch_jobs(conn)
+        vehicle_rules = shared.get_vehicle_rules()
+
+        # Filter to intake groups BEFORE taking the newest N. Technician
+        # groups out-post intake groups by a wide margin, so slicing
+        # first meant the window filled with technician chatter and real
+        # job postings never made it into the candidate list at all.
+        #
+        # Only company intake groups post NEW jobs. Technician groups
+        # carry replies, and IGNORE groups (owner-classified internal
+        # chat, e.g. Trio Dispatch) are excluded from operational routing
+        # entirely.
+        intake = [o for o in observations if o.get("group_role") == "COMPANY_JOB_INTAKE"]
+
+        # DOWNSTREAM EVIDENCE: which tickets a human has ALREADY forwarded.
+        #
+        # Without this the board re-offered work that was already sent --
+        # in live traffic the dispatcher forwards an Augusta job to
+        # "Sebai Augusta Dispatch" within ~10 seconds of it landing in
+        # "Augusta - Adam", and every one of those came back as "waiting
+        # for human dispatch". Inviting a duplicate send of work already
+        # on its way is worse than showing nothing.
+        #
+        # Only OWNER-CONFIRMED technician groups count as evidence, and
+        # correlation is by exact ticket only -- never by timing.
+        dispatched_by_ticket: dict = {}
+        closings_by_ticket: dict = {}
+        for obs in observations:
+            role = obs.get("group_role")
+            if role not in ("TECH_DISPATCH", "TECH_CLOSINGS"):
+                continue
+            if not obs.get("group_mapping_confirmed"):
+                continue
+            seen = extract_job(obs.get("text") or "", vehicle_rules).ticket_number.value
+            if not seen:
+                continue
+            bucket = dispatched_by_ticket if role == "TECH_DISPATCH" else closings_by_ticket
+            bucket.setdefault(seen, []).append({
+                "group_name": obs.get("group_name"),
+                "technician": obs.get("group_technician_name"),
+                "received_at": obs.get("received_at"),
+            })
+
+        candidates = []
+        seen_tickets = set()
+        for obs in intake[:40]:
+            interp = _interpret_whatsapp_observation(conn, obs, all_jobs, vehicle_rules)
+            if not str(interp.get("interpretation") or "").startswith(
+                    ("NEW JOB DETECTED", "MESSAGE RECEIVED")):
+                continue
+
+            job = extract_job(obs.get("text") or "", vehicle_rules)
+
+            # One candidate per ticket. The same job is often posted more
+            # than once in an intake group (repost, correction, chase-up),
+            # and each repost must not become another board row.
+            ticket = job.ticket_number.value
+            if ticket:
+                if ticket in seen_tickets:
+                    continue
+                seen_tickets.add(ticket)
+
+            resolution, eligible, _market = rm.resolve_job_routing(conn, job, obs.get("text") or "")
+            proposed = formatter.format_technician_message(job)
+
+            candidates.append(dispatch_candidates.build_candidate(
+                message_id=obs["message_id"],
+                received_at=obs.get("received_at"),
+                group_name=obs.get("group_name"),
+                group_confirmed=bool(obs.get("group_mapping_confirmed")),
+                company=obs.get("group_company") or job.source.value,
+                ticket=job.ticket_number.value,
+                service=job.service_type.value,
+                city=job.city.value,
+                state=job.state.value,
+                canonical_area=resolution.canonical_area,
+                eligible=[{"name": t.get("name"), "dispatch_group": t.get("dispatch_group")} for t in eligible],
+                missing_fields=interp.get("missing_fields") or [],
+                proposed_message=proposed,
+                correlated_job_id=interp.get("existing_job_id"),
+                dispatched_to=dispatched_by_ticket.get(ticket) if ticket else None,
+                closing_seen_in=closings_by_ticket.get(ticket) if ticket else None,
+            ))
+
+        def count(status):
+            return sum(1 for c in candidates if c["status"] == status)
+
+        return {
+            "candidates": candidates,
+            "waiting_for_human_dispatch": count(dispatch_candidates.STATUS_WAITING_HUMAN),
+            "already_dispatched": count(dispatch_candidates.STATUS_ALREADY_DISPATCHED),
+            "closing_observed": count(dispatch_candidates.STATUS_CLOSING_OBSERVED),
+            "human_review_needed": count(dispatch_candidates.STATUS_HUMAN_REVIEW),
+            "mapping_required": count(dispatch_candidates.STATUS_MAPPING_REQUIRED),
+            # Restated on the envelope: nothing here is committed work.
+            "canonical_state_created": False,
+        }
+    finally:
+        conn.close()
+
+
 def route_demo_console(handler: "Handler", match: dict, body: dict) -> dict:
     """Read-only demo feed for the owner demo, shown in the Dispatch
     Console beside real work but never mixed into it.
@@ -2646,6 +2817,7 @@ ROUTES = [
     ("GET", r"^/api/live_feed$", route_live_feed, {}),
     ("GET", r"^/api/live_health$", route_live_health, {}),
     ("GET", r"^/api/apprentice_suggestions$", route_apprentice_suggestions, {}),
+    ("GET", r"^/api/whatsapp_candidates$", route_whatsapp_candidates, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
