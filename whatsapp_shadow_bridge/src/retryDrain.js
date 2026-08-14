@@ -10,6 +10,24 @@
 
 const deliveryQueue = require("./deliveryQueue");
 const dedupeStore = require("./dedupeStore");
+const { describeNonTextMessage } = require("./messageHandler");
+
+/* An observation queued BEFORE caption handling existed can carry an
+ * empty text. The adapter correctly rejects that ("observation.text is
+ * required"), so such an entry could never drain: it failed on every
+ * pass, forever, and the real capture behind it -- a genuine message
+ * from a real group -- was never persisted. Found live with 25 entries
+ * stuck in exactly this state.
+ *
+ * Applying the SAME placeholder the capture path already uses recovers
+ * the observation (group, sender, timestamp, message id are all still
+ * there) instead of discarding it. Nothing is invented: the queued
+ * record carries no media metadata, so it resolves to the generic
+ * "no text content" label rather than guessing a media type. */
+function deliverable(observation) {
+  if (observation.text) return observation;
+  return { ...observation, text: describeNonTextMessage({}) };
+}
 
 /** One drain pass. Returns { attempted, delivered } for observability/tests. */
 async function drainOnce(config, deps = {}) {
@@ -19,7 +37,7 @@ async function drainOnce(config, deps = {}) {
   let delivered = 0;
   for (const observation of queued) {
     try {
-      await postObservation(config, observation);
+      await postObservation(config, deliverable(observation));
       dedupeStore.markSeen(config.dedupeFile, observation.messageId);
       deliveryQueue.dequeue(config.retryQueueFile, observation.messageId);
       delivered += 1;

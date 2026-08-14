@@ -48,6 +48,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -74,6 +75,9 @@ import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
 from dispatcher import db_safety  # noqa: E402
 from dispatcher import operator_stage  # noqa: E402
+from dispatcher import branding  # noqa: E402
+from dispatcher import live_feed  # noqa: E402
+from dispatcher import apprentice  # noqa: E402
 from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.action_names import TECHNICIAN_UPDATE_TYPES  # noqa: E402
@@ -2277,6 +2281,219 @@ def route_whatsapp_shadow_feed(handler: "Handler", match: dict, body: dict) -> d
         conn.close()
 
 
+# Real process state, populated by run(). Never guessed: if a value was
+# not actually recorded, /api/live_health omits it rather than inventing
+# an uptime or a green light.
+_RUNTIME: dict = {"started_at": None, "adapter_thread": None, "adapter_port": None}
+
+# PRAGMA quick_check is cheap on this database but pointless to run on
+# every poll, so its result is cached briefly. The timestamp is reported
+# alongside it -- the operator sees WHEN it was verified, not just that
+# it was.
+_INTEGRITY_CACHE: dict = {"at": 0.0, "result": None}
+_INTEGRITY_TTL_SECONDS = 120
+
+
+def _retry_queue_path() -> Path:
+    """Same file the Node bridge uses (whatsapp_shadow_bridge/src/config.js).
+    Read only -- this process never writes the bridge's queue."""
+    override = os.environ.get("WHATSAPP_SHADOW_RETRY_QUEUE_FILE")
+    if override:
+        return Path(override)
+    return REPO_ROOT / ".runtime" / "whatsapp-shadow-session" / "pending-delivery.json"
+
+
+def _retry_queue_depth() -> Optional[int]:
+    """Depth of the bridge's durable delivery queue, or None if it cannot
+    be read. None means UNKNOWN and is displayed as such -- never as 0,
+    which would read as healthy."""
+    try:
+        raw = json.loads(_retry_queue_path().read_text(encoding="utf-8"))
+        return len(raw.get("queued") or [])
+    except (OSError, ValueError):
+        return None
+
+
+def _integrity_status(conn) -> dict:
+    now = time.time()
+    if _INTEGRITY_CACHE["result"] is None or now - _INTEGRITY_CACHE["at"] > _INTEGRITY_TTL_SECONDS:
+        _INTEGRITY_CACHE.update({"at": now, "result": storage.integrity_snapshot(conn)})
+    out = dict(_INTEGRITY_CACHE["result"])
+    out["checked_at"] = datetime.fromtimestamp(_INTEGRITY_CACHE["at"], tz=timezone.utc).isoformat()
+    return out
+
+
+def route_live_health(handler: "Handler", match: dict, body: dict) -> dict:
+    """The console's health bar. Every value comes from a REAL local
+    source; nothing here is decorative.
+
+    Note on WhatsApp: this process deliberately makes no outbound HTTP
+    calls (test_operator_api_makes_no_outbound_network_calls), so it does
+    NOT poll the bridge on 8514. WhatsApp health is therefore derived
+    from evidence the bridge actually delivered -- how recently a real
+    observation arrived. That is weaker than a socket check and is
+    labelled honestly as such, but it cannot lie in the dangerous
+    direction: it can never claim "receiving" without a real message.
+    """
+    conn = get_conn()
+    try:
+        total, last_at = storage.observation_totals(conn)
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today = storage.count_observations_since(conn, today_start)
+
+        seconds_since = None
+        if last_at:
+            try:
+                seconds_since = (now - datetime.fromisoformat(last_at)).total_seconds()
+            except ValueError:
+                seconds_since = None
+
+        adapter_thread = _RUNTIME.get("adapter_thread")
+        adapter_alive = bool(adapter_thread and adapter_thread.is_alive())
+
+        queue_depth = _retry_queue_depth()
+
+        uptime = None
+        if _RUNTIME.get("started_at"):
+            uptime = int(time.time() - _RUNTIME["started_at"])
+
+        return {
+            **branding.branding(),
+            "crm": {
+                # This response IS the proof -- the route ran and reached
+                # the database.
+                "up": True,
+                "detail": "serving",
+            },
+            "adapter": {
+                "up": adapter_alive,
+                "detail": (f"loopback :{_RUNTIME['adapter_port']}" if adapter_alive
+                           else "adapter thread not running in this process"),
+            },
+            "whatsapp": {
+                # Deliberately conservative thresholds; "receiving" is a
+                # claim about evidence, not about a socket.
+                "up": seconds_since is not None and seconds_since < 3600,
+                "detail": ("receiving" if seconds_since is not None and seconds_since < 3600
+                           else "no message in the last hour"),
+                "derived_from": "observation recency (no outbound polling by design)",
+            },
+            "last_observation_at": last_at,
+            "seconds_since_last_observation": seconds_since,
+            "observations_today": today,
+            "observations_total": total,
+            "queue": {
+                "depth": queue_depth,
+                "healthy": queue_depth == 0 if queue_depth is not None else None,
+                "detail": "unreadable" if queue_depth is None else ("healthy" if queue_depth == 0 else "backlog"),
+            },
+            # PASSIVE unless a deliberate analysis process actually
+            # announced itself. Capture being alive is NOT analysis, and
+            # must never imply a model is running.
+            "shadow_mode": "ACTIVE ANALYSIS" if (REPO_ROOT / ".runtime" / "active_analysis.lock").exists() else "PASSIVE",
+            "database": _integrity_status(conn),
+            "uptime_seconds": uptime,
+            "release": _release_label(),
+        }
+    finally:
+        conn.close()
+
+
+def _release_label() -> Optional[str]:
+    """Current release, read from the checkpoint file if one exists.
+    Never shells out to git from a request path."""
+    try:
+        return (REPO_ROOT / ".runtime" / "release.txt").read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def route_live_feed(handler: "Handler", match: dict, body: dict) -> dict:
+    """Operator-facing Live Operations Feed.
+
+    Reuses the EXISTING interpretation pipeline verbatim -- the same
+    observations and the same _interpret_whatsapp_observation the shadow
+    feed uses -- and only projects it into operator event lines via
+    dispatcher.live_feed. No second parser, no second state machine, and
+    no model call: this renders evidence that is already persisted, so it
+    keeps working while Claude is completely idle.
+    """
+    conn = get_conn()
+    try:
+        observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+        observations.sort(key=lambda o: o.get("received_at") or "", reverse=True)
+        observations = observations[:25]
+        all_jobs = shared.fetch_jobs(conn)
+        vehicle_rules = shared.get_vehicle_rules()
+        items = []
+        for obs in observations:
+            interp = _interpret_whatsapp_observation(conn, obs, all_jobs, vehicle_rules)
+            items.append({
+                "message_id": obs["message_id"], "time": obs.get("received_at"),
+                "group_name": obs["group_name"],
+                # Masked before it ever reaches the projection -- the feed
+                # module never sees raw customer text.
+                "text_preview": shared.mask_sensitive(obs["text"])[:120],
+                **interp,
+            })
+        return {"events": live_feed.feed_from_items(items), "observations_considered": len(items)}
+    finally:
+        conn.close()
+
+
+def route_apprentice_suggestions(handler: "Handler", match: dict, body: dict) -> dict:
+    """READ-ONLY Banna Apprentice proposals.
+
+    Pairs an owner-confirmed intake group with the owner-confirmed
+    technician dispatch group that later carried the SAME ticket --
+    exact ticket only, never timing -- and hands those pairings to
+    dispatcher.apprentice for counting.
+
+    This route cannot change anything. There is no approval endpoint, no
+    write, and no code path anywhere in this application that turns one
+    of these into a routing rule. Every payload carries "active": false.
+    """
+    conn = get_conn()
+    try:
+        vehicle_rules = shared.get_vehicle_rules()
+        intake: dict = {}
+        dispatched: dict = {}
+        for row in storage.list_confirmed_routing_observations(conn):
+            job = extract_job(row["text"] or "", vehicle_rules)
+            ticket = job.ticket_number.value
+            if not ticket:
+                continue  # no ticket -> no correlation, ever
+            day = (row["received_at"] or "")[:10] or None
+            if row["role"] == "COMPANY_JOB_INTAKE":
+                # First sighting wins: the intake that opened the ticket.
+                intake.setdefault(ticket, {
+                    "source": row["company"], "area": row["service_area"],
+                    "service": job.service_type.value, "day": day,
+                })
+            elif row["technician_name"]:
+                dispatched.setdefault(ticket, row["technician_name"])
+
+        observations = [
+            apprentice.RoutingObservation(
+                source=meta["source"], area=meta["area"], service=meta["service"],
+                destination=dispatched[ticket], ticket=ticket, day=meta["day"],
+            )
+            for ticket, meta in intake.items()
+            if ticket in dispatched and meta["source"]
+        ]
+        suggestions = apprentice.build_suggestions(observations)
+        return {
+            "suggestions": [s.as_dict() for s in suggestions],
+            "correlated_pairings": len(observations),
+            "read_only": True,
+            "note": ("Proposals only. Nothing here is active and this application has no "
+                     "path to activate one -- routing changes remain owner-approved."),
+        }
+    finally:
+        conn.close()
+
+
 def route_demo_console(handler: "Handler", match: dict, body: dict) -> dict:
     """Read-only demo feed for the owner demo, shown in the Dispatch
     Console beside real work but never mixed into it.
@@ -2426,6 +2643,9 @@ ROUTES = [
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/ignore$", route_whatsapp_ignore, {}),
     ("GET", r"^/api/whatsapp_shadow_feed$", route_whatsapp_shadow_feed, {}),
     ("GET", r"^/api/demo_console$", route_demo_console, {}),
+    ("GET", r"^/api/live_feed$", route_live_feed, {}),
+    ("GET", r"^/api/live_health$", route_live_health, {}),
+    ("GET", r"^/api/apprentice_suggestions$", route_apprentice_suggestions, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
@@ -2528,6 +2748,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
             except ApiError as exc:
                 self._send_json(exc.status, {"error": exc.message})
+            except (ConnectionResetError, BrokenPipeError):
+                # The CLIENT went away mid-response -- a phone locking,
+                # backgrounding the app or switching to WhatsApp does this
+                # routinely. It is not a server fault, and logging it as a
+                # 500 with a traceback made ordinary phone use look like
+                # the API was failing, which is exactly the wrong signal
+                # to hand an owner during recovery. Recorded as what it
+                # actually is; no response can be sent to a closed socket.
+                self.log_message('"%s %s" client disconnected before the response was sent',
+                                 method, path)
             except Exception:  # noqa: BLE001
                 # Full detail goes to the server log only -- the client
                 # response is deliberately generic. An unhandled
@@ -2617,12 +2847,19 @@ def run(port: int = 8512, start_bridge_adapter: bool = True) -> None:
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Operator API (connected) serving on http://localhost:{port}  (static: {STATIC_DIR})")
 
+    _RUNTIME["started_at"] = time.time()
+
     bridge_server = None
     if start_bridge_adapter:
         whatsapp_bridge_adapter._get_or_create_adapter_secret(_env_file_path())
         bridge_server = whatsapp_bridge_adapter.run_bridge_adapter()
         bridge_thread = threading.Thread(target=bridge_server.serve_forever, daemon=True)
         bridge_thread.start()
+        # Recorded so /api/live_health can report the adapter's REAL
+        # liveness (is the thread actually alive?) instead of painting a
+        # decorative green dot.
+        _RUNTIME["adapter_thread"] = bridge_thread
+        _RUNTIME["adapter_port"] = bridge_server.server_address[1]
         print(
             f"WhatsApp Shadow Bridge adapter listening on http://127.0.0.1:{bridge_server.server_address[1]} "
             "(loopback only -- never reachable through the public tunnel)."

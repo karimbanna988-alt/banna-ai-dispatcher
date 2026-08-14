@@ -1,6 +1,6 @@
 {
-  "name": "LUXOR Dispatch",
-  "short_name": "LUXOR",
+  "name": "Banna Dispatch",
+  "short_name": "Banna",
   "description": "Phone-first dispatch copilot. Reads the operational channels, recommends the next action, prepares the message. The human sends it.",
   "start_url": "/index.html",
   "scope": "/",
@@ -9,8 +9,23 @@
   "background_color": "#0B0E14",
   "theme_color": "#0B0E14",
   "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ]
 }

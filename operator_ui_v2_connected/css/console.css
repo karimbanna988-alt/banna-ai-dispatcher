@@ -397,3 +397,107 @@ h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-t
   margin-top: 5px; background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
   padding: 6px; font-family: var(--mono); font-size: 11px; white-space: pre-wrap;
 }
+
+/* ------------------------------------------------------- branding -- */
+/* Product name and tenant. The tenant is data, not a fork -- see
+   src/dispatcher/branding.py. */
+/* Selectors are deliberately `.brand .x`: the older `.brand span` rule
+   above is (0,1,1) and would otherwise out-rank a bare `.brand-tenant`
+   (0,1,0) and paint the tenant name accent-cyan. */
+.brand { display: flex; flex-direction: column; line-height: 1.15; }
+.brand .brand-product { font-size: 14px; font-weight: 700; letter-spacing: .12em; white-space: nowrap; }
+.brand .brand-product span { color: var(--accent); margin-left: 5px; }
+.brand .brand-tenant {
+  font-size: 10px; color: var(--dim); letter-spacing: .04em;
+  white-space: nowrap; margin-left: 0; font-weight: 400;
+}
+
+/* ------------------------------------------------------ healthbar -- */
+/* Real operational state. Every number here is sourced from a live
+   local check -- see route_live_health. */
+.healthbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+  padding: 6px 14px; background: var(--panel-2); border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+.hb-stats { display: flex; gap: 16px; align-items: center; }
+.hb-stat { display: flex; flex-direction: column; line-height: 1.2; white-space: nowrap; }
+.hb-stat b { font-size: 12px; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.hb-stat i { font-size: 9px; font-style: normal; color: var(--dim); text-transform: uppercase; letter-spacing: .07em; }
+.hb-stat b.warnv { color: var(--warn); }
+.hb-stat b.badv { color: var(--danger); }
+.hb-toggle {
+  margin-left: auto; min-height: 30px; padding: 5px 12px; white-space: nowrap;
+  background: var(--panel-3); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .07em; font-weight: 600;
+}
+.hb-toggle.on { color: var(--accent); border-color: var(--accent-dim); }
+
+/* ------------------------------------------------ live operations -- */
+.liveops {
+  flex: 0 0 auto; max-height: 34vh; overflow-y: auto;
+  background: var(--bg); border-bottom: 1px solid var(--line);
+}
+.lo-head {
+  position: sticky; top: 0; display: flex; align-items: center; gap: 10px;
+  padding: 7px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.lo-title { font-size: 10px; font-weight: 700; letter-spacing: .12em; color: var(--muted); }
+.lo-note { margin-left: auto; font-size: 10px; color: var(--dim); }
+.lo-ev {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  padding: 5px 14px; border-bottom: 1px solid rgba(31,41,55,.5); font-size: 12px;
+}
+.lo-t { font-family: var(--mono); font-size: 11px; color: var(--dim); min-width: 68px; }
+.lo-type {
+  font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); background: var(--panel-3); padding: 2px 6px; border-radius: 3px;
+  min-width: 74px; text-align: center;
+}
+.lo-title { color: var(--text); }
+.lo-conf { font-size: 9px; letter-spacing: .06em; color: var(--dim); }
+.lo-why { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 10px; margin: 2px 0 0 76px; }
+.lo-why span { font-size: 11px; color: var(--muted); }
+/* Event-type accents: what needs a human must be findable at a glance. */
+.lo-human-review .lo-type { background: rgba(251,191,36,.16); color: var(--warn); }
+.lo-decision .lo-type,
+.lo-routing .lo-type { background: rgba(0,212,255,.14); color: var(--accent); }
+.lo-closing .lo-type { background: rgba(52,211,153,.14); color: var(--ok); }
+.lo-error .lo-type { background: rgba(248,113,113,.16); color: var(--danger); }
+
+@media (max-width: 768px) {
+  .healthbar { padding: 7px 12px; gap: 10px; }
+  .hb-stats { gap: 13px; }
+  .hb-toggle { min-height: 36px; }
+  .liveops { max-height: 44vh; }
+  .lo-why { margin-left: 0; }
+  .lo-ev { padding: 7px 12px; }
+}
+/* An event can be both a real closing AND something needing a human --
+   the type says what happened, this says whether it needs the operator. */
+.lo-needs {
+  font-size: 9px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--warn); background: rgba(251,191,36,.14); padding: 2px 6px; border-radius: 3px;
+}
+
+/* -------------------------------------------------- apprentice UI -- */
+/* Proposals, not rules. Nothing in this panel can be activated -- there
+   is deliberately no approve control. */
+.ap-card {
+  border-bottom: 1px solid rgba(31,41,55,.5); padding: 10px 14px;
+  border-left: 3px solid var(--dim);
+}
+.ap-card.ap-high { border-left-color: var(--ok); }
+.ap-card.ap-medium { border-left-color: var(--accent-dim); }
+.ap-card.ap-low { border-left-color: var(--warn); }
+.ap-top { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.ap-status {
+  font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); background: var(--panel-3); padding: 2px 7px; border-radius: 3px;
+}
+.ap-conf { margin-left: auto; font-size: 10px; letter-spacing: .07em; color: var(--dim); }
+.ap-rule { font-size: 13px; color: var(--muted); }
+.ap-rule b { color: var(--text); }
+.ap-ev { font-size: 11px; color: var(--dim); margin-top: 3px; font-variant-numeric: tabular-nums; }
+.ap-note { font-size: 11px; color: var(--muted); margin-top: 4px; }

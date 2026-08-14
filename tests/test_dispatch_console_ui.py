@@ -29,7 +29,10 @@ def console_js():
 def test_console_is_the_primary_page_served_at_root(index_html):
     """Opening http://localhost:8512 must land on the dispatch console,
     not the back-office CRM."""
-    assert "LUXOR Dispatch" in index_html
+    # Product is Banna Dispatch; Luxor Locksmith is the tenant. Only the
+    # visible UI was rebranded -- no LUXOR_* env var, fixture or business
+    # record was renamed (see src/dispatcher/branding.py).
+    assert "Banna Dispatch" in index_html
     assert 'id="colDispatch"' in index_html
     assert 'id="colProgress"' in index_html
     assert 'id="colClose"' in index_html

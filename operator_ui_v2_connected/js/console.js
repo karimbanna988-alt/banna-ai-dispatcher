@@ -44,6 +44,9 @@
     failures: 0,          // consecutive failed polls
     offline: false,
     lastGood: null,       // Date of the last successful load
+    liveOpen: false,      // Live Operations panel visibility
+    apprenticeOpen: false,// Apprentice review panel visibility
+    health: null,         // last /api/live_health payload
   };
 
   const $ = (id) => document.getElementById(id);
@@ -180,13 +183,143 @@
     } catch (e) { /* demo is optional -- never break the real board */ }
   }
 
+  // Real health, from /api/live_health. Every value here comes from a
+  // real local source -- the adapter THREAD's liveness, the bridge's own
+  // durable queue file, observation recency in the database. Nothing is
+  // painted green because it looks better that way.
   async function health() {
     try {
-      const s = await Api.getWhatsappBridgeStatus();
-      $("dotWa").className = "dot " + (s && s.paired ? "up" : "down");
-      $("dotAdapter").className = "dot " + (s ? "up" : "down");
-    } catch (e) { $("dotWa").className = "dot down"; }
-    $("dotCrm").className = "dot " + (state.offline ? "down" : "up");
+      const h = await Api.getLiveHealth();
+      state.health = h;
+
+      if (h.product_name) {
+        const parts = String(h.product_name).split(" ");
+        $("brandProduct").innerHTML = parts.length > 1
+          ? esc(parts[0]) + "<span>" + esc(parts.slice(1).join(" ")) + "</span>"
+          : esc(h.product_name);
+      }
+      if (h.tenant_name) $("brandTenant").textContent = h.tenant_name;
+
+      $("dotCrm").className = "dot " + (h.crm && h.crm.up ? "up" : "down");
+      $("dotAdapter").className = "dot " + (h.adapter && h.adapter.up ? "up" : "down");
+      $("dotWa").className = "dot " + (h.whatsapp && h.whatsapp.up ? "up" : "down");
+      $("health").title =
+        `CRM: ${(h.crm || {}).detail || "?"}
+` +
+        `Adapter: ${(h.adapter || {}).detail || "?"}
+` +
+        `WhatsApp: ${(h.whatsapp || {}).detail || "?"} (${(h.whatsapp || {}).derived_from || ""})
+` +
+        `Database: ${(h.database || {}).integrity || "?"}, ` +
+        `${(h.database || {}).foreign_key_violations} FK violations`;
+
+      $("hbLast").textContent = h.seconds_since_last_observation == null
+        ? "never" : relative(h.seconds_since_last_observation);
+      $("hbToday").textContent = h.observations_today != null ? h.observations_today : "--";
+
+      const q = h.queue || {};
+      // An unreadable queue is UNKNOWN, never "healthy" -- a false green
+      // here would hide exactly the backlog it exists to reveal.
+      $("hbQueue").textContent = q.depth == null ? "unknown" : (q.depth === 0 ? "healthy" : q.depth);
+      $("hbQueue").className = q.depth == null ? "warnv" : (q.depth === 0 ? "" : "badv");
+
+      $("hbShadow").textContent = h.shadow_mode || "--";
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("dotCrm").className = "dot down";
+      $("hbShadow").textContent = "unknown";
+    }
+  }
+
+  function relative(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    if (s < 60) return s + " sec ago";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " hr ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+
+  /* ------------------------------------------------ live operations -- */
+
+  // Renders the operator event stream projected by the server from
+  // ALREADY-PERSISTED observations. No parsing happens here, and no
+  // model is involved -- this keeps updating while Claude is idle.
+  async function loadLive() {
+    if (!state.liveOpen) return;
+    try {
+      const r = await Api.getLiveFeed();
+      const events = (r && r.events) || [];
+      $("loBody").innerHTML = events.length ? events.map((ev) => `
+        <div class="lo-ev lo-${esc((ev.type || "").toLowerCase().replace(/\s+/g, "-"))}">
+          <span class="lo-t">${esc(clockOf(ev.time))}</span>
+          <span class="lo-type">${esc(ev.type)}</span>
+          <span class="lo-title">${esc(ev.title)}</span>
+          ${ev.confidence ? `<span class="lo-conf">${esc(ev.confidence)}</span>` : ""}
+          ${ev.needs_human ? `<span class="lo-needs">needs you</span>` : ""}
+          ${(ev.why || []).length ? `<div class="lo-why">${
+            ev.why.map((w) => `<span>${esc(w)}</span>`).join("")}</div>` : ""}
+        </div>`).join("")
+        : `<div class="empty">No recent operational events.</div>`;
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("loBody").innerHTML = `<div class="empty">Live feed unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
+  function clockOf(iso) {
+    if (!iso) return "";
+    const t = new Date(iso);
+    return isNaN(t.getTime()) ? "" : t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  // Apprentice review. READ-ONLY by construction: there is no approve
+  // control here and no endpoint to call if there were. Every card
+  // states its evidence and its status so the owner judges the pattern,
+  // not a verdict.
+  async function loadApprentice() {
+    if (!state.apprenticeOpen) return;
+    try {
+      const r = await Api.getApprenticeSuggestions();
+      const list = (r && r.suggestions) || [];
+      $("apBody").innerHTML = list.length ? list.map((s) => `
+        <div class="ap-card ap-${esc(String(s.confidence || "").toLowerCase())}">
+          <div class="ap-top">
+            <span class="ap-status">${esc(s.status)}</span>
+            <span class="ap-conf">${esc(s.confidence)}</span>
+          </div>
+          <div class="ap-rule">
+            ${esc(s.source || "?")} &middot; ${esc(s.area || "any area")} &middot;
+            ${esc(s.service || "any service")} &rarr; <b>${esc(s.destination)}</b>
+          </div>
+          <div class="ap-ev">
+            ${esc(s.evidence.distinct_tickets)} tickets &middot;
+            ${esc(s.evidence.distinct_days)} days &middot;
+            ${esc(s.conflicts)} conflicts
+          </div>
+          ${(s.notes || []).map((n) => `<div class="ap-note">${esc(n)}</div>`).join("")}
+        </div>`).join("")
+        : `<div class="empty">No pattern has enough evidence yet. That is the correct
+             result for thin evidence &mdash; one example never makes a rule.</div>`;
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("apBody").innerHTML = `<div class="empty">Apprentice unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
+  function toggleApprentice() {
+    state.apprenticeOpen = !state.apprenticeOpen;
+    $("apprentice").hidden = !state.apprenticeOpen;
+    $("apprenticeToggle").setAttribute("aria-expanded", String(state.apprenticeOpen));
+    $("apprenticeToggle").classList.toggle("on", state.apprenticeOpen);
+    if (state.apprenticeOpen) loadApprentice();
+  }
+
+  function toggleLive() {
+    state.liveOpen = !state.liveOpen;
+    $("liveops").hidden = !state.liveOpen;
+    $("liveToggle").setAttribute("aria-expanded", String(state.liveOpen));
+    $("liveToggle").classList.toggle("on", state.liveOpen);
+    if (state.liveOpen) loadLive();
   }
 
   /* ---------------------------------------------------- rendering -- */
@@ -626,6 +759,7 @@
     load(); health();
     setInterval(load, POLL_MS);
     setInterval(health, 15000);
+    setInterval(loadLive, POLL_MS);
   }
 
   async function doLogin() {
@@ -656,6 +790,8 @@
   $("detailClose").addEventListener("click", closeDetail);
   $("adminBtn").addEventListener("click", () => { window.location.href = "admin.html"; });
   $("searchInput").addEventListener("input", onSearch);
+  $("liveToggle").addEventListener("click", toggleLive);
+  $("apprenticeToggle").addEventListener("click", toggleApprentice);
   document.querySelectorAll("[data-jump]").forEach((b) =>
     b.addEventListener("click", () => setStage(b.getAttribute("data-jump"))));
 

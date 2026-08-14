@@ -154,6 +154,9 @@ const Api = {
   },
   getWhatsappShadowFeed() { return this._call("GET", "/api/whatsapp_shadow_feed"); },
   getDemoConsole() { return this._call("GET", "/api/demo_console"); },
+  getLiveFeed() { return this._call("GET", "/api/live_feed"); },
+  getLiveHealth() { return this._call("GET", "/api/live_health"); },
+  getApprenticeSuggestions() { return this._call("GET", "/api/apprentice_suggestions"); },
   promoteWhatsappToJob(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});
   },

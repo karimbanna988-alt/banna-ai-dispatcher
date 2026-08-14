@@ -58,3 +58,50 @@ test("one failing and one succeeding observation are handled independently", asy
   assert.equal(dedupeStore.isSeen(config.dedupeFile, "bad"), false);
   assert.deepEqual(deliveryQueue.load(config.retryQueueFile), [{ messageId: "bad", text: "fails" }]);
 });
+
+// --------------------------------------------------- poison entries ----
+// Found live: 25 observations stuck in the real retry queue, every pass
+// failing with "observation.text is required", none of them ever
+// persisted. They were captured before caption handling existed, so
+// their text was empty and no number of retries could ever fix that.
+
+test("an observation queued with empty text is delivered with the standard placeholder, not stuck forever", async () => {
+  const config = fakeConfig();
+  deliveryQueue.enqueue(config.retryQueueFile, {
+    messageId: "m-empty", groupId: "g@g.us", groupName: "Some Dispatch",
+    sender: "s@lid", timestamp: 1786396082, text: "",
+  });
+
+  const posted = [];
+  const result = await drainOnce(config, {
+    postObservation: async (_c, obs) => { posted.push(obs); },
+  });
+
+  assert.equal(result.delivered, 1, "the entry must drain, not fail forever");
+  assert.equal(posted.length, 1);
+  assert.ok(posted[0].text, "empty text must be replaced before delivery");
+  assert.match(posted[0].text, /no text content/);
+  // The real capture is preserved -- this recovers a message, it does
+  // not fabricate one.
+  assert.equal(posted[0].messageId, "m-empty");
+  assert.equal(posted[0].groupId, "g@g.us");
+  assert.equal(posted[0].groupName, "Some Dispatch");
+  assert.equal(posted[0].timestamp, 1786396082);
+  assert.deepEqual(deliveryQueue.load(config.retryQueueFile), []);
+});
+
+test("no media type is invented for a queued observation that carries no media metadata", async () => {
+  const config = fakeConfig();
+  deliveryQueue.enqueue(config.retryQueueFile, { messageId: "m2", text: "" });
+  const posted = [];
+  await drainOnce(config, { postObservation: async (_c, obs) => { posted.push(obs); } });
+  assert.doesNotMatch(posted[0].text, /type:/, "must not guess a media type it never saw");
+});
+
+test("an observation that already has text is passed through unchanged", async () => {
+  const config = fakeConfig();
+  deliveryQueue.enqueue(config.retryQueueFile, { messageId: "m3", text: "20 min" });
+  const posted = [];
+  await drainOnce(config, { postObservation: async (_c, obs) => { posted.push(obs); } });
+  assert.equal(posted[0].text, "20 min");
+});

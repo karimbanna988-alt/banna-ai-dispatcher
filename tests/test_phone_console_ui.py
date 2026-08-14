@@ -191,7 +191,7 @@ def test_the_last_technician_update_renders_as_text_not_an_object(js):
 # ---------------------------------------------------------- the PWA ---
 def test_the_manifest_is_a_standalone_phone_app():
     m = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert m["name"] == "LUXOR Dispatch"
+    assert m["name"] == "Banna Dispatch"
     assert m["short_name"]
     assert m["display"] == "standalone"
     assert m["start_url"]
@@ -267,7 +267,7 @@ def test_the_shell_cache_version_matches_the_asset_version(sw, index_html):
     """Bumping ?v= without bumping the cache leaves the worker serving
     the previous build forever."""
     asset_v = re.search(r"console\.js\?v=(\d+)", index_html).group(1)
-    cache_v = re.search(r'SHELL_VERSION = "luxor-shell-v(\d+)"', sw).group(1)
+    cache_v = re.search(r'SHELL_VERSION = "[a-z]+-shell-v(\d+)"', sw).group(1)
     assert asset_v == cache_v
     assert f"console.js?v={asset_v}" in sw
 

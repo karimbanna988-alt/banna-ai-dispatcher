@@ -159,4 +159,4 @@ async function handleOutgoingMessage(message, deps) {
   return { audited: true, reason: "ok" };
 }
 
-module.exports = { handleIncomingMessage, handleOutgoingMessage };
+module.exports = { handleIncomingMessage, handleOutgoingMessage, describeNonTextMessage };

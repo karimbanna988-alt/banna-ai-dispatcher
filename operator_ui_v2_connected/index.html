@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>LUXOR Dispatch</title>
+<title>Banna Dispatch</title>
 
 <!-- Phone/PWA. Installable only over HTTPS (or localhost); over plain
      LAN http these are inert but harmless -- see docs/PHONE_DISPATCH_PILOT.md -->
@@ -13,18 +13,18 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="LUXOR">
+<meta name="apple-mobile-web-app-title" content="Banna">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=2">
+<link rel="stylesheet" href="css/console.css?v=3">
 </head>
 <body>
 
 <div id="loginScreen" class="login">
   <div class="login-card">
-    <div class="login-brand">LUXOR<span>DISPATCH</span></div>
-    <div class="login-sub">Operator console</div>
+    <div class="login-brand">BANNA<span>DISPATCH</span></div>
+    <div class="login-sub" id="loginTenant">Luxor Locksmith</div>
     <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password">
     <button id="loginBtn">Sign in</button>
     <div class="login-error" id="loginError"></div>
@@ -34,7 +34,10 @@
 <div id="app" class="app" hidden>
 
   <header class="topbar">
-    <div class="brand">LUXOR<span>DISPATCH</span></div>
+    <div class="brand">
+      <span class="brand-product" id="brandProduct">BANNA<span>DISPATCH</span></span>
+      <span class="brand-tenant" id="brandTenant">Luxor Locksmith</span>
+    </div>
 
     <div class="counts">
       <button class="count" data-jump="dispatch">
@@ -77,6 +80,34 @@
       <span class="stage-l">To close</span><span class="stage-n" id="stClose">0</span>
     </button>
   </nav>
+
+  <!-- Real health, from real sources. Never decorative. -->
+  <section class="healthbar" id="healthbar">
+    <div class="hb-stats">
+      <span class="hb-stat"><b id="hbLast">--</b><i>last message</i></span>
+      <span class="hb-stat"><b id="hbToday">0</b><i>observations today</i></span>
+      <span class="hb-stat"><b id="hbQueue">--</b><i>queue</i></span>
+      <span class="hb-stat"><b id="hbShadow">--</b><i>shadow</i></span>
+    </div>
+    <button class="hb-toggle" id="liveToggle" aria-expanded="false">Live operations</button>
+    <button class="hb-toggle" id="apprenticeToggle" aria-expanded="false">Apprentice</button>
+  </section>
+
+  <section class="liveops" id="liveops" hidden>
+    <div class="lo-head">
+      <span class="lo-title">LIVE OPERATIONS</span>
+      <span class="lo-note" id="loNote">passive capture &middot; no model required</span>
+    </div>
+    <div class="lo-body" id="loBody"></div>
+  </section>
+
+  <section class="liveops" id="apprentice" hidden>
+    <div class="lo-head">
+      <span class="lo-title">APPRENTICE &mdash; PLAYBOOK SUGGESTIONS</span>
+      <span class="lo-note">read-only &middot; nothing here is active</span>
+    </div>
+    <div class="lo-body" id="apBody"></div>
+  </section>
 
   <div id="searchResults" class="search-results" hidden></div>
 
@@ -128,7 +159,7 @@
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=2"></script>
-<script src="js/console.js?v=2"></script>
+<script src="js/api.js?v=3"></script>
+<script src="js/console.js?v=3"></script>
 </body>
 </html>

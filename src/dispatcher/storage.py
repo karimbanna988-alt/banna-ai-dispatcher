@@ -3440,3 +3440,69 @@ def list_shadow_episodes_for_export(conn: sqlite3.Connection) -> List[dict]:
     cur = conn.execute("SELECT * FROM shadow_episodes WHERE eligible_for_export = 1 ORDER BY created_at ASC")
     columns = [d[0] for d in cur.description]
     return [_shadow_episode_row_to_dict(columns, row) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------
+# Live Operations / health read models.
+#
+# These exist here rather than in operator_api.py because that module
+# deliberately owns NO SQL -- every persisted fact goes through
+# storage.py, which structurally rules out a hidden write path in the
+# HTTP layer (see test_operator_api_module_owns_no_sql). All of the
+# following are strictly read-only.
+# ---------------------------------------------------------------------
+
+def observation_totals(conn: sqlite3.Connection) -> tuple:
+    """(total observations, most recent received_at) -- backs the health
+    bar's "last message" and total counters."""
+    row = conn.execute(
+        "SELECT COUNT(*), MAX(received_at) FROM whatsapp_pending_observations"
+    ).fetchone()
+    return (row[0], row[1]) if row else (0, None)
+
+
+def count_observations_since(conn: sqlite3.Connection, since_iso: str) -> int:
+    """Observations received at or after an ISO timestamp -- backs
+    "observations today"."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM whatsapp_pending_observations WHERE received_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def integrity_snapshot(conn: sqlite3.Connection) -> dict:
+    """PRAGMA quick_check + foreign_key_check, surfaced to the operator.
+
+    Returns the failure text rather than raising: a health bar that goes
+    blank when the database is unhappy is worse than one that says so.
+    """
+    try:
+        result = conn.execute("PRAGMA quick_check").fetchone()[0]
+        violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+        return {"integrity": result, "foreign_key_violations": violations}
+    except sqlite3.Error as exc:
+        return {"integrity": f"check failed: {exc}", "foreign_key_violations": None}
+
+
+# Owner-confirmed intake and dispatch groups only. Unconfirmed groups are
+# excluded at the source: an unmapped group must never contribute
+# evidence toward a routing suggestion.
+_CONFIRMED_ROUTING_SQL = """
+    SELECT o.text, o.received_at,
+           r.role, r.company, r.service_area,
+           t.name AS technician_name
+    FROM whatsapp_pending_observations o
+    JOIN whatsapp_group_registry r ON r.group_id = o.group_id
+    LEFT JOIN technicians t ON t.id = r.technician_id
+    WHERE r.confirmed_by_owner = 1
+      AND r.role IN ('COMPANY_JOB_INTAKE', 'TECH_DISPATCH')
+"""
+
+
+def list_confirmed_routing_observations(conn: sqlite3.Connection) -> List[dict]:
+    """Raw material for the read-only Apprentice evidence aggregation.
+    Read-only, and confirmed groups only."""
+    cur = conn.execute(_CONFIRMED_ROUTING_SQL)
+    columns = [d[0] for d in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
