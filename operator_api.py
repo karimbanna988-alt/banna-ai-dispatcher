@@ -73,6 +73,7 @@ import luxor_ops_shared as shared  # noqa: E402
 import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
 from dispatcher import db_safety  # noqa: E402
+from dispatcher import operator_stage  # noqa: E402
 from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
 from dispatcher.action_names import TECHNICIAN_UPDATE_TYPES  # noqa: E402
@@ -666,6 +667,8 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
             # recompute the same two DTOs a second time internally.
             technician_k = _technician_k_dto(conn, j, jobs, pending_observations, waiting_by_technician)
             company_update_owed = _company_update_owed_dto(conn, j)
+            next_action = _active_next_action_label(conn, j)
+            bucket = luxor_desk_shared.active_job_bucket(j)
             entries.append({
                 "id": j["id"],
                 "source": j["source"],
@@ -676,8 +679,20 @@ def route_active(handler: "Handler", match: dict, body: dict) -> dict:
                 "city": j.get("service_area"),
                 "description": j.get("description"),
                 "latest_technician_update": j.get("latest_technician_update"),
-                "next_action": _active_next_action_label(conn, j),
-                "bucket": luxor_desk_shared.active_job_bucket(j),
+                "next_action": next_action,
+                "bucket": bucket,
+                # Presentation-only projection for the phone console: the
+                # words above a card ("ETA 20 min", "Customer no answer").
+                # Derived from the SAME message_patterns the dispatcher
+                # brain uses, so the phone can never disagree with it --
+                # see dispatcher/operator_stage.py. Changes no status.
+                "operator_state": operator_stage.waiting_state(
+                    status=j["status"],
+                    bucket=bucket,
+                    next_action=next_action,
+                    latest_technician_update=j.get("latest_technician_update"),
+                    company_update_owed=company_update_owed,
+                ),
                 "waiting_since": j.get("last_event_at") or j.get("updated_at"),
                 "shadow_episode": _episode_summary(episode) if episode else None,
                 "company_update_owed": company_update_owed,
@@ -2591,6 +2606,10 @@ def _guess_content_type(path: Path) -> str:
         ".json": "application/json",
         ".png": "image/png",
         ".svg": "image/svg+xml",
+        # Chrome ignores a manifest served as octet-stream, which makes
+        # the PWA silently non-installable with no console error.
+        ".webmanifest": "application/manifest+json",
+        ".ico": "image/x-icon",
     }.get(path.suffix, "application/octet-stream")
 
 

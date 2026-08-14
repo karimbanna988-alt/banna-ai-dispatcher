@@ -243,15 +243,127 @@ h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-t
   padding: 9px 16px; border-radius: var(--radius); font-size: 12px; z-index: 80;
 }
 
+/* ------------------------------------------------- connectivity bar -- */
+/* Truthfulness rule: cached pixels must never read as live work. When
+   the board cannot reach the API this bar is the loudest thing on the
+   screen and the stale board behind it is dimmed. */
+.offline-bar {
+  flex: 0 0 auto; padding: 7px 14px;
+  background: rgba(248,113,113,.14); border-bottom: 1px solid var(--danger);
+  color: var(--danger); font-size: 12px; letter-spacing: .04em;
+}
+.offline-bar b { letter-spacing: .12em; }
+.board.stale { opacity: .45; filter: grayscale(.4); }
+
+/* ------------------------------------------------- stage switcher --- */
+/* Phone only. Desktop shows all three columns, so a stage filter there
+   would just hide work the operator can already see. */
+.stages { display: none; }
+.stage {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 2px; min-height: 52px; padding: 6px 4px;
+  background: var(--panel); color: var(--muted);
+  border: 0; border-bottom: 2px solid transparent;
+}
+.stage-l { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.stage-n { font-size: 17px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+.stage.on { color: var(--accent); border-bottom-color: var(--accent); background: var(--panel-2); }
+.stage.on .stage-n { color: var(--accent); }
+
+/* -------------------------------------------- recommendation block -- */
+.rec {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 7px; padding: 7px 9px;
+  background: var(--panel-3); border-radius: 6px;
+}
+.rec-l { font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+.rec-v { font-size: 14px; font-weight: 700; color: var(--text); }
+.rec.none .rec-v { color: var(--warn); }
+
+/* ------------------------------------------ detail sticky action bar -- */
+.detail-bar {
+  flex: 0 0 auto; display: flex; gap: 8px; padding: 10px 14px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  background: var(--panel-2); border-top: 1px solid var(--line);
+}
+.detail-bar .btn { min-height: 44px; font-size: 14px; }
+
 /* ------------------------------------------------------ responsive -- */
-@media (max-width: 1000px) {
-  .board { grid-template-columns: 1fr; overflow-y: auto; }
-  .col { min-height: 240px; }
+/* Tablet / narrow desktop: still all three columns, just tighter. */
+@media (max-width: 1000px) and (min-width: 769px) {
   .counts .count-l { display: none; }
   .search { width: 140px; }
   .search:focus { width: 180px; }
   .detail { width: 100%; top: 46px; }
   .hint { display: none; }
+}
+
+/* ---------------------------------------------------------- phone -- */
+/* A deliberate mobile workflow, NOT three desktop columns stacked. One
+   stage owns the viewport; the switcher above it is one tap; every
+   control is thumb-sized; nothing depends on hover. */
+@media (max-width: 768px) {
+  html, body { font-size: 14px; overflow-x: hidden; }
+
+  /* The very first thing the owner touches. Desktop sizing left both the
+     field and the button at ~41px, under the platform floor. */
+  .login-card { width: 100%; max-width: 340px; padding: 28px 22px; }
+  .login-card input, .login-card button { min-height: 48px; font-size: 16px; }
+
+  .app {
+    height: 100vh; height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .topbar { height: 50px; flex: 0 0 50px; gap: 10px; padding: 0 12px; }
+  .brand { font-size: 13px; }
+  /* The topbar keeps only identity + connection state. Counts move into
+     the stage switcher, where they are also the navigation. */
+  .counts { display: none; }
+  .search { display: none; }
+  .topbar-right { gap: 8px; }
+  .dot { width: 8px; height: 8px; }
+
+  .stages { display: grid; grid-template-columns: repeat(3, 1fr); flex: 0 0 auto; border-bottom: 1px solid var(--line); }
+
+  /* One stage fills the screen. The others are not rendered, so the
+     board can never scroll sideways or stack into a long dead column. */
+  .board { grid-template-columns: 1fr; gap: 0; }
+  .col { display: none; }
+  .board[data-stage="dispatch"] #colDispatch,
+  .board[data-stage="progress"] #colProgress,
+  .board[data-stage="close"]    #colClose { display: flex; }
+  .col-head { display: none; }          /* the switcher already labels it */
+  .col-body { padding: 10px; gap: 9px; padding-bottom: 24px; }
+
+  .card { padding: 12px 14px; border-left-width: 4px; }
+  .card:hover { background: var(--panel); border-color: var(--line); }  /* no hover-only affordance */
+  .card.sel { border-color: var(--accent); background: var(--panel-2); }
+  .ticket { font-size: 16px; }
+  .card-line { font-size: 13px; }
+  .waiting { font-size: 11px; padding: 4px 9px; margin-top: 8px; }
+  .card-actions { margin-top: 10px; }
+  .btn { min-height: 46px; font-size: 14px; border-radius: 8px; }
+
+  /* Detail is a full-screen sheet with its own bottom action bar. */
+  .detail { top: 0; bottom: 0; left: 0; right: 0; width: 100%; max-width: 100%; border-left: 0; }
+  .detail-head { padding: calc(12px + env(safe-area-inset-top)) 14px 12px; }
+  .detail-title { font-size: 16px; }
+  .icon-btn { font-size: 30px; min-width: 44px; min-height: 44px; }
+  .detail-body { padding: 14px 14px 4px; }
+  .kv { font-size: 13px; padding: 4px 0; }
+  .kv .k { min-width: 88px; }
+  .msgbox { font-size: 13px; max-height: 40vh; }
+
+  .statusbar { flex: 0 0 auto; min-height: 44px; padding: 0 12px calc(0px + env(safe-area-inset-bottom)); }
+  .hint { display: none; }
+  .updated { display: none; }
+  .admin-btn { min-height: 44px; padding-right: 10px; }   /* thumb-sized: it navigates away */
+
+  .search-results { width: 100%; max-width: 100%; left: 0; transform: none; }
+  .toast { bottom: calc(56px + env(safe-area-inset-bottom)); width: 88%; text-align: center; }
+  .demo-strip { max-height: 34vh; }
+  .demo-step { flex: 1 1 100%; }
 }
 
 /* ------------------------------------------------------------ demo -- */

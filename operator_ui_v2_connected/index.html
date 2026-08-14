@@ -4,7 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>LUXOR Dispatch</title>
-<link rel="stylesheet" href="css/console.css">
+
+<!-- Phone/PWA. Installable only over HTTPS (or localhost); over plain
+     LAN http these are inert but harmless -- see docs/PHONE_DISPATCH_PILOT.md -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0B0E14">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LUXOR">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+
+<link rel="stylesheet" href="css/console.css?v=2">
 </head>
 <body>
 
@@ -45,6 +58,26 @@
     </div>
   </header>
 
+  <!-- Connectivity truth. Never let cached pixels read as live work. -->
+  <div id="offlineBar" class="offline-bar" hidden>
+    <b>OFFLINE</b> <span id="offlineDetail">not live &middot; showing last known state</span>
+  </div>
+
+  <!-- Phone stage switcher. One tap per stage; only one stage occupies
+       the phone viewport at a time. Hidden on desktop, where all three
+       columns are visible at once. -->
+  <nav class="stages" id="stages">
+    <button class="stage on" data-stage="dispatch">
+      <span class="stage-l">To dispatch</span><span class="stage-n" id="stDispatch">0</span>
+    </button>
+    <button class="stage" data-stage="progress">
+      <span class="stage-l">In progress</span><span class="stage-n" id="stProgress">0</span>
+    </button>
+    <button class="stage" data-stage="close">
+      <span class="stage-l">To close</span><span class="stage-n" id="stClose">0</span>
+    </button>
+  </nav>
+
   <div id="searchResults" class="search-results" hidden></div>
 
   <section class="demo-strip" id="demoStrip" hidden>
@@ -56,18 +89,18 @@
     <div class="demo-steps" id="demoSteps"></div>
   </section>
 
-  <main class="board">
-    <section class="col" id="colDispatch">
+  <main class="board" id="board" data-stage="dispatch">
+    <section class="col" id="colDispatch" data-col="dispatch">
       <div class="col-head"><h2>To dispatch</h2><span class="col-count" id="hdDispatch">0</span></div>
       <div class="col-body" id="listDispatch"></div>
     </section>
 
-    <section class="col" id="colProgress">
+    <section class="col" id="colProgress" data-col="progress">
       <div class="col-head"><h2>In progress</h2><span class="col-count" id="hdProgress">0</span></div>
       <div class="col-body" id="listProgress"></div>
     </section>
 
-    <section class="col" id="colClose">
+    <section class="col" id="colClose" data-col="close">
       <div class="col-head"><h2>To close</h2><span class="col-count" id="hdClose">0</span></div>
       <div class="col-body" id="listClose"></div>
     </section>
@@ -79,6 +112,9 @@
       <button class="icon-btn" id="detailClose" title="Close (Esc)">&times;</button>
     </div>
     <div class="detail-body" id="detailBody"></div>
+    <!-- Thumb-reachable primary action. Populated per job type; empty
+         when the job offers no safe one-tap action. -->
+    <div class="detail-bar" id="detailBar" hidden></div>
   </aside>
 
   <footer class="statusbar">
@@ -92,7 +128,7 @@
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js"></script>
-<script src="js/console.js"></script>
+<script src="js/api.js?v=2"></script>
+<script src="js/console.js?v=2"></script>
 </body>
 </html>

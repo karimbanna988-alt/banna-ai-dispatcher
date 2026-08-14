@@ -1,15 +1,24 @@
-/* LUXOR Dispatch Console.
+/* LUXOR Dispatch Console -- phone-first operator product.
 
    The CRM is the memory; this is the product. Three operational
-   columns -- TO DISPATCH / IN PROGRESS / TO CLOSE -- built entirely
+   stages -- TO DISPATCH / IN PROGRESS / TO CLOSE -- built entirely
    from the existing API routes (/api/new_jobs, /api/active,
    /api/closings). No new backend, no new framework.
 
-   SAFETY: this file cannot send anything. It prepares text and copies
-   it to the clipboard; a human pastes it into WhatsApp. Every state
-   change goes through the same audited POST routes the previous UI
-   used. There is no code path here that sends a WhatsApp message or
-   writes to Quo. */
+   On a phone exactly one stage owns the viewport and the switcher above
+   it is one tap. On a desktop all three columns show at once. Same code,
+   same data; the CSS decides which shape applies.
+
+   SAFETY: this file cannot transmit anything. It prepares text and
+   copies it to the clipboard; a human pastes it into WhatsApp. Every
+   state change goes through the same audited POST routes the previous
+   UI used. There is no code path here that transmits a WhatsApp message
+   or writes to Quo.
+
+   BUSINESS LOGIC: none lives here. Waiting-state wording comes from the
+   server (`operator_state`, computed by dispatcher/operator_stage.py
+   over the shared message_patterns) so the phone can never disagree
+   with the dispatcher brain about what a technician's message meant. */
 
 (function () {
   "use strict";
@@ -20,14 +29,21 @@
   // dispatch board -- a 300-hour-old unresolved message must never
   // visually compete with something that arrived 30 seconds ago.
   const DISPATCH_MAX_AGE_MIN = 24 * 60;
+  // One failed poll is a blip; two in a row is a connectivity problem
+  // worth telling the operator about.
+  const OFFLINE_AFTER_FAILURES = 2;
 
   const state = {
     dispatch: [], progress: [], close: [],
+    stage: "dispatch",    // which stage owns the phone viewport
     selected: null,       // { col, id }
     detail: null,         // resolved detail payload
     order: [],            // flat nav order for J/K
     paused: false,        // suspend polling while a detail panel is open
     lastPrepared: {},     // messageId -> prepared technician text
+    failures: 0,          // consecutive failed polls
+    offline: false,
+    lastGood: null,       // Date of the last successful load
   };
 
   const $ = (id) => document.getElementById(id);
@@ -43,6 +59,9 @@
 
   function age(mins) {
     if (mins == null) return "";
+    // Under a minute matters on a phone: a job 40 seconds old is the
+    // one the operator is actually reacting to, and "0m" hides that.
+    if (mins < 1) return Math.max(0, Math.round(mins * 60)) + "s";
     const m = Math.round(mins);
     if (m < 60) return m + "m";
     const h = Math.floor(m / 60);
@@ -81,6 +100,22 @@
     }
   }
 
+  /* ------------------------------------------------ connectivity ---- */
+
+  // Truthfulness rule: the operator must never mistake a stale board for
+  // live work. On repeated failure the banner appears and the board is
+  // visibly dimmed until a poll succeeds again.
+  function setOffline(on, why) {
+    state.offline = on;
+    $("offlineBar").hidden = !on;
+    $("board").classList.toggle("stale", on);
+    if (on) {
+      const since = state.lastGood
+        ? "last live " + state.lastGood.toLocaleTimeString() : "never reached the server";
+      $("offlineDetail").textContent = `not live · ${since}${why ? " · " + why : ""}`;
+    }
+  }
+
   /* ------------------------------------------------------ load ----- */
 
   async function load() {
@@ -101,11 +136,17 @@
       state.progress = (active.entries || []);
       state.close = (closings.entries || []);
 
+      state.failures = 0;
+      state.lastGood = new Date();
+      if (state.offline) setOffline(false);
+
       render();
       loadDemo();
-      $("updatedAt").textContent = new Date().toLocaleTimeString();
+      $("updatedAt").textContent = state.lastGood.toLocaleTimeString();
     } catch (e) {
       if (e.authRequired) return showLogin();
+      state.failures += 1;
+      if (state.failures >= OFFLINE_AFTER_FAILURES) setOffline(true, e.message);
       $("updatedAt").textContent = "error: " + e.message;
     }
   }
@@ -145,20 +186,32 @@
       $("dotWa").className = "dot " + (s && s.paired ? "up" : "down");
       $("dotAdapter").className = "dot " + (s ? "up" : "down");
     } catch (e) { $("dotWa").className = "dot down"; }
-    $("dotCrm").className = "dot up"; // reaching this code means the CRM answered
+    $("dotCrm").className = "dot " + (state.offline ? "down" : "up");
   }
 
   /* ---------------------------------------------------- rendering -- */
 
+  // The words come from the server (operator_state). The fallback below
+  // is presentation-only and deliberately vague -- it never tries to
+  // re-derive meaning from message text, which is the brain's job.
   function waitingLabel(e) {
+    const os = e.operator_state;
+    if (os && os.label) return { t: os.label, c: os.tone || "", next: os.next_expected || "" };
     const na = (e.next_action || "").toUpperCase();
-    if (na.includes("HUMAN_REVIEW")) return { t: "Needs review", c: "rev" };
-    if (na.includes("K")) return { t: "Waiting for tech K", c: "act" };
-    if (na.includes("UPDATE_COMPANY")) return { t: "Update company", c: "act" };
-    if (na.includes("CLOSING")) return { t: "Waiting for closing", c: "" };
-    if (na.includes("REASSIGN") || na.includes("DECLINED")) return { t: "Needs reassignment", c: "bad" };
-    if (e.bucket) return { t: String(e.bucket).replace(/_/g, " "), c: "" };
-    return { t: e.status || "In progress", c: "" };
+    if (na.includes("HUMAN_REVIEW")) return { t: "Needs review", c: "rev", next: "" };
+    if (e.bucket) return { t: String(e.bucket).replace(/_/g, " "), c: "", next: "" };
+    return { t: e.status || "In progress", c: "", next: "" };
+  }
+
+  // latest_technician_update arrives from the read model as an object
+  // ({update_type, raw_message, eta_minutes, created_at}), not a string.
+  // Interpolating it directly rendered a literal "[object Object]" on the
+  // card where the technician's own words belong.
+  function lastUpdateText(e) {
+    const u = e.latest_technician_update;
+    if (!u) return "";
+    if (typeof u === "string") return u;
+    return u.raw_message || u.update_type || "";
   }
 
   function dispatchCard(j) {
@@ -169,12 +222,16 @@
     return `<div class="${cls}" data-col="dispatch" data-id="${esc(j.message_id)}">
       <div class="card-top">
         <span class="ticket">${esc(j.ticket || "no ticket")}</span>
-        <span class="src">${esc(j.source || "")}</span>
         <span class="age ${ageClass(j.age_minutes)}">${age(j.age_minutes)}</span>
       </div>
       <div class="card-line"><b>${esc(j.service || "service not stated")}</b></div>
+      <div class="card-line">${esc(j.source || "source not stated")}</div>
       <div class="card-line">${esc([j.city, j.state].filter(Boolean).join(", ") || "location not stated")}</div>
-      <div class="card-line">Tech: <b>${esc(tech)}</b></div>
+      <div class="rec ${j.technician_name ? "" : "none"}">
+        <span class="rec-l">Recommended</span>
+        <span class="rec-v">${esc(tech)}</span>
+        ${confidenceChip(j.technician_name ? "EXACT" : "AMBIGUOUS")}
+      </div>
       ${review ? `<span class="waiting rev">Needs review</span>` : `<span class="waiting act">Ready to dispatch</span>`}
       <div class="card-actions">
         <button class="btn primary" data-act="dispatch" data-id="${esc(j.message_id)}">Dispatch</button>
@@ -190,41 +247,62 @@
     return `<div class="${cls}" data-col="progress" data-id="${esc(e.id)}">
       <div class="card-top">
         <span class="ticket">${esc(e.ticket || "#" + e.id)}</span>
-        <span class="src">${esc(e.source || "")}</span>
         <span class="age ${ageClass(mins)}">${esc(elapsedSince(e.waiting_since))}</span>
       </div>
       <div class="card-line">Tech: <b>${esc(e.technician_name || "unassigned")}</b></div>
       <div class="card-line">${esc(e.city || "")} ${esc(e.description ? "· " + e.description : "")}</div>
-      ${e.latest_technician_update ? `<div class="card-line">Last: ${esc(e.latest_technician_update)}</div>` : ""}
+      ${lastUpdateText(e) ? `<div class="card-line">Last: ${esc(lastUpdateText(e))}</div>` : ""}
       <span class="waiting ${w.c}">${esc(w.t)}</span>
     </div>`;
   }
 
+  // Reads the fields /api/closings actually returns (amount,
+  // payment_method, missing, prepared_text, closing_recorded).
   function closeCard(e) {
     const sel = state.selected && state.selected.col === "close" && state.selected.id === e.id;
-    const missing = e.missing_fields || [];
-    const ready = missing.length === 0;
-    const cls = ["card", sel ? "sel" : "", ready ? "ready" : "review"].join(" ");
+    const st = closingState(e);
+    const cls = ["card", sel ? "sel" : "", st.ready ? "ready" : "review"].join(" ");
     return `<div class="${cls}" data-col="close" data-id="${esc(e.id)}">
       <div class="card-top">
         <span class="ticket">${esc(e.ticket || "#" + e.id)}</span>
         <span class="age">${esc(e.technician_name || "")}</span>
       </div>
-      <div class="card-line">Amount: <b>${esc(e.closing_amount || "not stated")}</b></div>
-      <div class="card-line">Payment: <b>${esc(e.closing_payment_method || "not stated")}</b></div>
-      ${ready ? `<span class="waiting ok">Ready to close</span>`
-              : `<span class="waiting rev">Missing: ${esc(missing.join(", "))}</span>`}
+      <div class="card-line">Amount: <b>${esc(e.amount ? "$" + e.amount : "not stated")}</b></div>
+      <div class="card-line">Payment: <b>${esc(e.payment_method || "not stated")}</b></div>
+      <span class="waiting ${st.tone}">${esc(st.label)}</span>
+      ${st.ready ? `<div class="card-actions">
+        <button class="btn primary" data-act="copy-closing" data-id="${esc(e.id)}">Copy closing</button>
+      </div>` : ""}
     </div>`;
+  }
+
+  // A closing is READY only when the server says the amount and the
+  // payment method were actually recorded and it could render the
+  // company text. A bare "Done" leaves `missing` populated and must
+  // never present a one-tap close.
+  function closingState(e) {
+    const missing = e.missing || [];
+    if (!e.closing_recorded) {
+      return { ready: false, tone: "", label: "Waiting for closing", missing: ["closing report"] };
+    }
+    if (missing.length) {
+      return { ready: false, tone: "rev", label: "Missing: " + missing.join(", "), missing };
+    }
+    if (e.supported === false) {
+      return { ready: false, tone: "rev", label: "Human review needed", missing: [e.unsupported_reason || "unsupported format"] };
+    }
+    if (!e.prepared_text) {
+      return { ready: false, tone: "rev", label: "Human review needed", missing: ["prepared closing text"] };
+    }
+    return { ready: true, tone: "ok", label: "Ready to close", missing: [] };
   }
 
   function render() {
     const d = state.dispatch, p = state.progress, c = state.close;
-    $("countDispatch").textContent = d.length;
-    $("countProgress").textContent = p.length;
-    $("countClose").textContent = c.length;
-    $("hdDispatch").textContent = d.length;
-    $("hdProgress").textContent = p.length;
-    $("hdClose").textContent = c.length;
+    [["countDispatch", d], ["countProgress", p], ["countClose", c],
+     ["hdDispatch", d], ["hdProgress", p], ["hdClose", c],
+     ["stDispatch", d], ["stProgress", p], ["stClose", c]]
+      .forEach(([id, list]) => { const el = $(id); if (el) el.textContent = list.length; });
     $("countDispatch").parentElement.classList.toggle("hot", d.length > 0);
     $("countClose").parentElement.classList.toggle("hot", c.length > 0);
 
@@ -244,6 +322,20 @@
       c.map((e) => ({ col: "close", id: e.id })));
   }
 
+  /* ------------------------------------------------ stage switcher -- */
+
+  function setStage(name) {
+    if (!name) return;
+    state.stage = name;
+    $("board").setAttribute("data-stage", name);
+    document.querySelectorAll(".stage").forEach((b) =>
+      b.classList.toggle("on", b.getAttribute("data-stage") === name));
+    // Desktop shows every column at once; bring the chosen one into view.
+    const map = { dispatch: "colDispatch", progress: "colProgress", close: "colClose" };
+    const el = $(map[name]);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
   /* ------------------------------------------------------- detail -- */
 
   function confidenceChip(conf) {
@@ -260,10 +352,10 @@
       <div class="sec">
         <div class="sec-h">Job</div>
         <div class="kv"><span class="k">Ticket</span><span class="v">${esc(j.ticket || "not stated")}</span></div>
-        <div class="kv"><span class="k">Company</span><span class="v">${esc(j.source || "")}</span></div>
+        <div class="kv"><span class="k">Company</span><span class="v">${esc(j.source || "not stated")}</span></div>
         <div class="kv"><span class="k">Service</span><span class="v">${esc(j.service || "not stated")}</span></div>
         <div class="kv"><span class="k">Area</span><span class="v">${esc([j.city, j.state].filter(Boolean).join(", ") || "not stated")}</span></div>
-        <div class="kv"><span class="k">Age</span><span class="v">${age(j.age_minutes)}</span></div>
+        <div class="kv"><span class="k">Waiting</span><span class="v">${age(j.age_minutes) || "just now"}</span></div>
       </div>
       <div class="sec">
         <div class="sec-h">Decision</div>
@@ -280,10 +372,6 @@
       <div class="sec">
         <div class="sec-h">Proposed technician message</div>
         <div class="msgbox" id="msgBox">${esc(proposed || "Press Dispatch to prepare the message.")}</div>
-        <div class="detail-actions">
-          <button class="btn primary" data-act="dispatch" data-id="${esc(j.message_id)}">Dispatch &amp; copy</button>
-          ${proposed ? `<button class="btn" data-act="copy">Copy (C)</button>` : ""}
-        </div>
       </div>`;
   }
 
@@ -293,19 +381,19 @@
     return `
       <div class="sec">
         <div class="sec-h">Job</div>
-        <div class="kv"><span class="k">Ticket</span><span class="v">${esc(e.ticket || "")}</span></div>
-        <div class="kv"><span class="k">Company</span><span class="v">${esc(e.source || "")}</span></div>
+        <div class="kv"><span class="k">Ticket</span><span class="v">${esc(e.ticket || "not stated")}</span></div>
+        <div class="kv"><span class="k">Company</span><span class="v">${esc(e.source || "not stated")}</span></div>
         <div class="kv"><span class="k">Technician</span><span class="v">${esc(e.technician_name || "unassigned")}</span></div>
-        <div class="kv"><span class="k">Area</span><span class="v">${esc(e.city || "")}</span></div>
+        <div class="kv"><span class="k">Area</span><span class="v">${esc(e.city || "not stated")}</span></div>
         <div class="kv"><span class="k">State</span><span class="v">${esc(e.status || "")}</span></div>
         <div class="kv"><span class="k">Waiting</span><span class="v">${esc(elapsedSince(e.waiting_since) || "just now")}</span></div>
       </div>
       <div class="sec">
-        <div class="sec-h">What we are waiting for</div>
+        <div class="sec-h">Luxor</div>
         <div class="decision">
           <div class="d-detected">${esc(w.t)}</div>
-          ${e.latest_technician_update ? `<div class="d-why">Last technician update: ${esc(e.latest_technician_update)}</div>` : ""}
-          ${e.next_action ? `<div class="d-why">Next action: ${esc(e.next_action)}</div>` : ""}
+          ${lastUpdateText(e) ? `<div class="d-why">Last technician update: ${esc(lastUpdateText(e))}</div>` : ""}
+          ${w.next ? `<div class="d-why">Waiting for: ${esc(w.next)}</div>` : ""}
           ${e.company_update_owed ? `<div class="d-why">A company update is owed</div>` : ""}
         </div>
       </div>
@@ -313,7 +401,6 @@
       <div class="sec">
         <div class="sec-h">Proposed company update</div>
         <div class="msgbox" id="msgBox">${esc(wf.next_message)}</div>
-        <div class="detail-actions"><button class="btn primary" data-act="copy">Copy update (C)</button></div>
       </div>` : ""}
       <div class="sec">
         <div class="sec-h">Open in full workspace</div>
@@ -324,24 +411,48 @@
   }
 
   function renderCloseDetail(e) {
-    const missing = e.missing_fields || [];
+    const st = closingState(e);
     return `
       <div class="sec">
         <div class="sec-h">Closing</div>
-        <div class="kv"><span class="k">Ticket</span><span class="v">${esc(e.ticket || "")}</span></div>
-        <div class="kv"><span class="k">Technician</span><span class="v">${esc(e.technician_name || "")}</span></div>
-        <div class="kv"><span class="k">Amount</span><span class="v">${esc(e.closing_amount || "not stated")}</span></div>
-        <div class="kv"><span class="k">Payment</span><span class="v">${esc(e.closing_payment_method || "not stated")}</span></div>
+        <div class="kv"><span class="k">Ticket</span><span class="v">${esc(e.ticket || "not stated")}</span></div>
+        <div class="kv"><span class="k">Technician</span><span class="v">${esc(e.technician_name || "not stated")}</span></div>
+        <div class="kv"><span class="k">Amount</span><span class="v">${esc(e.amount ? "$" + e.amount : "not stated")}</span></div>
+        <div class="kv"><span class="k">Payment</span><span class="v">${esc(e.payment_method || "not stated")}</span></div>
       </div>
-      ${missing.length ? `<div class="sec"><div class="missing">
-          <b>Missing: ${esc(missing.join(", "))}</b><br>
-          These are never invented. Enter them in the full workspace only if you actually know them.
-        </div></div>` : ""}
+      ${st.ready ? `
+      <div class="sec">
+        <div class="sec-h">Closing message</div>
+        <div class="msgbox" id="msgBox">${esc(e.prepared_text)}</div>
+      </div>` : `
+      <div class="sec"><div class="missing">
+          <b>Human review needed — missing: ${esc(st.missing.join(", "))}</b><br>
+          These are never invented. A job is not closed on an implied amount.
+          Enter them in the full workspace only if you actually know them.
+        </div></div>`}
       <div class="sec">
         <div class="detail-actions">
-          <button class="btn ghost" data-act="admin-job" data-id="${esc(e.id)}">Open in Admin to complete</button>
+          <button class="btn ghost" data-act="admin-job" data-id="${esc(e.id)}">Open in Admin</button>
         </div>
       </div>`;
+  }
+
+  // The one primary action, pinned to the bottom of the sheet where a
+  // thumb reaches it. Copy commits nothing; Dispatch is the only button
+  // here that changes state, and it stays an explicit labelled tap.
+  function detailBar(col, item) {
+    if (col === "dispatch") {
+      const proposed = state.lastPrepared[item.message_id] || item.luxor_message || "";
+      return `<button class="btn primary" data-act="dispatch" data-id="${esc(item.message_id)}">Dispatch &amp; copy</button>`
+        + (proposed ? `<button class="btn" data-act="copy">Copy (C)</button>` : "");
+    }
+    if (col === "progress") {
+      const wf = item.workflow || {};
+      return wf.next_message ? `<button class="btn primary" data-act="copy">Copy company update</button>` : "";
+    }
+    const st = closingState(item);
+    return st.ready
+      ? `<button class="btn primary" data-act="copy-closing" data-id="${esc(item.id)}">Copy closing</button>` : "";
   }
 
   function openDetail(col, id) {
@@ -362,6 +473,9 @@
     state.detail = item;
     $("detailTitle").textContent = title;
     $("detailBody").innerHTML = html;
+    const bar = detailBar(col, item);
+    $("detailBar").innerHTML = bar;
+    $("detailBar").hidden = !bar;
     $("detail").hidden = false;
     render();
   }
@@ -376,7 +490,7 @@
 
   async function doDispatch(messageId) {
     // Reuses the existing audited flow exactly: acknowledge -> prepare
-    // -> confirm. Nothing new, nothing automatic, nothing sent.
+    // -> confirm. Nothing new, nothing automatic, nothing transmitted.
     try {
       const j = state.dispatch.find((x) => x.message_id === messageId);
       if (j && j.needs_review) {
@@ -400,12 +514,37 @@
     }
   }
 
+  // Asks the server to render the closing text from persisted fields --
+  // the client never composes a closing itself, and never fills a blank.
+  async function doCopyClosing(jobId) {
+    try {
+      const entry = state.close.find((e) => String(e.id) === String(jobId));
+      if (entry && !closingState(entry).ready) {
+        toast("Not ready to close — missing facts");
+        return openDetail("close", jobId);
+      }
+      if (entry && entry.prepared_text) return copy(entry.prepared_text, "Closing");
+      const r = await Api.prepareClosing(jobId);
+      const text = (r && (r.prepared_text || r.message || r.luxor_message)) || "";
+      if (text) await copy(text, "Closing");
+      else toast("No closing text available — open in Admin");
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      toast("Could not prepare closing: " + e.message);
+    }
+  }
+
   function onClick(ev) {
+    const stageEl = ev.target.closest("[data-stage]");
+    if (stageEl && stageEl.classList.contains("stage")) {
+      return setStage(stageEl.getAttribute("data-stage"));
+    }
     const actEl = ev.target.closest("[data-act]");
     if (actEl) {
       ev.stopPropagation();
       const act = actEl.getAttribute("data-act");
       if (act === "dispatch") return doDispatch(actEl.getAttribute("data-id"));
+      if (act === "copy-closing") return doCopyClosing(actEl.getAttribute("data-id"));
       if (act === "copy") {
         const box = $("msgBox");
         return box ? copy(box.textContent, "Message") : null;
@@ -423,6 +562,7 @@
     i = i < 0 ? 0 : Math.min(state.order.length - 1, Math.max(0, i + delta));
     const target = state.order[i];
     state.selected = target;
+    if (target.col !== state.stage) setStage(target.col);
     render();
     const el = document.querySelector(`.card[data-col="${target.col}"][data-id="${CSS.escape(String(target.id))}"]`);
     if (el) el.scrollIntoView({ block: "nearest" });
@@ -439,6 +579,9 @@
     if (ev.key === "j" || ev.key === "J") return move(1);
     if (ev.key === "k" || ev.key === "K") return move(-1);
     if (ev.key === "Enter" && state.selected) return openDetail(state.selected.col, state.selected.id);
+    if (ev.key === "1") return setStage("dispatch");
+    if (ev.key === "2") return setStage("progress");
+    if (ev.key === "3") return setStage("close");
     if (ev.key === "c" || ev.key === "C") {
       const box = $("msgBox");
       if (box) copy(box.textContent, "Message");
@@ -479,6 +622,7 @@
   function showApp() {
     $("loginScreen").hidden = true;
     $("app").hidden = false;
+    setStage(state.stage);
     load(); health();
     setInterval(load, POLL_MS);
     setInterval(health, 15000);
@@ -495,6 +639,16 @@
     } catch (e) { $("loginError").textContent = e.message; }
   }
 
+  // Application shell only -- see sw.js, which is forbidden from caching
+  // anything under /api/. Registration needs a secure context, so over
+  // plain LAN http this is skipped silently rather than logging an error
+  // the operator would have no way to act on.
+  function registerServiceWorker() {
+    if (!("serviceWorker" in navigator)) return;
+    if (!window.isSecureContext) return;
+    navigator.serviceWorker.register("/sw.js").catch(() => { /* shell cache is optional */ });
+  }
+
   document.addEventListener("click", onClick);
   document.addEventListener("keydown", onKey);
   $("loginBtn").addEventListener("click", doLogin);
@@ -502,11 +656,9 @@
   $("detailClose").addEventListener("click", closeDetail);
   $("adminBtn").addEventListener("click", () => { window.location.href = "admin.html"; });
   $("searchInput").addEventListener("input", onSearch);
-  document.querySelectorAll("[data-jump]").forEach((b) => b.addEventListener("click", () => {
-    const map = { dispatch: "colDispatch", progress: "colProgress", close: "colClose" };
-    const el = $(map[b.getAttribute("data-jump")]);
-    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }));
+  document.querySelectorAll("[data-jump]").forEach((b) =>
+    b.addEventListener("click", () => setStage(b.getAttribute("data-jump"))));
 
+  registerServiceWorker();
   Api.checkSession().then(showApp).catch(showLogin);
 })();
