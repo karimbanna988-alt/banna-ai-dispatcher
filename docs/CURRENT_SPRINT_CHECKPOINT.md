@@ -293,6 +293,75 @@ uses so the two can never drift.
   observations still `GROUP_MAPPING_REQUIRED`, media/no-body messages
   captured as metadata instead of retrying forever.
 
+## Update -- Seif's live shift: what the shadow window actually learned
+
+Continuous receive-only observation of the real operation while Seif
+worked. Every interpretation change below was measured against real
+traffic BEFORE any code was written, and each refusal to generalize is
+recorded as deliberately as each fix.
+
+**Interpretation accuracy.** The single biggest defect was the rule
+"any digit means an ETA". Measured: 105 messages carried that label,
+only 6 actually stated a time -- wrong ~94%. It was sweeping up phone
+numbers, street addresses, a VIN, price quotes and bare @mentions, and
+showing a dispatcher "ETA" on all of them. Split into measured
+patterns (`00248b4`): bare @mention (33), price quote (6), and a real
+ETA requiring actual time language. A message stating both an ETA and a
+quote reports both.
+
+Categories now produced across the corpus, all evidence-driven:
+TECHNICIAN K, JOB FORWARDED TO TECHNICIAN, MENTION ONLY, CLOSING
+RECEIVED (with amount where deterministic), NEW JOB DETECTED,
+ACKNOWLEDGEMENT, TECHNICIAN ETA/UPDATE, TECHNICIAN PRICE QUOTE,
+TECHNICIAN EN ROUTE, TECHNICIAN NO ANSWER, TECHNICIAN DECLINE, and an
+honest TECHNICIAN UPDATE catch-all.
+
+**End-to-end traces.** `dispatcher/shadow_trace.py` reconstructs job
+chains from observations alone, correlated by exact ticket only --
+timing never establishes a link. All four workflow segments have now
+been observed in real traffic: company intake -> dispatcher forward
+(14 chains), dispatch -> closing (4), technician closing -> company
+closing (1). No single ticket has traversed all four yet, and the
+reason is measurable rather than mysterious: the intake->dispatch
+tickets were forwarded 14-49 minutes before the check, so those jobs
+were still in flight.
+
+The classifier's refusals fired correctly on real data: ticket
+`ARV3-NZJ9` appeared in two different technician dispatch groups 48
+seconds apart -- a live reassignment -- and was reported AMBIGUOUS with
+a "possible reassignment, needs a human" note rather than forced into
+one clean chain.
+
+**A real reliability bug, found via a test I had previously misjudged.**
+The adapter's rate-limit and auth checks run before the request body is
+read, so an early rejection closed the connection with the body unread
+and the client saw a reset instead of the status code. I had earlier
+dismissed the resulting intermittent test failure as an environment
+artifact; re-running it isolated failed 1 in 3, which disproved that.
+Fixed in `33544e7`. This mattered beyond tests: a bridge that hit a
+429 or a bad secret would have been handed an opaque network error
+instead of the reason -- the same ambiguity that made the historical
+adapter-secret mismatch hard to diagnose.
+
+**Deliberately NOT done, each for a stated reason:**
+- Freeform job postings (phone + service + address, no ticket block):
+  only 2-3 distinct instances, and inferring a job from unstructured
+  text risks inventing an address or phone. Left as an owner question.
+- A general "backfill technician destinations from confirmed registry
+  rows" script: would have silently converted Tarek's owner-declared
+  *temporary* Columbia coverage into a permanent assignment. See
+  `PENDING_OWNER_QUESTIONS.md` item 5.
+- Further catch-all subdivision: the strongest remaining sub-pattern was
+  3 messages across 2 groups, below the bar held all shift.
+- Any mapping confirmation: registry unchanged at 27 confirmed / 58
+  unmapped for the entire shift.
+
+**Verification.** Full chain confirmed end-to-end through the real CRM
+API with authentication -- WhatsApp -> 8514 -> 8513 -> SQLite -> 8512 --
+serving every new category. Feed latency 42ms at 526 observations. Logs
+across the shift contain zero errors, zero tracebacks, zero adapter
+rejections and zero delivery failures.
+
 ## Exact next task if continuing
 
 Keep shadowing. No blocker. Open items, in priority order:
