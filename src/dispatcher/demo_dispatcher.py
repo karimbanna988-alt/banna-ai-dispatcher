@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from dispatcher import technician_ack
+from dispatcher import message_patterns, technician_ack
 from dispatcher.parser import extract_job
 
 # Fabricated identities. Deliberately NOT looked up in the technicians
@@ -210,7 +210,7 @@ def _technician_reply(text: str, job: DemoJob) -> DemoDecision:
             state_before=before, state_after=job.state, ticket=job.ticket,
         )
 
-    if _CLOSING_WORDS.search(text or ""):
+    if message_patterns.says_job_done(text):
         job.state = STATE_NEEDS_REVIEW
         return DemoDecision(
             detected="Technician says the job is done, but stated no amount",
@@ -223,19 +223,19 @@ def _technician_reply(text: str, job: DemoJob) -> DemoDecision:
             missing_fields=["amount", "payment_method"], needs_human=True,
         )
 
-    if _EN_ROUTE.search(text or "") or _ETA_TIME.search(text or ""):
+    if message_patterns.is_en_route(text) or message_patterns.stated_eta(text):
         job.state = STATE_EN_ROUTE
-        eta = _ETA_TIME.search(text or "")
+        eta = message_patterns.stated_eta(text)
         why = ["Technician reported travelling to the job"]
         if eta:
-            why.append(f"Stated time: {eta.group(0)}")
+            why.append(f"Stated time: {eta}")
         return DemoDecision(
-            detected="Technician is on the way" + (f" ({eta.group(0)})" if eta else ""),
+            detected="Technician is on the way" + (f" ({eta})" if eta else ""),
             decision="Update the company with the ETA",
             why=why, confidence=CONFIDENCE_EXACT,
             proposed_action="UPDATE_COMPANY",
             proposed_message=f"{job.ticket}: technician en route"
-                             + (f", {eta.group(0)}." if eta else "."),
+                             + (f", {eta}." if eta else "."),
             state_before=before, state_after=job.state, ticket=job.ticket,
         )
 
@@ -249,22 +249,10 @@ def _technician_reply(text: str, job: DemoJob) -> DemoDecision:
     )
 
 
-import re  # noqa: E402  -- kept next to the patterns it serves
-
-# Same narrow, adjacency-anchored shape the production interpreter uses
-# (see operator_api._CLOSING_AMOUNT_RE): an amount immediately followed
-# by a payment word. A figure mentioned in passing is never a closing.
-_CLOSING_AMOUNT_RE = re.compile(r"\$?\s*([\d,]+\.?\d*)\s+(cash|cc|card|venmo|zelle|check)\b", re.IGNORECASE)
-_CLOSING_WORDS = re.compile(r"\b(done|finished|completed|closed|closing)\b", re.IGNORECASE)
-_EN_ROUTE = re.compile(r"\b(on my way|omw)\b|^on the way\b", re.IGNORECASE)
-_ETA_TIME = re.compile(r"\b\d+\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE)
-
-
 def _closing_amount(text: str):
-    m = _CLOSING_AMOUNT_RE.search(text or "")
-    if not m:
-        return None, None
-    return m.group(1), m.group(2).lower()
+    """Delegates to the shared implementation -- the demo must recognize
+    a closing exactly the way production does."""
+    return message_patterns.extract_closing_amount(text)
 
 
 def reason(role: str, text: str, job: DemoJob, vehicle_rules) -> DemoDecision:

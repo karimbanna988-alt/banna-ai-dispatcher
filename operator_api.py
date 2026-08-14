@@ -82,6 +82,7 @@ from dispatcher.closing import ClosingInput, render_closing_from_persisted_field
 from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
+from dispatcher import message_patterns  # noqa: E402
 from dispatcher.parser import extract_job  # noqa: E402
 from dispatcher import pipeline  # noqa: E402
 from dispatcher.workflow_projection import (  # noqa: E402
@@ -2003,58 +2004,25 @@ _NO_ANSWER_RE = re.compile(
     r"(no answer|didn'?t answer|doesn'?t answer|not answering|no reply|voice ?mail)", re.IGNORECASE,
 )
 
-# A WhatsApp @mention with no other content ("@2632865341592"). Someone
-# tagging a person carries no status information at all. Measured on live
-# traffic: 33 of the 105 messages the old heuristic called an ETA were
-# exactly this.
-_MENTION_ONLY_RE = re.compile(r"^@\d+$")
-
-# Real time language. The rule this replaces was "any digit means ETA",
-# which was wrong ~94% of the time on live traffic -- it swept up phone
-# numbers, street numbers, a VIN, price quotes and @mentions. Only 6 of
-# 105 such messages actually stated a time.
-_ETA_TIME_RE = re.compile(
-    r"\b(eta|min|mins|minute|minutes|hour|hours|hr|hrs)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE,
-)
-
-# The technician reporting they are travelling to the job. Deliberately
-# anchored to FIRST PERSON ("on my way"/"omw") or a leading "on the
-# way", because live traffic contains a real false positive that a looser
-# rule would swallow: "She has someone on the way" is the CUSTOMER having
-# arranged another locksmith -- close to the opposite of this technician
-# being en route. Also deliberately does not match "heading", whose only
-# observed use was about a different, future job ("I will go to her after
-# i'm done with the one i'm heading to").
-_EN_ROUTE_RE = re.compile(r"\b(on my way|omw)\b|^on the way\b", re.IGNORECASE)
-
-# A price quoted to the customer ("quoted 125", "Quoted 150 he's gonna
-# call back"). Operationally distinct from an ETA and worth surfacing on
-# its own -- a price is a commercial fact a human may need to act on.
-# Never parses the number into an amount; only labels that a quote was
-# discussed, since quoting language is far less structured than the
-# closing-report format.
-_QUOTE_RE = re.compile(r"\b(quote|quoted|quoting)\b", re.IGNORECASE)
-
-# Checked only AFTER _NO_ANSWER_RE has already matched, to separate
-# "the customer didn't answer, I'll retry" from "I'm dropping this job
-# because they didn't answer" -- different real outcomes (wait/update vs.
-# reassign). Deliberately anchored to a leading "pass": a bare leading
-# "no" cannot be used as the decline signal here, because the real
-# messages "No answer sent a text" and "No answer will try to call again"
-# both begin with "No" as part of the phrase "No answer" and are NOT
-# declines.
-_PASS_PREFIX_RE = re.compile(r"^\s*pass\b", re.IGNORECASE)
+# All deterministic message patterns now live in one place --
+# dispatcher/message_patterns.py -- because the production interpreter
+# and the owner demo had each grown their own copy of the closing/ETA/
+# en-route rules, which meant the demo could drift from the behaviour it
+# exists to demonstrate. Each pattern's measurement and the false
+# positive that shaped it are documented there.
+_MENTION_ONLY_RE = message_patterns.MENTION_ONLY_RE
+_ETA_TIME_RE = message_patterns.ETA_TIME_RE
+_EN_ROUTE_RE = message_patterns.EN_ROUTE_RE
+_QUOTE_RE = message_patterns.QUOTE_RE
+_NO_ANSWER_RE = message_patterns.NO_ANSWER_RE
+_PASS_PREFIX_RE = message_patterns.PASS_PREFIX_RE
+_CLOSING_AMOUNT_RE = message_patterns.CLOSING_AMOUNT_RE
 
 
 def _extract_closing_amount_and_method(text: str):
-    """Returns (amount, payment_method) as the exact substrings matched,
-    or (None, None) if the message doesn't contain this specific,
-    high-confidence adjacent pattern. Never guesses a value from a less
-    certain shape -- see _CLOSING_AMOUNT_RE's comment."""
-    match = _CLOSING_AMOUNT_RE.search(text or "")
-    if not match:
-        return None, None
-    return match.group(1), match.group(2).lower()
+    """Delegates to the shared implementation so production and the demo
+    can never disagree about what counts as a closing."""
+    return message_patterns.extract_closing_amount(text)
 
 
 def _interpret_whatsapp_observation(conn, obs: dict, all_jobs: list, vehicle_rules) -> dict:
