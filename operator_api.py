@@ -83,6 +83,7 @@ from dispatcher.policy import get_policy  # noqa: E402
 from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
 from dispatcher import message_patterns  # noqa: E402
+from dispatcher import demo_dispatcher  # noqa: E402
 from dispatcher.parser import extract_job  # noqa: E402
 from dispatcher import pipeline  # noqa: E402
 from dispatcher.workflow_projection import (  # noqa: E402
@@ -2261,6 +2262,73 @@ def route_whatsapp_shadow_feed(handler: "Handler", match: dict, body: dict) -> d
         conn.close()
 
 
+def route_demo_console(handler: "Handler", match: dict, body: dict) -> dict:
+    """Read-only demo feed for the owner demo, shown in the Dispatch
+    Console beside real work but never mixed into it.
+
+    Drives dispatcher.demo_dispatcher -- the SAME brain, parser,
+    message_patterns and closing rule production uses -- over the
+    observations captured from the two registered demo groups only,
+    matched by exact group id from .runtime/demo_chats.json.
+
+    Cannot contaminate production: demo_dispatcher is a pure module (no
+    connection, no SQL, no send), this route creates no job and writes
+    nothing, and the demo groups are deliberately absent from
+    whatsapp_group_registry so the real interpretation path continues to
+    treat them as unmapped. If the demo chats are not registered, this
+    returns an empty, inert payload."""
+    config_path = REPO_ROOT / ".runtime" / "demo_chats.json"
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"configured": False, "decisions": [], "job": None}
+
+    roles = {}
+    if cfg.get("company_chat_id"):
+        roles[cfg["company_chat_id"]] = demo_dispatcher.ROLE_COMPANY
+    if cfg.get("technician_chat_id"):
+        roles[cfg["technician_chat_id"]] = demo_dispatcher.ROLE_TECHNICIAN
+    if not roles:
+        return {"configured": False, "decisions": [], "job": None}
+
+    conn = get_conn()
+    try:
+        observations = storage.list_whatsapp_pending_observations(conn, include_resolved=True)
+    finally:
+        conn.close()
+    demo_obs = [o for o in observations if o.get("group_id") in roles]
+    demo_obs.sort(key=lambda o: (o.get("timestamp") or "", o.get("received_at") or ""))
+
+    vehicle_rules = shared.get_vehicle_rules()
+    job = demo_dispatcher.DemoJob()
+    decisions = []
+    for obs in demo_obs:
+        d = demo_dispatcher.reason(roles[obs["group_id"]], obs.get("text") or "", job, vehicle_rules)
+        decisions.append({
+            "chat": "COMPANY" if roles[obs["group_id"]] == demo_dispatcher.ROLE_COMPANY else "TECHNICIAN",
+            "group_name": obs.get("group_name"),
+            "text": obs.get("text"),
+            "detected": d.detected, "decision": d.decision, "why": list(d.why),
+            "confidence": d.confidence, "proposed_action": d.proposed_action,
+            "proposed_message": d.proposed_message,
+            "state_before": d.state_before, "state_after": d.state_after,
+            "missing_fields": list(d.missing_fields), "needs_human": d.needs_human,
+            "ticket": d.ticket,
+        })
+    return {
+        "configured": True,
+        "company_chat_name": cfg.get("company_chat_name"),
+        "technician_chat_name": cfg.get("technician_chat_name"),
+        "decisions": decisions,
+        "job": {
+            "ticket": job.ticket, "state": job.state, "technician": job.technician,
+            "service_type": job.service_type,
+            "closing_amount": job.closing_amount,
+            "closing_payment_method": job.closing_payment_method,
+        },
+    }
+
+
 def route_whatsapp_promote_to_job(handler: "Handler", match: dict, body: dict) -> dict:
     """Human-triggered "PROMOTE TO JOB" for a COMPANY_JOB_INTAKE candidate.
     Reuses the exact existing job-commit path
@@ -2342,6 +2410,7 @@ ROUTES = [
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/attach$", route_whatsapp_attach, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/ignore$", route_whatsapp_ignore, {}),
     ("GET", r"^/api/whatsapp_shadow_feed$", route_whatsapp_shadow_feed, {}),
+    ("GET", r"^/api/demo_console$", route_demo_console, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]

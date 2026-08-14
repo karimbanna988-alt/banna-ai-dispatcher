@@ -6,32 +6,119 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 import pytest  # noqa: E402
 
 
+# Tables the LIVE receive-only shadow stack legitimately appends to while
+# the suite runs -- the WhatsApp bridge and Quo poller are separate
+# processes that keep capturing during a release test run, and stopping
+# them to test would mean losing real operational traffic.
+#
+# These are observation/audit tables only. No business truth is in this
+# set: jobs, events, technicians and whatsapp_group_registry are
+# deliberately absent, so a test touching any of them still fails hard.
+_LIVE_APPEND_ONLY_TABLES = frozenset({
+    "whatsapp_pending_observations",
+    "whatsapp_outgoing_audit",
+    "quo_pending_messages",
+    "quo_processed_messages",
+    "quo_poll_state",
+})
+
+
+def _snapshot_real_db(db_path, bounds=None):
+    """(per-table fingerprint) of the real database, read-only.
+
+    `bounds` is {table: max_rowid} and matters only for the append-only
+    tables: the "after" snapshot must fingerprint exactly the same row
+    range the "before" snapshot did, otherwise a legitimately-appended
+    row would change the digest and look like tampering. Pass the before
+    snapshot's max_ids to compare like with like."""
+    import hashlib
+    import sqlite3
+
+    if not db_path.exists():
+        return None
+    bounds = bounds or {}
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    try:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        snap = {}
+        for table in sorted(tables):
+            try:
+                max_id = conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM '{table}'").fetchone()[0]
+                has_rowid = True
+            except sqlite3.OperationalError:
+                has_rowid, max_id = False, None
+            if has_rowid and table in _LIVE_APPEND_ONLY_TABLES:
+                limit = bounds.get(table, max_id)
+                rows = conn.execute(
+                    f"SELECT * FROM '{table}' WHERE rowid <= ? ORDER BY rowid", (limit,)).fetchall()
+            else:
+                rows = conn.execute(f"SELECT * FROM '{table}'").fetchall()
+            digest = hashlib.sha256(repr(rows).encode("utf-8", "replace")).hexdigest()
+            snap[table] = {"max_id": max_id, "digest": digest, "count": len(rows)}
+        return snap
+    finally:
+        conn.close()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _real_database_untouched_tripwire():
     """Last-resort, whole-suite safety net -- independent of
     dispatcher.db_safety's own guards (which this fixture does not
     replace; see tests/test_db_safety.py and the operator_api.py/
-    whatsapp_bridge_adapter.py tests for those). If the real database's
-    mtime or size changes at any point during a full test run, something
-    in this suite wrote to it -- that is always a bug, regardless of
-    which code path caused it, so this fails the run loudly rather than
-    letting it pass silently."""
+    whatsapp_bridge_adapter.py tests for those). If any test writes to
+    the real database, this fails the run loudly rather than letting it
+    pass silently.
+
+    It compares TABLE CONTENT rather than file mtime/size. The earlier
+    file-stat version could not tell "a test wrote to production" (always
+    a bug) from "the live WhatsApp bridge captured a real message during
+    the run" (correct, and the whole point of the shadow system), so a
+    release run could not produce an unambiguous result while shadowing
+    was live.
+
+    This is not a relaxation. Business tables -- jobs, events,
+    technicians, whatsapp_group_registry -- must be byte-identical, which
+    is a stricter statement than "the file size matched". Observation
+    tables may only GAIN rows: every row that existed beforehand must be
+    unchanged, so a test that edits an existing observation still fails.
+    """
     from dispatcher import storage
 
     db_path = storage.DB_PATH
-    before = db_path.stat() if db_path.exists() else None
+    before = _snapshot_real_db(db_path)
     yield
-    after = db_path.stat() if db_path.exists() else None
+    # Fingerprint the same row range the "before" snapshot covered, so a
+    # legitimately appended observation cannot look like tampering.
+    bounds = {t: v["max_id"] for t, v in (before or {}).items() if v["max_id"] is not None}
+    after = _snapshot_real_db(db_path, bounds=bounds)
+
     if before is None and after is None:
         return
     assert before is not None and after is not None, (
         "data/dispatcher.db existed before the test session but not after (or vice versa) -- "
         "investigate immediately, do not ignore."
     )
-    assert (before.st_mtime, before.st_size) == (after.st_mtime, after.st_size), (
-        "data/dispatcher.db changed during this test session -- some test wrote to the real "
-        "database. This must never happen; find and fix the offending test before merging."
+    assert set(before) == set(after), (
+        f"tables appeared/disappeared during the test session: "
+        f"{set(before) ^ set(after)} -- a test altered the real schema."
     )
+    for table, was in before.items():
+        now = after[table]
+        if table in _LIVE_APPEND_ONLY_TABLES:
+            assert now["digest"] == was["digest"], (
+                f"{table}: rows that already existed were MODIFIED during the test session. "
+                "Live capture only ever appends, so this means a test wrote to the real database."
+            )
+            assert now["max_id"] >= was["max_id"], (
+                f"{table}: rows were deleted during the test session -- a test wrote to the "
+                "real database."
+            )
+        else:
+            assert now["digest"] == was["digest"], (
+                f"{table}: contents changed during the test session -- a test wrote to real "
+                "business data. This must never happen; find and fix the offending test."
+            )
 
 
 @pytest.fixture(autouse=True)

@@ -102,11 +102,41 @@
       state.close = (closings.entries || []);
 
       render();
+      loadDemo();
       $("updatedAt").textContent = new Date().toLocaleTimeString();
     } catch (e) {
       if (e.authRequired) return showLogin();
       $("updatedAt").textContent = "error: " + e.message;
     }
+  }
+
+  // The owner demo. Rendered in its own amber-framed strip so a demo job
+  // can never be mistaken for real work, and driven by /api/demo_console
+  // which runs the same dispatcher brain over the two registered demo
+  // chats only. Silent and hidden until those chats are registered.
+  async function loadDemo() {
+    try {
+      const d = await Api.getDemoConsole();
+      const strip = $("demoStrip");
+      if (!d || !d.configured || !d.decisions.length) { strip.hidden = true; return; }
+      strip.hidden = false;
+      const j = d.job || {};
+      $("demoState").textContent =
+        `${j.ticket || "no ticket"} · ${j.state || ""}` +
+        (j.closing_amount ? ` · $${j.closing_amount} ${j.closing_payment_method || ""}` : "");
+      $("demoSteps").innerHTML = d.decisions.slice(-4).map((s) => `
+        <div class="demo-step">
+          <div class="ds-chat">${esc(s.chat)} chat${s.confidence ? " · " + esc(s.confidence) : ""}</div>
+          <div class="ds-msg">${esc((s.text || "").slice(0, 70))}</div>
+          <div class="ds-det">${esc(s.detected)}</div>
+          ${(s.why || []).slice(0, 3).map((w) => `<div class="ds-why">· ${esc(w)}</div>`).join("")}
+          <div class="ds-state">${esc(s.proposed_action)}${
+            s.state_before !== s.state_after ? ` · ${esc(s.state_before)} → ${esc(s.state_after)}` : ""}</div>
+          ${s.missing_fields && s.missing_fields.length
+            ? `<div class="ds-why" style="color:var(--warn)">missing: ${esc(s.missing_fields.join(", "))} (never invented)</div>` : ""}
+          ${s.proposed_message ? `<div class="ds-msgbox">${esc(s.proposed_message)}</div>` : ""}
+        </div>`).join("");
+    } catch (e) { /* demo is optional -- never break the real board */ }
   }
 
   async function health() {

@@ -153,6 +153,7 @@ const Api = {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/ignore`, {});
   },
   getWhatsappShadowFeed() { return this._call("GET", "/api/whatsapp_shadow_feed"); },
+  getDemoConsole() { return this._call("GET", "/api/demo_console"); },
   promoteWhatsappToJob(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});
   },

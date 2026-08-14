@@ -243,3 +243,35 @@ h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-t
   .detail { width: 100%; top: 46px; }
   .hint { display: none; }
 }
+
+/* ------------------------------------------------------------ demo -- */
+/* The owner demo, shown beside real work and never mixed into it. The
+   amber frame is deliberate: it must be impossible to mistake a demo
+   job for a real one at a glance. */
+.demo-strip {
+  border-top: 1px solid var(--line);
+  border-bottom: 2px solid var(--warn);
+  background: linear-gradient(180deg, rgba(251,191,36,.06), transparent);
+  padding: 8px 12px; max-height: 40vh; overflow-y: auto;
+}
+.demo-head { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; }
+.demo-tag {
+  background: var(--warn); color: #221701; font-weight: 800; font-size: 10px;
+  letter-spacing: .1em; padding: 2px 7px; border-radius: 4px;
+}
+.demo-state { font-family: var(--mono); font-size: 12px; color: var(--text); }
+.demo-note { margin-left: auto; font-size: 11px; color: var(--dim); }
+.demo-steps { display: flex; gap: 8px; flex-wrap: wrap; }
+.demo-step {
+  flex: 1 1 240px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 3px solid var(--warn); border-radius: var(--radius); padding: 8px 10px;
+}
+.demo-step .ds-chat { font-size: 10px; letter-spacing: .06em; color: var(--dim); text-transform: uppercase; }
+.demo-step .ds-msg { font-family: var(--mono); font-size: 11px; color: var(--muted); margin: 3px 0 5px; }
+.demo-step .ds-det { font-size: 12px; font-weight: 600; }
+.demo-step .ds-why { font-size: 11px; color: var(--muted); margin-left: 10px; }
+.demo-step .ds-state { font-size: 11px; color: var(--accent); margin-top: 4px; font-family: var(--mono); }
+.demo-step .ds-msgbox {
+  margin-top: 5px; background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
+  padding: 6px; font-family: var(--mono); font-size: 11px; white-space: pre-wrap;
+}
