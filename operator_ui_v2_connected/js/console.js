@@ -485,8 +485,12 @@
   }
 
   async function doLogin() {
+    // Clear any previous failure first, so a stale "Invalid password."
+    // cannot linger after a subsequent successful sign-in.
+    $("loginError").textContent = "";
     try {
       await Api.login($("loginPassword").value);
+      $("loginPassword").value = "";   // never leave the password in the DOM
       showApp();
     } catch (e) { $("loginError").textContent = e.message; }
   }

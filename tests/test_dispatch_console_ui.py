@@ -155,3 +155,52 @@ def test_console_is_responsive_for_mobile():
     css = CONSOLE_CSS.read_text(encoding="utf-8")
     assert "@media" in css
     assert "grid-template-columns: 1fr" in css
+
+
+# ------------------------------------------- owner acceptance: auth ----
+def test_hidden_attribute_is_forced_to_win_over_layout_display():
+    """THE owner-reported defect. `.login` and `.app` both set
+    `display: flex`, and an author class selector beats the user-agent
+    `[hidden] { display: none }` rule -- so `element.hidden = true` had no
+    visual effect. Both layers rendered at once and, critically, the login
+    card stayed on screen after a SUCCESSFUL sign-in, which reads to an
+    operator as "login didn't work".
+
+    Everything the console shows/hides uses the `hidden` attribute, so
+    without this rule the whole show/hide model is silently inert."""
+    css = CONSOLE_CSS.read_text(encoding="utf-8")
+    # Match the real declaration, not the comment above it that quotes the
+    # user-agent rule while explaining the bug.
+    import re
+    rule = re.search(r"^\s*\[hidden\]\s*\{[^}]*\}", css, re.MULTILINE)
+    assert rule, "console.css must contain a real [hidden] rule, not only a comment about one"
+    body = rule.group(0)
+    assert "display: none" in body
+    assert "!important" in body, (
+        "without !important the class rules (.login/.app display:flex) win again"
+    )
+
+
+def test_login_clears_a_previous_error_before_retrying(console_js):
+    """A stale "Invalid password." must not linger after a later
+    successful sign-in."""
+    login_fn = console_js[console_js.index("async function doLogin"):]
+    login_fn = login_fn[:login_fn.index("\n  }")]
+    assert '$("loginError").textContent = ""' in login_fn
+
+
+def test_password_is_cleared_from_the_dom_after_a_successful_login(console_js):
+    login_fn = console_js[console_js.index("async function doLogin"):]
+    login_fn = login_fn[:login_fn.index("\n  }")]
+    assert '$("loginPassword").value = ""' in login_fn
+
+
+def test_a_failed_login_surfaces_the_error_to_the_user(console_js):
+    assert '$("loginError").textContent = e.message' in console_js
+
+
+def test_login_screen_and_app_start_in_the_correct_initial_state(index_html):
+    """The app must carry `hidden` in the markup so an unauthenticated
+    visitor never sees the console before the session check completes."""
+    assert 'id="app" class="app" hidden' in index_html
+    assert 'id="loginScreen"' in index_html
