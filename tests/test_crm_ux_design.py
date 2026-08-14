@@ -36,7 +36,7 @@ def app_js() -> str:
 
 @pytest.fixture(scope="module")
 def index_html() -> str:
-    return (UI_DIR / "index.html").read_text(encoding="utf-8")
+    return (UI_DIR / "admin.html").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------- design tokens --

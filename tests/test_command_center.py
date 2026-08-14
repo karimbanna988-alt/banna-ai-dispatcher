@@ -370,7 +370,7 @@ def test_jobs_screen_no_longer_labels_raw_messages_as_unresolved_jobs():
     """Regression guard: the whole frontend must never say "unresolved
     jobs" anywhere -- raw Quo/WhatsApp messages pending triage are not
     jobs. Archive / Inbox Review is the accurate replacement label."""
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
     assert "unresolved jobs" not in html.lower()
     assert "unresolved jobs" not in js.lower()
@@ -381,7 +381,7 @@ def test_jobs_screen_has_no_old_message_fallback():
     """Regression guard: the Jobs screen must never auto-insert an older
     message when the live (<=60 min) bucket is empty -- the exact
     'recent unresolved' / 'needs review' fallback this phase removed."""
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
     for stale_id in ("recentJobsSection", "recentJobsTableBody", "olderJobsDetails", "olderJobsTableBody"):
         assert stale_id not in html
@@ -623,13 +623,13 @@ def test_command_center_kpi_cards_link_to_a_real_screen():
 
 
 def test_command_center_screen_registered_in_html_and_nav():
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     assert 'id="screen-commandcenter"' in html
     assert 'data-screen="commandcenter"' in html
 
 
 def test_mobile_and_desktop_nav_match_the_required_structure():
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     desktop_nav = html[html.index('id="desktopSidebar"'):html.index("</nav>", html.index('id="desktopSidebar"'))]
     for expected in ("commandcenter", "jobs", "active", "closings", "history"):
         assert f'data-screen="{expected}"' in desktop_nav
@@ -642,7 +642,7 @@ def test_mobile_and_desktop_nav_match_the_required_structure():
 
 
 def test_login_screen_has_command_center_branding():
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     login_block = html[html.index('id="loginScreen"'):html.index('id="appShell"')]
     assert "Dispatch Command Center" in login_block
     assert "LUXOR" in login_block
@@ -650,7 +650,7 @@ def test_login_screen_has_command_center_branding():
 
 # =================================================== PHASE 6C: VISUAL/UX ==
 def test_login_screen_has_a_password_visibility_toggle():
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     login_block = html[html.index('id="loginScreen"'):html.index('id="appShell"')]
     assert 'id="loginPasswordToggle"' in login_block
     js = (REPO_ROOT / "operator_ui_v2_connected" / "js" / "app.js").read_text(encoding="utf-8")
@@ -670,7 +670,7 @@ def test_login_distinguishes_network_failure_from_invalid_password():
 
 
 def test_command_center_has_a_chart_period_selector():
-    html = (REPO_ROOT / "operator_ui_v2_connected" / "index.html").read_text(encoding="utf-8")
+    html = (REPO_ROOT / "operator_ui_v2_connected" / "admin.html").read_text(encoding="utf-8")
     assert 'id="ccChartPeriodSelect"' in html
     for expected_value in ('"today"', '"shift"', '"7d"', '"30d"'):
         assert expected_value.strip('"') in html

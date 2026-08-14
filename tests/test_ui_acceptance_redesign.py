@@ -35,7 +35,7 @@ def app_js() -> str:
 
 @pytest.fixture(scope="module")
 def index_html() -> str:
-    return (UI_DIR / "index.html").read_text(encoding="utf-8")
+    return (UI_DIR / "admin.html").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +45,7 @@ def seed_script() -> str:
 
 # ------------------------------------------------------------- asset paths
 def test_served_static_assets_exist_at_the_expected_paths():
-    for rel in ("index.html", "css/styles.css", "css/connected.css", "js/app.js"):
+    for rel in ("admin.html", "css/styles.css", "css/connected.css", "js/app.js"):
         assert (UI_DIR / rel).is_file(), f"missing asset: {rel}"
 
 

@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>LUXOR Operator UI V2 (Connected)</title>
+<link rel="stylesheet" href="css/styles.css">
+<link rel="stylesheet" href="css/connected.css">
+</head>
+<body>
+
+<div id="loginScreen" class="login-screen">
+  <div id="loginDemoModeBanner" style="display:none;">DEMO MODE &mdash; Synthetic data only. No live Quo or WhatsApp connection.</div>
+  <div class="login-card">
+    <div class="login-brand">LUXOR</div>
+    <div class="login-sub">Dispatch Command Center</div>
+    <div class="form-field">
+      <label>Password</label>
+      <div class="login-password-wrap">
+        <input type="password" id="loginPassword" autocomplete="current-password">
+        <button type="button" class="login-password-toggle" id="loginPasswordToggle" aria-label="Show password">&#128065;</button>
+      </div>
+    </div>
+    <button class="btn btn-primary btn-block" id="loginSubmitBtn">
+      <span id="loginSubmitLabel">Log in</span>
+    </button>
+    <div class="detail-warning" id="loginError" style="display:none; margin-top:10px;"></div>
+  </div>
+</div>
+
+<div id="appShell" style="display:none;">
+<div id="demoModeBanner" style="display:none;">DEMO MODE &mdash; synthetic data only, not connected to Quo or WhatsApp</div>
+<header class="app-header">
+  <div class="brand">
+    LUXOR
+    <span class="header-date" id="headerDateContext"></span>
+  </div>
+  <div class="header-search-wrap">
+    <input type="text" id="globalSearchInput" class="header-search-input" placeholder="Search ticket, technician, city... ( / )" autocomplete="off">
+    <div class="header-search-results" id="globalSearchResults" style="display:none;"></div>
+  </div>
+  <div class="header-actions">
+    <span class="status-dot" id="headerStatusDot"></span>
+    <span class="status-text" id="headerStatusText">Connected -- real data · manual WhatsApp bridge</span>
+    <button class="icon-btn mobile-search-btn" id="mobileSearchBtn" title="Search">&#128269;</button>
+    <button class="icon-btn" id="refreshBtn" title="Refresh">&#8635;</button>
+    <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
+  </div>
+</header>
+
+<div class="settings-menu-backdrop" id="settingsMenuBackdrop"></div>
+<div class="settings-menu" id="settingsMenu">
+  <div class="settings-menu-item" data-screen="actioncenter">Action Center</div>
+  <div class="settings-menu-item" data-screen="history" id="settingsCompletedItem">Completed</div>
+  <div class="settings-menu-item" data-screen="performance">Performance</div>
+  <div class="settings-menu-item" data-screen="technicians">Technicians</div>
+  <div class="settings-menu-item" data-screen="learning">Learning Review</div>
+  <div class="settings-menu-divider"></div>
+  <div class="settings-menu-item" id="settingsLogoutItem">Log out</div>
+</div>
+
+<div class="app-body">
+  <nav class="desktop-sidebar" id="desktopSidebar">
+    <div class="nav-item" data-screen="commandcenter" data-icon="&#9635;">Command Center</div>
+    <div class="nav-item" data-screen="actioncenter" data-icon="&#9873;">Action Center</div>
+    <div class="nav-item" data-screen="jobs" data-icon="&#9737;">Jobs</div>
+    <div class="nav-item" data-screen="active" data-icon="&#9679;">Active</div>
+    <div class="nav-item" data-screen="closings" data-icon="&#36;">Closings</div>
+    <div class="nav-item" data-screen="history" data-icon="&#10003;">Completed</div>
+  </nav>
+
+  <main class="main-content">
+
+    <!-- =================================================== COMMAND CENTER -->
+    <section class="screen" id="screen-commandcenter">
+      <div class="section-title">Command Center</div>
+      <div class="cc-generated-at" id="ccGeneratedAt"></div>
+
+      <div class="cc-kpi-grid" id="ccKpiGrid"></div>
+      <div class="cc-closed-amount" id="ccClosedAmount"></div>
+
+      <div id="ccAttentionSection">
+        <div class="cc-section-header">
+          <div class="subsection-label">Attention now</div>
+          <span id="ccAttentionViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="actioncenter">View all</button></span>
+        </div>
+        <div class="cc-attention-section-wrap">
+          <div id="ccAttentionList"></div>
+          <div id="ccAttentionEmpty" class="empty-state" style="display:none;">Nothing needs attention right now.</div>
+        </div>
+      </div>
+
+      <div class="cc-section-header">
+        <div class="subsection-label">Active jobs</div>
+        <span id="ccActiveViewAllWrap" style="display:none;"><button class="btn btn-secondary cc-small-btn" data-screen="active">View all</button></span>
+      </div>
+      <table class="data-table" id="ccActiveTable">
+        <thead>
+          <tr><th>Job</th><th>Source</th><th>City</th><th>Technician</th><th>Stage</th><th>Last update</th><th>Next action</th><th></th></tr>
+        </thead>
+        <tbody id="ccActiveTableBody"></tbody>
+      </table>
+      <div class="mobile-row-list" id="ccActiveMobileList"></div>
+      <div id="ccActiveEmpty" class="empty-state" style="display:none;">No active jobs with a technician right now.</div>
+
+      <div class="cc-section-header">
+        <div class="subsection-label">Charts</div>
+        <select id="ccChartPeriodSelect" class="cc-period-select">
+          <option value="today" selected>Today</option>
+          <option value="shift">Current shift</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+      </div>
+      <div class="cc-charts-grid">
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Job source mix</div>
+          <div id="ccSourceMixChart"></div>
+        </div>
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Job pipeline</div>
+          <div id="ccPipelineChart"></div>
+        </div>
+        <div class="perf-card cc-chart-card">
+          <div class="subsection-label">Technician activity</div>
+          <div id="ccTechActivityChart"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================================================== ACTION CENTER -->
+    <section class="screen" id="screen-actioncenter">
+      <div class="section-title">
+        Action Center
+        <button type="button" class="btn btn-primary cc-small-btn" id="nextActionableJobBtn">Next actionable job &rarr;</button>
+      </div>
+      <div class="scope-note">Everything that needs a human decision right now, grouped by what's blocking it. Sourced from one workflow projection -- not a second, independent count.</div>
+      <div id="actionCenterSections"></div>
+    </section>
+
+    <!-- ============================================================ JOBS -->
+    <section class="screen" id="screen-jobs">
+      <div class="section-title">
+        Jobs <span class="count" id="jobsCount"></span>
+        <button class="btn btn-secondary" id="syncBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Sync</button>
+      </div>
+      <div id="jobsSyncMsg" class="info-banner" style="display:none;"></div>
+      <div class="split">
+        <div class="list-pane">
+          <div class="subsection-label">New jobs (last 60 minutes)</div>
+          <table class="data-table" id="jobsTable">
+            <thead>
+              <tr><th>Age</th><th>Job</th><th>Company</th><th>Service</th><th>City</th><th>Technician</th></tr>
+            </thead>
+            <tbody id="jobsTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="jobsMobileList"></div>
+          <div id="jobsShowMoreWrap" style="display:none; margin-top:8px;">
+            <button class="btn btn-secondary btn-block" id="jobsShowMoreBtn"></button>
+          </div>
+          <div id="jobsEmptyState" class="empty-state" style="display:none;">No new actionable jobs received in the last 60 minutes.</div>
+
+          <div class="jobs-archive-link-wrap">
+            <button class="btn btn-secondary btn-block" id="jobsArchiveLinkBtn" data-screen="archive">Archive / Inbox Review<span id="jobsArchiveLinkCount" class="jobs-archive-link-count"></span></button>
+          </div>
+        </div>
+        <div class="detail-pane" id="jobsDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ============================================== ARCHIVE / INBOX REVIEW -->
+    <!-- Historical inbound Quo/WhatsApp messages -- never labeled "jobs"
+         anywhere on this screen. These are raw messages pending or already
+         reviewed; most will never become a real job. Real, honest
+         server-side pagination -- see route_inbox_review. -->
+    <section class="screen" id="screen-archive">
+      <div class="section-title">
+        Archive / Inbox Review <span class="count" id="archiveCount"></span>
+      </div>
+      <div class="scope-note">Historical inbound messages -- not confirmed jobs. Most of these were never actioned into a real job; some may be duplicates, status chatter, or messages that never matched an existing job.</div>
+      <div class="toolbar">
+        <input type="text" id="archiveSearch" placeholder="Search message text or source...">
+        <label class="archive-filter-label"><input type="checkbox" id="archiveUnmatchedOnly"> Unmatched messages only</label>
+        <button class="btn btn-secondary" id="archiveSearchBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Search</button>
+      </div>
+      <table class="data-table" id="archiveTable">
+        <thead><tr><th>Received</th><th>Source</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody id="archiveTableBody"></tbody>
+      </table>
+      <div class="mobile-row-list" id="archiveMobileList"></div>
+      <div id="archiveEmptyState" class="empty-state" style="display:none;">No historical messages match this search.</div>
+      <div class="archive-pagination">
+        <button class="btn btn-secondary" id="archivePrevBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">&larr; Newer</button>
+        <span id="archivePageLabel" class="archive-page-label"></span>
+        <button class="btn btn-secondary" id="archiveNextBtn" style="min-height:30px; padding:5px 10px; font-size:12px;">Older &rarr;</button>
+      </div>
+    </section>
+
+    <!-- ========================================================== ACTIVE -->
+    <section class="screen" id="screen-active">
+      <div class="section-title">Active <span class="count" id="activeCount"></span></div>
+      <div id="whatsappBridgeBanner" class="scope-note"></div>
+      <div id="whatsappPendingSection" style="display:none;">
+        <div class="subsection-label">Incoming WhatsApp update</div>
+        <div id="whatsappPendingList"></div>
+      </div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="activeTable">
+            <thead>
+              <tr><th>Job</th><th>Source</th><th>City</th><th>Service</th><th>Technician</th><th>Stage</th><th>Last update</th><th>Next action</th></tr>
+            </thead>
+            <tbody id="activeTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="activeMobileList"></div>
+        </div>
+        <div class="detail-pane" id="activeDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ======================================================== CLOSINGS -->
+    <section class="screen" id="screen-closings">
+      <div class="section-title">Closings <span class="count" id="closingsCount"></span></div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="closingsTable">
+            <thead>
+              <tr><th>Job</th><th>Company</th><th>Technician</th><th>Amount</th><th>Payment</th><th>Status</th></tr>
+            </thead>
+            <tbody id="closingsTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="closingsMobileList"></div>
+        </div>
+        <div class="detail-pane" id="closingsDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ======================================================== COMPLETED -->
+    <section class="screen" id="screen-history">
+      <div class="section-title">Completed <span class="count" id="historyCount"></span></div>
+      <div class="toolbar">
+        <input type="text" id="historySearch" placeholder="Search ticket / PDL">
+        <select id="historySourceFilter"><option value="All">All sources</option></select>
+        <select id="historyTechFilter"><option value="All">All technicians</option></select>
+        <select id="historyStatusFilter"><option value="All">All statuses</option></select>
+        <input type="date" id="historyDateFrom">
+        <input type="date" id="historyDateTo">
+        <button class="btn btn-secondary" id="historyFilterBtn">Filter</button>
+      </div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="historyTable">
+            <thead><tr><th>Job</th><th>Company</th><th>Technician</th><th>Status</th><th>Completed</th></tr></thead>
+            <tbody id="historyTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="historyMobileList"></div>
+        </div>
+        <div class="detail-pane" id="historyDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ========================================================= REPORTS -->
+    <!-- Hidden from navigation until real settlement fields/rules exist --
+         see docs/technician_reports_requirements.md. Code intentionally
+         kept, not deleted. -->
+    <section class="screen" id="screen-reports">
+      <div class="section-title">Reports</div>
+      <div class="scope-note">Read-only. Only fields recorded in the database are shown -- nothing here is calculated or estimated.</div>
+      <div class="report-table-wrap">
+        <table class="report-table" id="reportTable">
+          <thead>
+            <tr><th>Job</th><th>Company</th><th>Date</th><th>Technician</th><th>Area</th><th>Quoted</th><th>Final</th><th>Payment</th></tr>
+          </thead>
+          <tbody id="reportTableBody"></tbody>
+        </table>
+      </div>
+      <div class="report-mobile-list" id="reportMobileList"></div>
+    </section>
+
+    <!-- ===================================================== TECHNICIANS -->
+    <section class="screen" id="screen-technicians">
+      <div class="section-title">Technicians <span class="count" id="techCount"></span></div>
+      <div id="techMissingBanner" class="review-banner" style="display:none;"></div>
+      <div class="tech-card-grid" id="techCardGrid"></div>
+    </section>
+
+    <!-- ================================================== LEARNING REVIEW -->
+    <section class="screen" id="screen-learning">
+      <div class="section-title">Learning Review</div>
+      <div class="scope-note">Real Shadow episodes only. Shadow Mode is passive -- it observes and records; it never sends anything and never retrains itself automatically.</div>
+      <div id="learningCount" class="info-banner"></div>
+      <div class="split">
+        <div class="list-pane">
+          <table class="data-table" id="learningTable">
+            <thead><tr><th>Job</th><th>Source</th><th>Intent</th><th>Review status</th></tr></thead>
+            <tbody id="learningTableBody"></tbody>
+          </table>
+          <div class="mobile-row-list" id="learningMobileList"></div>
+        </div>
+        <div class="detail-pane" id="learningDetailPane"></div>
+      </div>
+    </section>
+
+    <!-- ===================================================== PERFORMANCE -->
+    <section class="screen" id="screen-performance">
+      <div class="section-title">
+        Performance
+        <select id="perfPeriodSelect" style="min-height:30px; font-size:12px;">
+          <option value="shift">Current shift</option>
+          <option value="24h" selected>Last 24 hours</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+      </div>
+      <div class="scope-note">Read-only. Figures reflect only what's recorded in the database -- low-volume periods will honestly show "Insufficient data" rather than a misleading percentage.</div>
+
+      <div class="perf-summary-grid" id="perfSummaryGrid"></div>
+
+      <div id="perfAttentionSection" style="display:none;">
+        <div class="subsection-label">Attention now</div>
+        <div id="perfAttentionList"></div>
+      </div>
+
+      <div class="subsection-label">Operations</div>
+      <div class="perf-card" id="perfOperationsCard"></div>
+
+      <div class="subsection-label">Technicians</div>
+      <div class="perf-card" id="perfTechniciansCard"></div>
+
+      <div class="subsection-label">Sources</div>
+      <div class="perf-card" id="perfSourcesCard"></div>
+
+      <div class="subsection-label">AI Quality</div>
+      <div class="perf-card" id="perfAiQualityCard"></div>
+
+      <div class="subsection-label">Data Quality</div>
+      <div class="perf-card" id="perfDataQualityCard"></div>
+
+      <div class="subsection-label">Owner summary</div>
+      <div class="perf-card" id="perfBossViewCard"></div>
+    </section>
+
+  </main>
+</div>
+
+<nav class="mobile-bottom-nav" id="mobileBottomNav">
+  <div class="nav-item" data-screen="commandcenter"><span class="nav-icon">&#127968;</span>Today</div>
+  <div class="nav-item" data-screen="jobs"><span class="nav-icon">&#128203;</span>Jobs</div>
+  <div class="nav-item" data-screen="active"><span class="nav-icon">&#9889;</span>Active</div>
+  <div class="nav-item" data-screen="closings"><span class="nav-icon">&#9989;</span>Closings</div>
+  <div class="nav-item" id="mobileMoreNavItem"><span class="nav-icon">&#9776;</span>More</div>
+</nav>
+
+<div class="sheet-backdrop" id="sheetBackdrop"></div>
+<div class="bottom-sheet" id="bottomSheet" style="display:none;">
+  <div class="sheet-handle"></div>
+  <div id="bottomSheetContent"></div>
+</div>
+
+<div class="confirm-modal-backdrop" id="confirmModalBackdrop">
+  <div class="confirm-modal" id="confirmModal"></div>
+</div>
+</div>
+
+<script src="js/api.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
