@@ -37,6 +37,7 @@
     dispatch: [], progress: [], close: [],
     progressStale: [],   // old open jobs, signposted not hidden
     candidates: [],      // WhatsApp jobs understood but not committed
+    candidateReviews: [],// held back by a safety rule; visible, not actionable
     stage: "dispatch",    // which stage owns the phone viewport
     selected: null,       // { col, id }
     detail: null,         // resolved detail payload
@@ -146,10 +147,16 @@
       // an 18-day-old record can never read as today's work.
       state.progressStale = (active.stale || []);
       state.close = (closings.entries || []);
-      // Only the ones the routing rules actually resolved reach the
-      // board; the rest stay in Live Operations as human-review items.
+      // Dispatchable candidates: the routing rules resolved them and no
+      // downstream evidence says they were already sent.
       state.candidates = (wa.candidates || []).filter(
         (c) => c.status === "WAITING FOR HUMAN DISPATCH");
+      // Held back by a SAFETY rule -- a repost after a prior dispatch,
+      // an order that could not be established, or a company that could
+      // not be resolved. These stay visible on purpose: a suppression
+      // the operator cannot see is a decision taken on their behalf
+      // without telling them. They carry no send or copy action.
+      state.candidateReviews = (wa.candidates || []).filter((c) => c.review_reason);
 
       state.failures = 0;
       state.lastGood = new Date();
@@ -411,6 +418,23 @@
     </div>`;
   }
 
+  // A candidate a SAFETY rule held back. Deliberately has NO copy and NO
+  // dispatch control: it is shown so the operator knows the decision was
+  // made and can resolve it, not so they can act on it blind.
+  function reviewCard(c) {
+    return `<div class="card candidate review" data-col="candidate-review" data-id="${esc(c.message_id)}">
+      <div class="card-top">
+        <span class="ticket">${esc(c.ticket || "no ticket")}</span>
+        <span class="cand-tag">WhatsApp</span>
+        <span class="age">${esc(elapsedSince(c.received_at))}</span>
+      </div>
+      <div class="card-line"><b>${esc(c.service || "service not stated")}</b></div>
+      <div class="card-line">${esc(c.source || "source not stated")}</div>
+      <span class="waiting rev">${esc(c.review_reason)}</span>
+      ${c.actual_destination ? `<div class="card-line">Seen at: ${esc(c.actual_destination)}</div>` : ""}
+    </div>`;
+  }
+
   function progressCard(e) {
     const sel = state.selected && state.selected.col === "progress" && state.selected.id === e.id;
     const w = waitingLabel(e);
@@ -475,7 +499,8 @@
      ["hdDispatch", d], ["hdProgress", p], ["hdClose", c],
      ["stDispatch", d], ["stProgress", p], ["stClose", c]]
       .forEach(([id, list]) => { const el = $(id); if (el) el.textContent = list.length; });
-    const dispatchTotal = d.length + (state.candidates || []).length;
+    const dispatchTotal = d.length + (state.candidates || []).length
+      + (state.candidateReviews || []).length;
     ["countDispatch", "hdDispatch", "stDispatch"].forEach((id) => {
       const el = $(id); if (el) el.textContent = dispatchTotal;
     });
@@ -483,9 +508,11 @@
     $("countClose").parentElement.classList.toggle("hot", c.length > 0);
 
     const cands = state.candidates || [];
+    const reviews = state.candidateReviews || [];
     $("listDispatch").innerHTML = (d.length ? d.map(dispatchCard).join("") : "")
       + (cands.length ? cands.map(candidateCard).join("") : "")
-      + (!d.length && !cands.length
+      + (reviews.length ? reviews.map(reviewCard).join("") : "")
+      + (!d.length && !cands.length && !reviews.length
           ? `<div class="empty">Nothing waiting to dispatch.</div>` : "");
     const staleActive = state.progressStale || [];
     $("listProgress").innerHTML = (p.length ? p.map(progressCard).join("") : "")
@@ -654,6 +681,7 @@
   // thumb reaches it. Copy commits nothing; Dispatch is the only button
   // here that changes state, and it stays an explicit labelled tap.
   function detailBar(col, item) {
+    if (col === "candidate-review") return "";   // never actionable
     if (col === "candidate") {
       return item.proposed_message
         ? `<button class="btn primary" data-act="copy-candidate" data-id="${esc(item.message_id)}">Copy message</button>` : "";
@@ -682,6 +710,9 @@
     } else if (col === "progress") {
       item = state.progress.find((e) => String(e.id) === String(id));
       if (item) { html = renderProgressDetail(item); title = item.ticket || "#" + item.id; }
+    } else if (col === "candidate-review") {
+      item = (state.candidateReviews || []).find((c) => c.message_id === id);
+      if (item) { html = renderCandidateDetail(item); title = item.ticket || "Needs review"; }
     } else if (col === "candidate") {
       item = (state.candidates || []).find((c) => c.message_id === id);
       if (item) { html = renderCandidateDetail(item); title = item.ticket || "WhatsApp job"; }

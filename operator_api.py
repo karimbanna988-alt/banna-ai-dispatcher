@@ -102,6 +102,10 @@ DISPATCHER_ACTOR = "dispatcher"
 LIVE_WINDOW_MINUTES = luxor_desk_shared.NEW_JOBS_LIVE_WINDOW_SECONDS // 60  # 60 -- single source of truth
 # What parser.extract_job reports when it cannot identify the company.
 UNRESOLVED_SOURCE = "Unknown"
+# How many WhatsApp candidates the board will show. Applied AFTER parsing,
+# scoping and sequencing so a real job is never pushed out by newer
+# non-job chatter.
+CANDIDATE_WINDOW = 60
 
 # get_live_dispatch_queue()'s "live" bucket is bounded only by the one-time
 # console-activation boundary (console_activation_state.live_queue_started_at,
@@ -2551,129 +2555,347 @@ def route_apprentice_suggestions(handler: "Handler", match: dict, body: dict) ->
         conn.close()
 
 
+def _missing_core_fields(job) -> list:
+    """The core facts a dispatchable job needs. Same four the WhatsApp
+    interpretation layer reports, so the console and the Live Operations
+    feed name the same gaps."""
+    core = {
+        "ticket": job.ticket_number.value,
+        "phone": job.phone.value,
+        "address": job.address.value,
+        "service": job.service_type.value,
+    }
+    return [name for name, value in core.items() if not value]
+
+
 def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> dict:
     """WhatsApp jobs, understood and routed, as TO DISPATCH candidates.
 
-    Runs entirely on already-persisted observations through the existing
-    deterministic path -- interpretation, parser, routing resolution and
-    message formatter are all reused, none reimplemented. No model call,
-    so this keeps working with Claude completely idle.
+    CORRELATION IDENTITY IS (owner-confirmed company, normalized ticket).
+    Nothing else. In particular the parser's `source` ("Main Leads",
+    "AGN", ...) describes the message FORMAT FAMILY; it is not a tenant
+    namespace. Two companies can post in the same format, and letting
+    format stand in for identity would let one company's dispatch
+    suppress another company's genuinely new job.
 
-    Writes nothing. A candidate is a read-model row; it never becomes a
-    `jobs` row here, and only a human acting on it can create one.
+    Order of operations matters and is deliberate:
+      1. parse and normalize (ticket + WhatsApp EVENT time)
+      2. scope by owner-confirmed company
+      3. sequence by event time
+      4. group per (company, ticket) keeping enough chronology to tell an
+         original intake from a repost
+      5. only then apply a display window
+
+    Doing any of these later than this loses real work: windowing before
+    parsing hid job postings behind newer chatter, and deduplicating
+    before sequencing let an older recovered intake replace a newer
+    repost.
+
+    Writes nothing. No model call. A candidate never becomes a job.
     """
     conn = get_conn()
     try:
-        observations = storage.list_whatsapp_pending_observations(conn, include_resolved=False)
-        observations.sort(key=lambda o: o.get("received_at") or "", reverse=True)
-        all_jobs = shared.fetch_jobs(conn)
         vehicle_rules = shared.get_vehicle_rules()
+        all_jobs = shared.fetch_jobs(conn)
+        norm = dispatch_candidates.normalize_ticket
+        all_observations = storage.list_whatsapp_pending_observations(
+            conn, include_resolved=True)
 
-        # Filter to intake groups BEFORE taking the newest N. Technician
-        # groups out-post intake groups by a wide margin, so slicing
-        # first meant the window filled with technician chatter and real
-        # job postings never made it into the candidate list at all.
-        #
-        # Only company intake groups post NEW jobs. Technician groups
-        # carry replies, and IGNORE groups (owner-classified internal
-        # chat, e.g. Trio Dispatch) are excluded from operational routing
-        # entirely.
-        intake = [o for o in observations if o.get("group_role") == "COMPANY_JOB_INTAKE"]
+        # Correlation evidence is allowed to name only ticket identities
+        # deterministically known in the relevant owner-confirmed company
+        # scope. Shape alone cannot distinguish WJFBT (a real all-letter
+        # ticket) from READY (ordinary English).
+        known_tickets_by_company: dict = {}
 
-        # DOWNSTREAM EVIDENCE: which tickets a human has ALREADY forwarded.
+        def remember_known_ticket(company, ticket):
+            company_key, ticket_key = company, norm(ticket)
+            if company_key and ticket_key:
+                known_tickets_by_company.setdefault(company_key, set()).add(ticket_key)
+
+        for persisted_job in all_jobs:
+            remember_known_ticket(persisted_job.get("source"),
+                                  persisted_job.get("ticket_number"))
+
+        for known_obs in all_observations:
+            if (known_obs.get("group_role") != "COMPANY_JOB_INTAKE"
+                    or not known_obs.get("group_mapping_confirmed")
+                    or not known_obs.get("group_company")):
+                continue
+            # The confirmed intake itself is deterministic identity evidence.
+            # Keep every production-shaped label it carries, including a
+            # colonless second ticket the legacy parser intentionally exposes
+            # only as low-confidence metadata. Otherwise the same full text
+            # forwarded downstream can lose its multi-ticket ambiguity and
+            # make the primary, already-forwarded job sendable again.
+            for known_ticket in dispatch_candidates.all_tickets(
+                    known_obs.get("text") or ""):
+                remember_known_ticket(known_obs.get("group_company"), known_ticket)
+
+        known_tickets_any_company = set().union(
+            *known_tickets_by_company.values()) if known_tickets_by_company else set()
+
+        def validated_evidence_tickets(text, company):
+            # With no resolved company, retain only globally known identities
+            # and surface them as ambiguous below; never correlate them to a
+            # tenant. With a company, exact scope is mandatory.
+            known = (known_tickets_by_company.get(company, set())
+                     if company else known_tickets_any_company)
+            return dispatch_candidates.validated_tickets(text, known)
+
+        def forwarded_structure(parsed, tickets) -> bool:
+            # A forwarded job block: a ticket reference plus contact detail.
+            #
+            # The ticket half comes from dispatch_candidates.all_tickets(),
+            # NOT from parsed.ticket_number, because the parser's TICKET_RE
+            # requires a colon. Gating on it skipped "Ticket ABC",
+            # "PDL ABC" and "//Ticket ABC //" before the evidence was ever
+            # examined -- and a skipped forward leaves an already-sent job
+            # looking sendable.
+            return bool(tickets and (parsed.phone.value or parsed.address.value))
+
+        # ---------------- downstream evidence: what was actually sent ----
+        # Company scope comes ONLY from durable owner-confirmed registry
+        # data. It is never inferred from "which intake format happens to
+        # be pending", because that would make one company's identity
+        # depend on another company's traffic.
         #
-        # Without this the board re-offered work that was already sent --
-        # in live traffic the dispatcher forwards an Augusta job to
-        # "Sebai Augusta Dispatch" within ~10 seconds of it landing in
-        # "Augusta - Adam", and every one of those came back as "waiting
-        # for human dispatch". Inviting a duplicate send of work already
-        # on its way is worse than showing nothing.
-        #
-        # Only OWNER-CONFIRMED technician groups count as evidence, and
-        # correlation requires the SAME COMPANY plus the exact ticket --
-        # never timing proximity.
-        #
-        # Scoping by source matters because a bare ticket string is not
-        # unique across companies. The canonical path already knows this:
-        # storage.classify_incoming looks up
-        # `WHERE ticket_number = ? AND source = ?` precisely so that "a
-        # bare ticket_number lookup could match the wrong company's job
-        # if two happened to share the same ticket string". This uses the
-        # same parser-derived source rather than a second normalisation,
-        # and technician-group registry rows carry no company of their
-        # own, so the source comes from the forwarded message itself.
+        # Resolved rows are INCLUDED: ignoring a queue item is an operator
+        # action and must not erase the fact that a job was dispatched.
         dispatched_by_scope: dict = {}
         closings_by_scope: dict = {}
-        unscoped_by_ticket: dict = {}
-        for obs in observations:
+        ambiguous_by_ticket: dict = {}
+
+        def record_evidence(role, ticket_key, company, evidence):
+            if not company:
+                ambiguous_by_ticket.setdefault(ticket_key, []).append(evidence)
+                return
+            bucket = dispatched_by_scope if role == "TECH_DISPATCH" else closings_by_scope
+            bucket.setdefault((company, ticket_key), []).append(evidence)
+
+        for obs in all_observations:
             role = obs.get("group_role")
             if role not in ("TECH_DISPATCH", "TECH_CLOSINGS"):
                 continue
             if not obs.get("group_mapping_confirmed"):
                 continue
-            downstream = extract_job(obs.get("text") or "", vehicle_rules)
-            seen = downstream.ticket_number.value
-            if not seen:
+            text = obs.get("text") or ""
+            parsed = extract_job(text, vehicle_rules)
+            # ONE authority for validated company-scoped ticket evidence.
+            evidence_tickets = validated_evidence_tickets(
+                text, obs.get("group_company"))
+            if not evidence_tickets:
                 continue
-            evidence = {
+            ticket_key = evidence_tickets[0]
+            if role == "TECH_DISPATCH":
+                verdict, _why = dispatch_candidates.classify_dispatch_evidence(
+                    text, forwarded_structure(parsed, evidence_tickets), evidence_tickets)
+                if verdict == dispatch_candidates.AMBIGUOUS:
+                    # Attribution is unclear -- most often a message
+                    # carrying two jobs. EVERY ticket it mentions is
+                    # protected, not just the one the parser happened to
+                    # return, so the second job cannot stay sendable.
+                    for affected in evidence_tickets:
+                        ambiguous_by_ticket.setdefault(affected, []).append({
+                            "group_name": obs.get("group_name"),
+                            "technician": obs.get("group_technician_name"),
+                            "event_at": obs.get("timestamp"),
+                            "received_at": obs.get("received_at"),
+                            "channel": "incoming (ambiguous: %s)" % _why,
+                        })
+                    continue
+                if verdict != dispatch_candidates.POSITIVE_DISPATCH:
+                    continue
+            if role == "TECH_CLOSINGS":
+                # A closing message can cover more than one job. Recording
+                # only the parser's first ticket would leave the others
+                # looking untouched and therefore still sendable, so every
+                # ticket in the message is protected.
+                closing_tickets = evidence_tickets
+                if len(closing_tickets) > 1:
+                    for affected in closing_tickets:
+                        ambiguous_by_ticket.setdefault(affected, []).append({
+                            "group_name": obs.get("group_name"),
+                            "technician": obs.get("group_technician_name"),
+                            "event_at": obs.get("timestamp"),
+                            "received_at": obs.get("received_at"),
+                            "channel": "closing (covers more than one ticket)",
+                        })
+                    continue
+                if not forwarded_structure(parsed, evidence_tickets):
+                    continue
+            record_evidence(role, ticket_key, obs.get("group_company"), {
                 "group_name": obs.get("group_name"),
                 "technician": obs.get("group_technician_name"),
+                # The read model exposes the WhatsApp event time as
+                # "timestamp"; the audit table calls it "whatsapp_timestamp".
+                "event_at": obs.get("timestamp"),
                 "received_at": obs.get("received_at"),
-            }
-            seen_source = downstream.source.value
-            if not seen_source or seen_source == UNRESOLVED_SOURCE:
-                # Same ticket string, unknown company. This cannot prove
-                # the jobs are the same, so it never suppresses -- it
-                # only raises a human review.
-                unscoped_by_ticket.setdefault(seen, []).append(evidence)
-                continue
-            bucket = dispatched_by_scope if role == "TECH_DISPATCH" else closings_by_scope
-            bucket.setdefault((seen_source, seen), []).append(evidence)
+                "channel": "incoming",
+            })
 
-        candidates = []
-        seen_tickets = set()
-        for obs in intake[:40]:
-            interp = _interpret_whatsapp_observation(conn, obs, all_jobs, vehicle_rules)
-            if not str(interp.get("interpretation") or "").startswith(
-                    ("NEW JOB DETECTED", "MESSAGE RECEIVED")):
+        # Messages the owner forwarded BY HAND from the paired account.
+        # Read-only evidence: never an actionable observation, never a
+        # job, never a send. Same predicate as inbound evidence.
+        confirmed_dispatch_groups = {
+            r["group_id"]: r for r in storage.list_group_registry(conn)
+            if r.get("confirmed_by_owner") and r.get("role") == "TECH_DISPATCH"
+        }
+        for sent in storage.list_whatsapp_outgoing_audit(conn):
+            reg = confirmed_dispatch_groups.get(sent.get("group_id"))
+            if reg is None:
                 continue
+            text = sent.get("text") or ""
+            parsed = extract_job(text, vehicle_rules)
+            evidence_tickets = validated_evidence_tickets(text, reg.get("company"))
+            if not evidence_tickets:
+                continue
+            ticket_key = evidence_tickets[0]
+            verdict, why_out = dispatch_candidates.classify_dispatch_evidence(
+                text, forwarded_structure(parsed, evidence_tickets), evidence_tickets)
+            if verdict == dispatch_candidates.AMBIGUOUS:
+                # A hand-sent message covering two jobs proves neither.
+                for affected in evidence_tickets:
+                    ambiguous_by_ticket.setdefault(affected, []).append({
+                        "group_name": sent.get("group_name"),
+                        "technician": (_resolve_registry_technician(conn, reg) or {}).get("name"),
+                        "event_at": sent.get("whatsapp_timestamp"),
+                        "received_at": sent.get("received_at"),
+                        "channel": "outgoing (ambiguous: %s)" % why_out,
+                    })
+                continue
+            if verdict != dispatch_candidates.POSITIVE_DISPATCH:
+                continue
+            record_evidence("TECH_DISPATCH", ticket_key, reg.get("company"), {
+                "group_name": sent.get("group_name"),
+                "technician": (_resolve_registry_technician(conn, reg) or {}).get("name"),
+                "event_at": sent.get("whatsapp_timestamp"),
+                "received_at": sent.get("received_at"),
+                "channel": "outgoing (sent by hand from the paired account)",
+            })
 
+        # ------------------------------- intake: parse and order first ---
+        prepared = []
+        for obs in storage.list_whatsapp_pending_observations(conn, include_resolved=False):
+            if obs.get("group_role") != "COMPANY_JOB_INTAKE":
+                continue
             job = extract_job(obs.get("text") or "", vehicle_rules)
+            prepared.append({
+                "obs": obs,
+                "job": job,
+                "ticket_key": norm(job.ticket_number.value),
+                # Owner-confirmed company identity, or None -> review.
+                "company": obs.get("group_company"),
+                "event_at": obs.get("timestamp"),
+                "order_key": dispatch_candidates.parse_event_time(obs.get("timestamp")),
+            })
 
-            # One candidate per (company, ticket). The same job is often
-            # posted more than once in an intake group (repost,
-            # correction, chase-up) and each repost must not become
-            # another board row -- but two companies sharing a ticket
-            # string are two different jobs and must both survive.
-            ticket = job.ticket_number.value
-            scope = (job.source.value, ticket) if ticket else None
+        # Business sequencing on the WhatsApp event time. Rows whose event
+        # time is unusable are RETAINED (never dropped) and sorted last so
+        # they still surface for review.
+        prepared.sort(key=lambda r: (r["order_key"] is not None, r["order_key"]
+                                     or datetime.min.replace(tzinfo=timezone.utc)),
+                      reverse=True)
+
+        # Keep the NEWEST intake per (company, normalized ticket). Older
+        # intakes for the same job are not re-offered, but the newest one
+        # survives -- an older recovered observation must never replace a
+        # newer repost.
+        # Duplicate intakes for the same (company, ticket) are normal --
+        # original, repost, correction, follow-up. The NEWEST is the one
+        # the operator acts on. But if two of them cannot be ordered
+        # (missing, malformed or identical event times) we cannot tell
+        # which is newest, and silently keeping an arbitrary one could
+        # drop a genuine repost. That is surfaced, not discarded.
+        order_unprovable = set()
+        by_scope: dict = {}
+        for row in prepared:
+            if row["company"] and row["ticket_key"]:
+                by_scope.setdefault((row["company"], row["ticket_key"]), []).append(row)
+        for scope_key, rows in by_scope.items():
+            if len(rows) < 2:
+                continue
+            stamps = [r["order_key"] for r in rows]
+            if any(st is None for st in stamps) or len(set(stamps)) < len(stamps):
+                order_unprovable.add(scope_key)
+
+        seen_scopes = set()
+        candidates = []
+        for row in prepared:
+            scope = (row["company"], row["ticket_key"]) if (row["company"] and row["ticket_key"]) else None
             if scope:
-                if scope in seen_tickets:
+                if scope in seen_scopes:
                     continue
-                seen_tickets.add(scope)
+                seen_scopes.add(scope)
 
+            obs, job = row["obs"], row["job"]
             resolution, eligible, _market = rm.resolve_job_routing(conn, job, obs.get("text") or "")
-            proposed = formatter.format_technician_message(job)
+
+            # An existing canonical job is only THIS job when the
+            # owner-confirmed company matches too. "This ticket already
+            # exists" and "this newer intake can be ignored" are different
+            # statements, and the second one is never made here.
+            correlated_job_id = None
+            if scope:
+                for candidate_job in all_jobs:
+                    if (norm(candidate_job.get("ticket_number")) == row["ticket_key"]
+                            and candidate_job.get("source") == row["company"]):
+                        correlated_job_id = candidate_job.get("id")
+                        break
 
             candidates.append(dispatch_candidates.build_candidate(
                 message_id=obs["message_id"],
                 received_at=obs.get("received_at"),
+                event_at=row["event_at"],
                 group_name=obs.get("group_name"),
                 group_confirmed=bool(obs.get("group_mapping_confirmed")),
-                company=obs.get("group_company") or job.source.value,
+                company=row["company"] or obs.get("group_company"),
                 ticket=job.ticket_number.value,
                 service=job.service_type.value,
                 city=job.city.value,
                 state=job.state.value,
                 canonical_area=resolution.canonical_area,
                 eligible=[{"name": t.get("name"), "dispatch_group": t.get("dispatch_group")} for t in eligible],
-                missing_fields=interp.get("missing_fields") or [],
-                proposed_message=proposed,
-                correlated_job_id=interp.get("existing_job_id"),
+                missing_fields=_missing_core_fields(job),
+                proposed_message=formatter.format_technician_message(job),
+                correlated_job_id=correlated_job_id,
                 dispatched_to=dispatched_by_scope.get(scope) if scope else None,
                 closing_seen_in=closings_by_scope.get(scope) if scope else None,
-                ambiguous_source_matches=unscoped_by_ticket.get(ticket) if ticket else None,
+                ambiguous_source_matches=(ambiguous_by_ticket.get(row["ticket_key"])
+                                          if row["ticket_key"] else None),
+                order_unprovable=(scope in order_unprovable) if scope else False,
             ))
+
+        # Display window LAST, and only INFORMATIONAL rows are ever cut.
+        #
+        # A safety review (repost, unprovable order, unresolved company)
+        # is a decision the operator has to make; letting a flood of
+        # informational "already dispatched" rows push it off the board
+        # would hide exactly what must stay visible. Actionable work is
+        # likewise never trimmed. Ordering is by WhatsApp EVENT time --
+        # ingestion time has no say in what the operator sees first.
+        def newest_first(c):
+            stamp = dispatch_candidates.parse_event_time(c.get("event_at"))
+            return stamp or datetime.min.replace(tzinfo=timezone.utc)
+
+        # A safety hold is always kept. Beyond that, only TICKET-BEARING
+        # rows are real work: ticketless chatter in an intake group is
+        # informational and may be trimmed, otherwise a busy group's small
+        # talk would push genuine jobs off the board.
+        safety = [c for c in candidates if c.get("review_reason")]
+        actionable = [c for c in candidates
+                      if not c.get("review_reason") and c["ticket"]
+                      and c["status"] in (dispatch_candidates.STATUS_WAITING_HUMAN,
+                                          dispatch_candidates.STATUS_HUMAN_REVIEW,
+                                          dispatch_candidates.STATUS_MAPPING_REQUIRED)]
+        informational = [c for c in candidates
+                         if not c.get("review_reason")
+                         and (not c["ticket"]
+                              or c["status"] in (dispatch_candidates.STATUS_ALREADY_DISPATCHED,
+                                                 dispatch_candidates.STATUS_CLOSING_OBSERVED))]
+        for bucket in (safety, actionable, informational):
+            bucket.sort(key=newest_first, reverse=True)
+        room = max(0, CANDIDATE_WINDOW - len(safety) - len(actionable))
+        candidates = safety + actionable + informational[:room]
 
         def count(status):
             return sum(1 for c in candidates if c["status"] == status)
