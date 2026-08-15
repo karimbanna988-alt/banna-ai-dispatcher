@@ -166,3 +166,71 @@ never at risk.
 
 This is why the health bar shows queue depth: a silently growing queue
 is silent data loss.
+
+## Private remote access (Tailscale Serve)
+
+Set up 2026-08-15 so the owner can work from the iPhone over cellular.
+
+```
+iPhone --private tailnet--> HTTPS --> laptop --> 127.0.0.1:8512
+```
+
+**Private HTTPS URL:**
+
+```
+https://laptop-g7s8949k.taild695d8.ts.net/
+```
+
+Reachable **only** from devices signed into the owner's Tailscale
+account. Verified at setup: Serve reports "tailnet only", **Funnel is
+OFF**, the TLS chain validates against the system trust store, the app
+login is still enforced (`/api/live_health` returns 401 unauthenticated),
+and `8513` / `8514` are **not** reachable on the tailnet address — they
+stay loopback-only. No router port was opened and no public tunnel exists.
+
+A useful side effect: Serve sets `X-Forwarded-Proto: https`, which the
+app already honours, so the session cookie now carries `Secure`.
+
+The laptop's tailnet address is `100.120.56.2`. `http://100.120.56.2:8512/`
+also works from tailnet devices (WireGuard-encrypted, still private) and
+is the fallback if the HTTPS name ever misbehaves.
+
+### After a reboot
+
+The Tailscale service starts automatically and the Serve config is
+persisted, so the HTTPS route is **expected** to return on its own —
+confirm rather than assume, with `tailscale serve status`.
+
+**The application does NOT auto-start.** After every reboot:
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts\start_banna_dispatch.ps1
+```
+
+Then give the WhatsApp bridge a minute or two. The wrapper's readiness
+check gives up at 45 seconds and prints "OWNER ACTION REQUIRED —
+WHATSAPP PAIRING", but the bridge frequently needs longer to boot
+Chromium and reconnect. **Wait and re-check before concluding a QR is
+needed** — on 2026-08-15 it reconnected on its own with the existing
+session and no QR was required.
+
+### If the private HTTPS route stops
+
+```bash
+tailscale serve --bg http://127.0.0.1:8512
+```
+
+`tailscale serve status` must report **tailnet only**. If it ever
+mentions Funnel or public access, turn it off immediately:
+
+```bash
+tailscale serve --https=443 off
+```
+
+### Never do this
+
+`tailscale cert <name>` writes a real certificate **and private key**
+into the current directory. It was run once during setup for
+diagnosis and both files were deleted immediately. Serve manages its own
+certificates internally — you do not need that command, and its output
+must never be committed.
