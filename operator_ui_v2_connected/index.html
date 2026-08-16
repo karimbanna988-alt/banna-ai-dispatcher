@@ -8,16 +8,16 @@
 <!-- Phone/PWA. Installable only over HTTPS (or localhost); over plain
      LAN http these are inert but harmless -- see docs/PHONE_DISPATCH_PILOT.md -->
 <link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#0B0E14">
-<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#F4F7FB">
+<meta name="color-scheme" content="light">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Banna">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=3">
+<link rel="stylesheet" href="css/console.css?v=5">
 </head>
 <body>
 
@@ -33,12 +33,25 @@
 
 <div id="app" class="app" hidden>
 
+  <!-- Header. Health lives here as three small dots: when everything is
+       healthy it should read as punctuation, not as a section. -->
   <header class="topbar">
     <div class="brand">
       <span class="brand-product" id="brandProduct">BANNA<span>DISPATCH</span></span>
       <span class="brand-tenant" id="brandTenant">Luxor Locksmith</span>
     </div>
 
+    <div class="topbar-right">
+      <input type="search" id="searchInput" class="search" placeholder="Search ticket, tech, city  ( / )" autocomplete="off">
+      <div class="health" id="health" title="Service health">
+        <span class="dot" id="dotCrm"></span><span class="dot-l">CRM</span>
+        <span class="dot" id="dotAdapter"></span><span class="dot-l">ADP</span>
+        <span class="dot" id="dotWa"></span><span class="dot-l">WA</span>
+      </div>
+    </div>
+
+    <!-- Desktop keeps its dense counter row; the phone uses the stage
+         cards below, so this is hidden there rather than duplicated. -->
     <div class="counts">
       <button class="count" data-jump="dispatch">
         <span class="count-n" id="countDispatch">0</span><span class="count-l">To dispatch</span>
@@ -50,15 +63,6 @@
         <span class="count-n" id="countClose">0</span><span class="count-l">To close</span>
       </button>
     </div>
-
-    <div class="topbar-right">
-      <input type="search" id="searchInput" class="search" placeholder="Search ticket, tech, city  ( / )" autocomplete="off">
-      <div class="health" id="health" title="Service health">
-        <span class="dot" id="dotCrm"></span><span class="dot-l">CRM</span>
-        <span class="dot" id="dotAdapter"></span><span class="dot-l">ADP</span>
-        <span class="dot" id="dotWa"></span><span class="dot-l">WA</span>
-      </div>
-    </div>
   </header>
 
   <!-- Connectivity truth. Never let cached pixels read as live work. -->
@@ -66,77 +70,112 @@
     <b>OFFLINE</b> <span id="offlineDetail">not live &middot; showing last known state</span>
   </div>
 
-  <!-- Phone stage switcher. One tap per stage; only one stage occupies
-       the phone viewport at a time. Hidden on desktop, where all three
-       columns are visible at once. -->
-  <nav class="stages" id="stages">
-    <button class="stage on" data-stage="dispatch">
-      <span class="stage-l">To dispatch</span><span class="stage-n" id="stDispatch">0</span>
-    </button>
-    <button class="stage" data-stage="progress">
-      <span class="stage-l">In progress</span><span class="stage-n" id="stProgress">0</span>
-    </button>
-    <button class="stage" data-stage="close">
-      <span class="stage-l">To close</span><span class="stage-n" id="stClose">0</span>
-    </button>
-  </nav>
+  <!-- ============================ JOBS (default screen) ============ -->
+  <section class="screen on" id="screenJobs" data-screen="jobs">
 
-  <!-- Real health, from real sources. Never decorative. -->
-  <section class="healthbar" id="healthbar">
-    <div class="hb-stats">
-      <span class="hb-stat"><b id="hbLast">--</b><i>last message</i></span>
-      <span class="hb-stat"><b id="hbToday">0</b><i>observations today</i></span>
-      <span class="hb-stat"><b id="hbQueue">--</b><i>queue</i></span>
-      <span class="hb-stat"><b id="hbShadow">--</b><i>shadow</i></span>
-    </div>
-    <button class="hb-toggle" id="liveToggle" aria-expanded="false">Live operations</button>
-    <button class="hb-toggle" id="apprenticeToggle" aria-expanded="false">Apprentice</button>
+    <!-- Phone stage switcher. One tap per stage; only one stage occupies
+         the phone viewport at a time. The selected card carries the blue
+         accent. Hidden on desktop, where all three columns are visible. -->
+    <nav class="stages" id="stages">
+      <button class="stage on" data-stage="dispatch">
+        <span class="stage-n" id="stDispatch">0</span><span class="stage-l">To dispatch</span>
+      </button>
+      <button class="stage" data-stage="progress">
+        <span class="stage-n" id="stProgress">0</span><span class="stage-l">In progress</span>
+      </button>
+      <button class="stage" data-stage="close">
+        <span class="stage-n" id="stClose">0</span><span class="stage-l">To close</span>
+      </button>
+    </nav>
+
+    <div id="searchResults" class="search-results" hidden></div>
+
+    <section class="demo-strip" id="demoStrip" hidden>
+      <div class="demo-head">
+        <span class="demo-tag">DEMO</span>
+        <span id="demoState" class="demo-state"></span>
+        <span class="demo-note">isolated &middot; no production job is created</span>
+      </div>
+      <div class="demo-steps" id="demoSteps"></div>
+    </section>
+
+    <main class="board" id="board" data-stage="dispatch">
+      <section class="col" id="colDispatch" data-col="dispatch">
+        <div class="col-head"><h2>To dispatch</h2><span class="col-count" id="hdDispatch">0</span></div>
+        <div class="col-body" id="listDispatch"></div>
+      </section>
+
+      <section class="col" id="colProgress" data-col="progress">
+        <div class="col-head"><h2>In progress</h2><span class="col-count" id="hdProgress">0</span></div>
+        <div class="col-body" id="listProgress"></div>
+      </section>
+
+      <section class="col" id="colClose" data-col="close">
+        <div class="col-head"><h2>To close</h2><span class="col-count" id="hdClose">0</span></div>
+        <div class="col-body" id="listClose"></div>
+      </section>
+    </main>
   </section>
 
-  <section class="liveops" id="liveops" hidden>
-    <div class="lo-head">
-      <span class="lo-title">LIVE OPERATIONS</span>
-      <span class="lo-note" id="loNote">passive capture &middot; no model required</span>
+  <!-- ============================ LIVE OPERATIONS ================== -->
+  <section class="screen" id="screenLive" data-screen="live" hidden>
+    <div class="screen-head">
+      <h1>Live operations</h1>
+      <span class="screen-note" id="loNote">passive capture &middot; no model required</span>
     </div>
     <div class="lo-body" id="loBody"></div>
   </section>
 
-  <section class="liveops" id="apprentice" hidden>
-    <div class="lo-head">
-      <span class="lo-title">APPRENTICE &mdash; PLAYBOOK SUGGESTIONS</span>
-      <span class="lo-note">read-only &middot; nothing here is active</span>
+  <!-- ============================ APPRENTICE ======================= -->
+  <section class="screen" id="screenApprentice" data-screen="apprentice" hidden>
+    <div class="screen-head">
+      <h1>Apprentice</h1>
+      <span class="screen-note">read-only &middot; nothing here is active</span>
     </div>
     <div class="lo-body" id="apBody"></div>
   </section>
 
-  <div id="searchResults" class="search-results" hidden></div>
-
-  <section class="demo-strip" id="demoStrip" hidden>
-    <div class="demo-head">
-      <span class="demo-tag">DEMO</span>
-      <span id="demoState" class="demo-state"></span>
-      <span class="demo-note">isolated &middot; no production job is created</span>
+  <!-- ============================ TECHNICIANS ====================== -->
+  <section class="screen" id="screenTechs" data-screen="techs" hidden>
+    <div class="screen-head">
+      <h1>Technicians</h1>
+      <span class="screen-note">routing coverage</span>
     </div>
-    <div class="demo-steps" id="demoSteps"></div>
+    <div class="lo-body" id="techBody"></div>
   </section>
 
-  <main class="board" id="board" data-stage="dispatch">
-    <section class="col" id="colDispatch" data-col="dispatch">
-      <div class="col-head"><h2>To dispatch</h2><span class="col-count" id="hdDispatch">0</span></div>
-      <div class="col-body" id="listDispatch"></div>
+  <!-- ============================ MORE / SYSTEM ==================== -->
+  <section class="screen" id="screenMore" data-screen="more" hidden>
+    <div class="screen-head">
+      <h1>System</h1>
+      <span class="screen-note">health &middot; diagnostics &middot; back office</span>
+    </div>
+
+    <!-- Real health, from real sources. Never decorative. -->
+    <section class="healthbar" id="healthbar">
+      <div class="hb-stats">
+        <span class="hb-stat"><b id="hbLast">--</b><i>last message</i></span>
+        <span class="hb-stat"><b id="hbToday">0</b><i>observations today</i></span>
+        <span class="hb-stat"><b id="hbQueue">--</b><i>queue</i></span>
+        <span class="hb-stat"><b id="hbShadow">--</b><i>shadow</i></span>
+      </div>
     </section>
 
-    <section class="col" id="colProgress" data-col="progress">
-      <div class="col-head"><h2>In progress</h2><span class="col-count" id="hdProgress">0</span></div>
-      <div class="col-body" id="listProgress"></div>
-    </section>
+    <div class="lo-body" id="moreBody"></div>
 
-    <section class="col" id="colClose" data-col="close">
-      <div class="col-head"><h2>To close</h2><span class="col-count" id="hdClose">0</span></div>
-      <div class="col-body" id="listClose"></div>
-    </section>
-  </main>
+    <div class="more-actions">
+      <button class="btn ghost" id="adminBtn">&#9881; Admin &mdash; back office</button>
+    </div>
 
+    <footer class="statusbar">
+      <span class="hint">J/K move &middot; Enter open &middot; C copy &middot; Esc close</span>
+      <span class="spacer"></span>
+      <span class="stale" id="staleNote"></span>
+      <span class="updated" id="updatedAt"></span>
+    </footer>
+  </section>
+
+  <!-- Job detail. Full-screen sheet on the phone. -->
   <aside class="detail" id="detail" hidden>
     <div class="detail-head">
       <div id="detailTitle" class="detail-title"></div>
@@ -148,18 +187,54 @@
     <div class="detail-bar" id="detailBar" hidden></div>
   </aside>
 
-  <footer class="statusbar">
-    <button class="admin-btn" id="adminBtn" title="Back office">&#9881; Admin</button>
-    <span class="hint">J/K move &middot; Enter open &middot; C copy &middot; Esc close</span>
-    <span class="spacer"></span>
-    <span class="stale" id="staleNote"></span>
-    <span class="updated" id="updatedAt"></span>
-  </footer>
+  <!-- Fixed bottom navigation. Sits above the home indicator via the
+       safe-area inset, and the screens reserve matching bottom padding
+       so it never covers the last card. -->
+  <nav class="tabbar" id="tabbar">
+    <button class="tab on" data-screen="jobs" aria-label="Jobs">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="7.5" width="18" height="12.5" rx="2.5"></rect>
+        <path d="M9 7.5V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1.5"></path>
+        <path d="M3 12.5h18"></path>
+      </svg>
+      <span class="tab-l">Jobs</span>
+    </button>
+    <button class="tab" data-screen="live" aria-label="Live operations">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <polyline points="2.5 12.5 7 12.5 9.5 6.5 14 17.5 16.5 12.5 21.5 12.5"></polyline>
+      </svg>
+      <span class="tab-l">Live</span>
+    </button>
+    <button class="tab" data-screen="apprentice" aria-label="Apprentice">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9-1.9 4.6-1.9-4.6L5.5 10l4.6-1.9z"></path>
+        <path d="M18 16.5l.8 1.9 1.9.8-1.9.8-.8 1.9-.8-1.9-1.9-.8 1.9-.8z"></path>
+      </svg>
+      <span class="tab-l">Apprentice</span>
+    </button>
+    <button class="tab" data-screen="techs" aria-label="Technicians">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="9" cy="8" r="3.2"></circle>
+        <path d="M3.5 19.5a5.5 5.5 0 0 1 11 0"></path>
+        <path d="M16 5.4a3.2 3.2 0 0 1 0 5.2"></path>
+        <path d="M17.5 14.4a5.5 5.5 0 0 1 3 5.1"></path>
+      </svg>
+      <span class="tab-l">Techs</span>
+    </button>
+    <button class="tab" data-screen="more" aria-label="More">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle class="solid" cx="5.5" cy="12" r="1.5"></circle>
+        <circle class="solid" cx="12" cy="12" r="1.5"></circle>
+        <circle class="solid" cx="18.5" cy="12" r="1.5"></circle>
+      </svg>
+      <span class="tab-l">More</span>
+    </button>
+  </nav>
 
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=3"></script>
-<script src="js/console.js?v=3"></script>
+<script src="js/api.js?v=5"></script>
+<script src="js/console.js?v=5"></script>
 </body>
 </html>

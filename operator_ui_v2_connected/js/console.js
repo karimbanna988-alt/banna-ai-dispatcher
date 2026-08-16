@@ -47,8 +47,9 @@
     failures: 0,          // consecutive failed polls
     offline: false,
     lastGood: null,       // Date of the last successful load
-    liveOpen: false,      // Live Operations panel visibility
-    apprenticeOpen: false,// Apprentice review panel visibility
+    screen: "jobs",       // which bottom-nav screen owns the viewport
+    liveOpen: false,      // Live screen is the visible one
+    apprenticeOpen: false,// Apprentice screen is the visible one
     health: null,         // last /api/live_health payload
   };
 
@@ -61,6 +62,62 @@
     t.textContent = msg; t.hidden = false;
     clearTimeout(toast._t);
     toast._t = setTimeout(() => { t.hidden = true; }, 2200);
+  }
+
+  /* ------------------------------------------------ time formatting --
+     ONE formatter for every visible clock time in this UI. The operator
+     reads 12-hour time, so "21:50" is wrong on their screen -- but this
+     is a DISPLAY concern only. Nothing here touches stored values: the
+     API keeps sending ISO/UTC, ordering and correlation still run on the
+     raw instant, and this function is never in that path. Same instant,
+     same timezone, different rendering.
+
+     Seconds are omitted by default. An operator deciding what to do next
+     does not need them; a debug view asks for them explicitly. */
+  function formatDisplayTime(value, opts) {
+    if (value == null || value === "") return "";
+    const t = value instanceof Date ? value : new Date(value);
+    if (isNaN(t.getTime())) return "";
+    const o = { hour: "numeric", minute: "2-digit", hour12: true };
+    if (opts && opts.seconds) o.second = "2-digit";
+    // en-US pins the AM/PM rendering regardless of device locale, so the
+    // owner never sees a 24-hour clock because of a phone setting.
+    return t.toLocaleTimeString("en-US", o);
+  }
+
+  /* ------------------------------------------------- display labels --
+     The backend speaks in enums, and it should keep doing so -- they are
+     stable identifiers that tests, correlation and the API all depend
+     on. But "NEXT: HUMAN_REVIEW_NEEDED" is not a sentence an operator
+     should have to decode mid-shift.
+
+     This maps machine values to human wording for DISPLAY ONLY. Nothing
+     here is ever sent back, compared, or stored: an unmapped value falls
+     through unchanged, so a new backend state degrades to its raw name
+     rather than vanishing from the screen. */
+  const DISPLAY_LABELS = {
+    "HUMAN_REVIEW_NEEDED": "Needs human review",
+    "COMPANY UNRESOLVED": "Company needs confirmation",
+    "ORDER UNDETERMINED": "Message order unclear",
+    "REPOST": "Posted again after dispatch",
+    "GROUP MAPPING REQUIRED": "Group not mapped yet",
+    "WAITING FOR HUMAN DISPATCH": "Ready to dispatch",
+    "ALREADY DISPATCHED": "Already dispatched",
+    "REPOST AFTER PRIOR DISPATCH": "Posted again after dispatch",
+    "CLOSING OBSERVED": "Closing seen",
+    "MAPPING_REQUIRED": "Group not mapped yet",
+  };
+
+  function displayLabel(value) {
+    if (value == null || value === "") return "";
+    const raw = String(value);
+    if (DISPLAY_LABELS[raw]) return DISPLAY_LABELS[raw];
+    const upper = raw.toUpperCase();
+    if (DISPLAY_LABELS[upper]) return DISPLAY_LABELS[upper];
+    // Unknown machine value: make it readable without inventing meaning.
+    return /^[A-Z0-9_ ]+$/.test(raw)
+      ? raw.charAt(0) + raw.slice(1).toLowerCase().replace(/_/g, " ")
+      : raw;
   }
 
   function age(mins) {
@@ -117,7 +174,7 @@
     $("board").classList.toggle("stale", on);
     if (on) {
       const since = state.lastGood
-        ? "last live " + state.lastGood.toLocaleTimeString() : "never reached the server";
+        ? "last live " + formatDisplayTime(state.lastGood) : "never reached the server";
       $("offlineDetail").textContent = `not live · ${since}${why ? " · " + why : ""}`;
     }
   }
@@ -164,7 +221,7 @@
 
       render();
       loadDemo();
-      $("updatedAt").textContent = state.lastGood.toLocaleTimeString();
+      $("updatedAt").textContent = formatDisplayTime(state.lastGood);
     } catch (e) {
       if (e.authRequired) return showLogin();
       state.failures += 1;
@@ -243,6 +300,7 @@
       $("hbQueue").className = q.depth == null ? "warnv" : (q.depth === 0 ? "" : "badv");
 
       $("hbShadow").textContent = h.shadow_mode || "--";
+      if (state.screen === "more") renderMore();
     } catch (e) {
       if (e.authRequired) return showLogin();
       $("dotCrm").className = "dot down";
@@ -268,13 +326,17 @@
     try {
       const r = await Api.getLiveFeed();
       const events = (r && r.events) || [];
+      // Compact by default: time, type, one line of substance. The
+      // reasoning ("why") is real operational evidence and is kept, but
+      // it waits behind a tap instead of burying the stream in prose.
       $("loBody").innerHTML = events.length ? events.map((ev) => `
-        <div class="lo-ev lo-${esc((ev.type || "").toLowerCase().replace(/\s+/g, "-"))}">
-          <span class="lo-t">${esc(clockOf(ev.time))}</span>
-          <span class="lo-type">${esc(ev.type)}</span>
-          <span class="lo-title">${esc(ev.title)}</span>
-          ${ev.confidence ? `<span class="lo-conf">${esc(ev.confidence)}</span>` : ""}
-          ${ev.needs_human ? `<span class="lo-needs">needs you</span>` : ""}
+        <div class="lo-ev lo-${esc((ev.type || "").toLowerCase().replace(/\s+/g, "-"))}${
+             ev.needs_human ? " needs" : ""}" data-ev="1">
+          <span class="lo-t">${esc(formatDisplayTime(ev.time))}</span>
+          <span class="lo-type">${esc(ev.needs_human ? "Needs you" : displayLabel(ev.type))}</span>
+          <span class="lo-title">${esc(displayLabel(ev.title))}</span>
+          ${ev.subtitle ? `<span class="lo-sub">${esc(displayLabel(ev.subtitle))}</span>` : ""}
+          ${ev.confidence ? `<span class="lo-conf">${esc(displayLabel(ev.confidence))}</span>` : ""}
           ${(ev.why || []).length ? `<div class="lo-why">${
             ev.why.map((w) => `<span>${esc(w)}</span>`).join("")}</div>` : ""}
         </div>`).join("")
@@ -283,12 +345,6 @@
       if (e.authRequired) return showLogin();
       $("loBody").innerHTML = `<div class="empty">Live feed unavailable: ${esc(e.message)}</div>`;
     }
-  }
-
-  function clockOf(iso) {
-    if (!iso) return "";
-    const t = new Date(iso);
-    return isNaN(t.getTime()) ? "" : t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
 
   // Apprentice review. READ-ONLY by construction: there is no approve
@@ -300,22 +356,35 @@
     try {
       const r = await Api.getApprenticeSuggestions();
       const list = (r && r.suggestions) || [];
+      // READ-ONLY by construction: no approve control exists here and no
+      // endpoint would accept one. The explanation lives behind VIEW
+      // EVIDENCE so the card stays scannable -- repeating the same
+      // paragraph on every card trains the owner to stop reading it.
       $("apBody").innerHTML = list.length ? list.map((s) => `
-        <div class="ap-card ap-${esc(String(s.confidence || "").toLowerCase())}">
+        <div class="ap-card ap-${esc(String(s.confidence || "").toLowerCase())}" data-ap="1">
           <div class="ap-top">
             <span class="ap-status">${esc(s.status)}</span>
             <span class="ap-conf">${esc(s.confidence)}</span>
           </div>
           <div class="ap-rule">
             ${esc(s.source || "?")} &middot; ${esc(s.area || "any area")} &middot;
-            ${esc(s.service || "any service")} &rarr; <b>${esc(s.destination)}</b>
+            ${esc(s.service || "any service")}
+            <div><span class="ap-arrow">&rarr;</span> <b>${esc(s.destination)}</b></div>
           </div>
           <div class="ap-ev">
-            ${esc(s.evidence.distinct_tickets)} tickets &middot;
+            ${esc(s.evidence.distinct_tickets)} jobs &middot;
             ${esc(s.evidence.distinct_days)} days &middot;
             ${esc(s.conflicts)} conflicts
           </div>
-          ${(s.notes || []).map((n) => `<div class="ap-note">${esc(n)}</div>`).join("")}
+          <div class="ap-evidence">
+            ${(s.notes || []).map((n) => `<div class="ap-note">${esc(n)}</div>`).join("")}
+            <div class="ap-note">Nothing here is active. This is a pattern Banna
+              noticed in traffic you already handled &mdash; it changes no routing
+              rule until you say so somewhere else.</div>
+          </div>
+          <div class="card-actions">
+            <button class="btn ghost" data-act="ap-evidence">View evidence</button>
+          </div>
         </div>`).join("")
         : `<div class="empty">No pattern has enough evidence yet. That is the correct
              result for thin evidence &mdash; one example never makes a rule.</div>`;
@@ -325,20 +394,81 @@
     }
   }
 
-  function toggleApprentice() {
-    state.apprenticeOpen = !state.apprenticeOpen;
-    $("apprentice").hidden = !state.apprenticeOpen;
-    $("apprenticeToggle").setAttribute("aria-expanded", String(state.apprenticeOpen));
-    $("apprenticeToggle").classList.toggle("on", state.apprenticeOpen);
-    if (state.apprenticeOpen) loadApprentice();
+  // Technicians. Routing coverage, read from the same /api/technicians
+  // the back office uses -- this screen states who can take work where,
+  // and nothing here changes an assignment.
+  async function loadTechs() {
+    if (state.screen !== "techs") return;
+    try {
+      const r = await Api.getTechnicians();
+      const list = (r && (r.technicians || r.entries)) || [];
+      $("techBody").innerHTML = list.length ? list.map((t) => `
+        <div class="tech-card">
+          <div class="tech-name">${esc(t.name || "unnamed")}</div>
+          <div class="tech-meta">${esc((t.areas || []).join(", ") || "no area set")}</div>
+          ${t.skills && t.skills.length ? `<div class="tech-meta">${esc(t.skills.join(", "))}</div>` : ""}
+          ${t.dispatch_group ? `<div class="tech-meta">${esc(t.dispatch_group)}</div>` : ""}
+          <div class="tech-meta">${esc(techState(t))}</div>
+        </div>`).join("")
+        : `<div class="empty">No technicians configured.</div>`;
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("techBody").innerHTML = `<div class="empty">Technicians unavailable: ${esc(e.message)}</div>`;
+    }
   }
 
-  function toggleLive() {
-    state.liveOpen = !state.liveOpen;
-    $("liveops").hidden = !state.liveOpen;
-    $("liveToggle").setAttribute("aria-expanded", String(state.liveOpen));
-    $("liveToggle").classList.toggle("on", state.liveOpen);
-    if (state.liveOpen) loadLive();
+  // Availability is only ever reported when the read model actually
+  // states it. "Unknown" is the honest answer for a technician whose
+  // status nobody has recorded -- inventing "Available" here would put a
+  // job on someone who never said they could take it.
+  function techState(t) {
+    if (t.is_active === false) return "Inactive";
+    const open = t.open_jobs != null ? t.open_jobs
+      : (t.active_jobs != null ? t.active_jobs : null);
+    if (open != null) return open === 0 ? "No open jobs" : open + " open job" + (open === 1 ? "" : "s");
+    if (t.status) return displayLabel(t.status);
+    return "Availability unknown";
+  }
+
+  // System screen. Diagnostics belong here, off the working board.
+  function renderMore() {
+    const h = state.health || {};
+    const rows = [
+      ["CRM", (h.crm || {}).detail],
+      ["Adapter", (h.adapter || {}).detail],
+      ["WhatsApp", (h.whatsapp || {}).detail],
+      ["Database", (h.database || {}).integrity],
+      ["FK violations", (h.database || {}).foreign_key_violations],
+    ].filter(([, v]) => v != null && v !== "");
+    $("moreBody").innerHTML = rows.length
+      ? `<div class="tech-card">${rows.map(([k, v]) =>
+          `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join("")}</div>`
+      : `<div class="empty">Health not reported yet.</div>`;
+  }
+
+  /* ------------------------------------------------ bottom navigation --
+     Jobs is home. Live Operations and Apprentice are their own screens:
+     mixing them into the board is what made the phone unreadable, because
+     telemetry always out-volumes the two or three jobs that actually
+     need a decision. */
+  function setScreen(name) {
+    if (!name) return;
+    state.screen = name;
+    const map = { jobs: "screenJobs", live: "screenLive", apprentice: "screenApprentice",
+                  techs: "screenTechs", more: "screenMore" };
+    Object.keys(map).forEach((k) => {
+      const el = $(map[k]);
+      if (el) { el.hidden = k !== name; el.classList.toggle("on", k === name); }
+    });
+    document.querySelectorAll(".tab").forEach((b) =>
+      b.classList.toggle("on", b.getAttribute("data-screen") === name));
+    state.liveOpen = name === "live";
+    state.apprenticeOpen = name === "apprentice";
+    if (name === "live") loadLive();
+    if (name === "apprentice") loadApprentice();
+    if (name === "techs") loadTechs();
+    if (name === "more") renderMore();
+    window.scrollTo(0, 0);
   }
 
   /* ---------------------------------------------------- rendering -- */
@@ -366,19 +496,20 @@
     return u.raw_message || u.update_type || "";
   }
 
-  function dispatchCard(j) {
+  function dispatchCard(j, isNext) {
     const sel = state.selected && state.selected.col === "dispatch" && state.selected.id === j.message_id;
     const review = j.needs_review || (j.review_problems && j.review_problems.length);
-    const cls = ["card", sel ? "sel" : "", review ? "review" : "", ageClass(j.age_minutes) === "bad" ? "urgent" : ""].join(" ");
+    const cls = ["card", isNext ? "next" : "", sel ? "sel" : "", review ? "review" : "",
+                 ageClass(j.age_minutes) === "bad" ? "urgent" : ""].join(" ");
     const tech = j.technician_name || (j.eligible_count ? j.eligible_count + " eligible" : "no match");
     return `<div class="${cls}" data-col="dispatch" data-id="${esc(j.message_id)}">
       <div class="card-top">
-        <span class="ticket">${esc(j.ticket || "no ticket")}</span>
+        <span class="card-company">${esc(j.source || "source not stated")}</span>
         <span class="age ${ageClass(j.age_minutes)}">${age(j.age_minutes)}</span>
       </div>
-      <div class="card-line"><b>${esc(j.service || "service not stated")}</b></div>
-      <div class="card-line">${esc(j.source || "source not stated")}</div>
+      <div class="card-title">${esc(j.service || "service not stated")}</div>
       <div class="card-line">${esc([j.city, j.state].filter(Boolean).join(", ") || "location not stated")}</div>
+      <div class="card-line"><span class="ticket">${esc(j.ticket || "no ticket")}</span></div>
       <div class="rec ${j.technician_name ? "" : "none"}">
         <span class="rec-l">Recommended</span>
         <span class="rec-v">${esc(tech)}</span>
@@ -396,22 +527,22 @@
   // belongs to a committed Quo message and there is none here. The
   // operator copies the prepared message and sends it themselves, which
   // is exactly the human-controlled step this product is built around.
-  function candidateCard(c) {
-    return `<div class="card candidate" data-col="candidate" data-id="${esc(c.message_id)}">
+  function candidateCard(c, isNext) {
+    return `<div class="card candidate${isNext ? " next" : ""}" data-col="candidate" data-id="${esc(c.message_id)}">
       <div class="card-top">
-        <span class="ticket">${esc(c.ticket || "no ticket")}</span>
+        <span class="card-company">${esc(c.source || "source not stated")}</span>
         <span class="cand-tag">WhatsApp</span>
         <span class="age">${esc(elapsedSince(c.received_at))}</span>
       </div>
-      <div class="card-line"><b>${esc(c.service || "service not stated")}</b></div>
-      <div class="card-line">${esc(c.source || "source not stated")}</div>
+      <div class="card-title">${esc(c.service || "service not stated")}</div>
       <div class="card-line">${esc([c.city, c.state].filter(Boolean).join(", ") || "location not stated")}</div>
+      <div class="card-line"><span class="ticket">${esc(c.ticket || "no ticket")}</span></div>
       <div class="rec">
         <span class="rec-l">Recommended</span>
         <span class="rec-v">${esc(c.recommended)}</span>
         ${confidenceChip(c.confidence)}
       </div>
-      <span class="waiting act">${esc(c.status)}</span>
+      <span class="waiting act">${esc(displayLabel(c.status))}</span>
       <div class="card-actions">
         <button class="btn primary" data-act="copy-candidate" data-id="${esc(c.message_id)}">Copy message</button>
       </div>
@@ -424,14 +555,16 @@
   function reviewCard(c) {
     return `<div class="card candidate review" data-col="candidate-review" data-id="${esc(c.message_id)}">
       <div class="card-top">
-        <span class="ticket">${esc(c.ticket || "no ticket")}</span>
-        <span class="cand-tag">WhatsApp</span>
+        <span class="card-company">Needs you</span>
         <span class="age">${esc(elapsedSince(c.received_at))}</span>
       </div>
-      <div class="card-line"><b>${esc(c.service || "service not stated")}</b></div>
-      <div class="card-line">${esc(c.source || "source not stated")}</div>
-      <span class="waiting rev">${esc(c.review_reason)}</span>
+      <div class="card-title">${esc(displayLabel(c.review_reason))}</div>
+      <div class="card-line">${esc([c.city, c.state].filter(Boolean).join(", ") || "location not stated")}</div>
+      <div class="card-line"><span class="ticket">${esc(c.ticket || "no ticket")}</span></div>
       ${c.actual_destination ? `<div class="card-line">Seen at: ${esc(c.actual_destination)}</div>` : ""}
+      <div class="card-actions">
+        <button class="btn ghost" data-act="review" data-id="${esc(c.message_id)}">Review</button>
+      </div>
     </div>`;
   }
 
@@ -448,7 +581,7 @@
       <div class="card-line">Tech: <b>${esc(e.technician_name || "unassigned")}</b></div>
       <div class="card-line">${esc(e.city || "")} ${esc(e.description ? "· " + e.description : "")}</div>
       ${lastUpdateText(e) ? `<div class="card-line">Last: ${esc(lastUpdateText(e))}</div>` : ""}
-      <span class="waiting ${w.c}">${esc(w.t)}</span>
+      <span class="waiting ${w.c}">${esc(displayLabel(w.t))}</span>
     </div>`;
   }
 
@@ -509,11 +642,35 @@
 
     const cands = state.candidates || [];
     const reviews = state.candidateReviews || [];
-    $("listDispatch").innerHTML = (d.length ? d.map(dispatchCard).join("") : "")
-      + (cands.length ? cands.map(candidateCard).join("") : "")
-      + (reviews.length ? reviews.map(reviewCard).join("") : "")
-      + (!d.length && !cands.length && !reviews.length
-          ? `<div class="empty">Nothing waiting to dispatch.</div>` : "");
+
+    // THE OPERATING LINE. The actionable queue is taken in the order the
+    // backend already returned -- committed jobs first, then understood
+    // WhatsApp candidates -- and the FIRST one is promoted to NEXT
+    // ACTION. No sorting, no scoring, no new priority rule: the same
+    // list, shown so the next move is unmissable.
+    const actionable = [].concat(
+      d.map((j) => ({ kind: "dispatch", item: j })),
+      cands.map((c) => ({ kind: "candidate", item: c })));
+    const cardFor = (row, isNext) => row.kind === "dispatch"
+      ? dispatchCard(row.item, isNext) : candidateCard(row.item, isNext);
+
+    let html = "";
+    if (actionable.length) {
+      html += `<div class="flow-h next">Next action</div>`
+        + cardFor(actionable[0], true);
+      if (actionable.length > 1) {
+        html += `<div class="flow-h flow-up">Up next</div>`
+          + actionable.slice(1).map((r) => cardFor(r, false)).join("");
+      }
+    }
+    if (reviews.length) {
+      html += `<div class="flow-h flow-up">Needs you</div>`
+        + reviews.map(reviewCard).join("");
+    }
+    if (!actionable.length && !reviews.length) {
+      html = `<div class="empty">No jobs need action right now.</div>`;
+    }
+    $("listDispatch").innerHTML = html;
     const staleActive = state.progressStale || [];
     $("listProgress").innerHTML = (p.length ? p.map(progressCard).join("") : "")
       + (staleActive.length ? `<div class="stale-note">
@@ -674,6 +831,33 @@
       <div class="sec">
         <div class="sec-h">Proposed technician message</div>
         <div class="msgbox" id="msgBox">${esc(c.proposed_message || "")}</div>
+      </div>
+      ${timelineSection(c)}`;
+  }
+
+  // Operational trace. Real, and kept -- but collapsed, because it is
+  // evidence for a question the operator only sometimes asks. Times are
+  // rendered by the one shared 12-hour formatter.
+  function timelineSection(item) {
+    const rows = [
+      ["Received", item.received_at, item.group_name],
+      ["Event time", item.event_at, "as sent in WhatsApp"],
+      ["Parsed", item.received_at, [item.service, item.city].filter(Boolean).join(" · ")],
+      ["Correlated", item.event_at, item.ticket ? item.ticket + (item.confidence ? " · " + item.confidence : "") : ""],
+      ["Routing", item.event_at, item.recommended || "no technician matched"],
+    ].filter((r) => r[1]);
+    if (!rows.length) return "";
+    return `
+      <div class="sec">
+        <details class="timeline">
+          <summary>Timeline</summary>
+          ${rows.map(([label, t, detail]) => `
+            <div class="tl-row">
+              <span class="tl-t">${esc(formatDisplayTime(t))}</span>
+              <span class="tl-type">${esc(label)}</span>
+              ${detail ? `<span class="tl-d">${esc(detail)}</span>` : ""}
+            </div>`).join("")}
+        </details>
       </div>`;
   }
 
@@ -805,7 +989,22 @@
         return box ? copy(box.textContent, "Message") : null;
       }
       if (act === "admin-job") { window.location.href = "admin.html"; return; }
+      // A safety hold opens its detail. It is deliberately NOT a send,
+      // NOT a copy, and NOT a dispatch -- the operator is being shown the
+      // decision, not handed a way around it.
+      if (act === "review") {
+        return openDetail("candidate-review", actEl.getAttribute("data-id"));
+      }
+      if (act === "ap-evidence") {
+        const card = actEl.closest(".ap-card");
+        if (card) card.classList.toggle("open");
+        return;
+      }
     }
+    const tabEl = ev.target.closest(".tab");
+    if (tabEl) return setScreen(tabEl.getAttribute("data-screen"));
+    const evEl = ev.target.closest("[data-ev]");
+    if (evEl) { evEl.classList.toggle("open"); return; }
     const card = ev.target.closest(".card");
     if (card) return openDetail(card.getAttribute("data-col"), card.getAttribute("data-id"));
   }
@@ -878,6 +1077,7 @@
     $("loginScreen").hidden = true;
     $("app").hidden = false;
     setStage(state.stage);
+    setScreen(state.screen);
     load(); health();
     setInterval(load, POLL_MS);
     setInterval(health, 15000);
@@ -912,10 +1112,8 @@
   $("detailClose").addEventListener("click", closeDetail);
   $("adminBtn").addEventListener("click", () => { window.location.href = "admin.html"; });
   $("searchInput").addEventListener("input", onSearch);
-  $("liveToggle").addEventListener("click", toggleLive);
-  $("apprenticeToggle").addEventListener("click", toggleApprentice);
   document.querySelectorAll("[data-jump]").forEach((b) =>
-    b.addEventListener("click", () => setStage(b.getAttribute("data-jump"))));
+    b.addEventListener("click", () => { setScreen("jobs"); setStage(b.getAttribute("data-jump")); }));
 
   registerServiceWorker();
   Api.checkSession().then(showApp).catch(showLogin);

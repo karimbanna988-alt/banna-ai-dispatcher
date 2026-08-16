@@ -23,13 +23,13 @@
 /* Bump SHELL_VERSION and the ?v= query in index.html together. The URLs
    below must match what index.html actually requests, query string
    included, or the cache-first branch silently misses every time. */
-const SHELL_VERSION = "banna-shell-v3";
+const SHELL_VERSION = "banna-shell-v5";
 
 const SHELL_ASSETS = [
   "/index.html",
-  "/css/console.css?v=3",
-  "/js/console.js?v=3",
-  "/js/api.js?v=3",
+  "/css/console.css?v=5",
+  "/js/console.js?v=5",
+  "/js/api.js?v=5",
   "/manifest.webmanifest",
   "/icons/icon-192.png",
   "/icons/icon-512.png",

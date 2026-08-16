@@ -147,11 +147,23 @@ def test_console_escapes_dynamic_values(console_js):
 
 
 # ---------------------------------------------------------- visual ----
-def test_console_uses_the_specified_dark_operations_palette():
+def test_console_uses_the_light_operations_palette():
+    """The console is a WHITE operations product, not a developer
+    console. The dark telemetry palette this replaced made every screen
+    read as equally urgent, which is the opposite of what a phone-first
+    board needs.
+
+    Colour has to stay meaningful: blue is the active stage and the one
+    primary action, amber is a decision the operator owes, red is an
+    actual fault, purple is Apprentice."""
     css = CONSOLE_CSS.read_text(encoding="utf-8")
-    for colour in ("#0B0E14", "#111827", "#F1F5F9", "#94A3B8"):
-        assert colour in css, f"missing specified colour {colour}"
-    assert "#00D4FF" in css or "#00BFFF" in css
+    assert "--surface:   #FFFFFF" in css, "cards must be white"
+    assert "color-scheme" not in css or "dark" not in css.split("color-scheme")[-1][:40]
+    for token in ("--blue:", "--green:", "--amber:", "--red:", "--purple:"):
+        assert token in css, f"missing semantic colour token {token}"
+    # The neon accents of the old console must be gone.
+    for neon in ("#00D4FF", "#00BFFF", "#0B0E14"):
+        assert neon not in css, f"cyberpunk accent {neon} survived the redesign"
 
 
 def test_console_is_responsive_for_mobile():
