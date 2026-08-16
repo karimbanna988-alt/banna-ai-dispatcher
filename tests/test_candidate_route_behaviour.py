@@ -40,7 +40,22 @@ JOB_BLOCK = ("Power By Ucallz App\n\n{company_label}\nTicket: {ticket}\n"
 
 
 def job_text(ticket, company_label="Joy Locksmith"):
+    """A Mike Jobs posting by default: the block carries the exact
+    owner-confirmed marker "Joy Locksmith"."""
     return JOB_BLOCK.format(ticket=ticket, company_label=company_label)
+
+
+def unlabelled_text(ticket):
+    """A posting carrying NO company marker. The format alone
+    ("Power By Ucallz App", a Ticket: field) is deliberately not company
+    proof, so this is what a genuinely unidentifiable job looks like."""
+    return job_text(ticket, company_label="")
+
+
+def lucky_text(ticket):
+    """The SAME ticket string posted by a competitor. The marker is what
+    makes it Lucky's -- not the group, not the format."""
+    return job_text(ticket, company_label="Co: LUCKY LOCKSMITH LLC")
 
 
 @pytest.fixture
@@ -108,29 +123,29 @@ def find(cands, ticket):
 
 # ===================================================== TEST 1 ==========
 def test_1_cross_company_collision_does_not_suppress(env):
-    """Company A and Company B both post the same ticket in the same message
+    """Mike Jobs and Lucky both post the same ticket in the same message
     FORMAT. A's dispatch must not suppress B's genuinely new job."""
-    group(env, "a-intake@g.us", "A intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "b-intake@g.us", "B intake", "COMPANY_JOB_INTAKE", company="Company B")
-    group(env, "a-disp@g.us", "A dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "a-intake@g.us", "A intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "b-intake@g.us", "Lucky intake", "COMPANY_JOB_INTAKE", company="Lucky")
+    group(env, "a-disp@g.us", "A dispatch", "TECH_DISPATCH", company="Mike Jobs")
 
     observe(env, "a-in", "a-intake@g.us", job_text("CMPA1"), NOW - timedelta(minutes=30))
     observe(env, "a-sent", "a-disp@g.us", job_text("CMPA1"), NOW - timedelta(minutes=29))
-    observe(env, "b-in", "b-intake@g.us", job_text("CMPA1"), NOW - timedelta(minutes=5))
+    observe(env, "b-in", "b-intake@g.us", lucky_text("CMPA1"), NOW - timedelta(minutes=5))
 
     cands = candidates(env)
     b = [c for c in cands if c["message_id"] == "b-in"][0]
     a = [c for c in cands if c["message_id"] == "a-in"][0]
     assert a["status"] == dc.STATUS_ALREADY_DISPATCHED, "A really was dispatched"
     assert b["status"] != dc.STATUS_ALREADY_DISPATCHED, (
-        "Company B's job must not be suppressed by Company A's dispatch")
+        "Lucky's job must not be suppressed by Mike's dispatch")
     assert b["status"] in (dc.STATUS_WAITING_HUMAN, dc.STATUS_HUMAN_REVIEW)
 
 
 # ===================================================== TEST 2 ==========
 def test_2_ticket_normalization_is_case_insensitive(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("ab123"), NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", job_text("AB123"), NOW - timedelta(minutes=9))
 
@@ -141,7 +156,7 @@ def test_2_ticket_normalization_is_case_insensitive(env):
 
 
 def test_2b_case_difference_does_not_create_a_duplicate_row(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     observe(env, "in1", "intake@g.us", job_text("ab123"), NOW - timedelta(minutes=10))
     observe(env, "in2", "intake@g.us", job_text("AB123"), NOW - timedelta(minutes=5))
     matching = [c for c in candidates(env)
@@ -153,8 +168,8 @@ def test_2b_case_difference_does_not_create_a_duplicate_row(env):
 def test_3_existing_canonical_job_does_not_hide_a_repost(env):
     """A prior dispatch plus a NEWER intake is a repost that a human must
     see -- not something to discard because the ticket already exists."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in-old", "intake@g.us", job_text("RPOST"), NOW - timedelta(days=1, minutes=5))
     observe(env, "sent", "disp@g.us", job_text("RPOST"), NOW - timedelta(days=1))
     observe(env, "in-new", "intake@g.us", job_text("RPOST"), NOW - timedelta(minutes=2))
@@ -171,8 +186,8 @@ def test_3_existing_canonical_job_does_not_hide_a_repost(env):
 def test_4_persistence_order_inverted_against_event_order(env):
     """Ingest the NEWER repost first and the OLDER dispatch second, so
     SQLite order is the opposite of WhatsApp order."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
 
     # persisted FIRST, but happened LAST
     observe(env, "in-new", "intake@g.us", job_text("EVNT4"),
@@ -190,7 +205,7 @@ def test_4_persistence_order_inverted_against_event_order(env):
 def test_5_real_work_is_not_pushed_out_by_newer_chatter(env):
     """Volume of non-job traffic must not evict a real job from the
     board -- windowing happens after parsing and sequencing."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     observe(env, "real-job", "intake@g.us", job_text("T5"), NOW - timedelta(hours=3))
     for i in range(80):
         observe(env, f"chat-{i}", "intake@g.us", f"ok thanks {i}",
@@ -204,8 +219,8 @@ def test_5_real_work_is_not_pushed_out_by_newer_chatter(env):
 def test_6_resolving_the_queue_item_does_not_re_offer_the_job(env):
     """Ignoring the technician-group observation is a QUEUE action. The
     durable fact that the job was dispatched must survive it."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("DURB6"), NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", job_text("DURB6"), NOW - timedelta(minutes=9), resolved=True)
 
@@ -219,8 +234,8 @@ def test_6_resolving_the_queue_item_does_not_re_offer_the_job(env):
 def test_7_manual_outgoing_dispatch_counts_as_evidence(env):
     """A job the owner forwarded by hand from the paired account never
     becomes an inbound observation, but it is still real dispatch."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("MANL7"), NOW - timedelta(minutes=10))
 
     conn = storage.connect(env)
@@ -240,8 +255,8 @@ def test_7_manual_outgoing_dispatch_counts_as_evidence(env):
 def test_8_a_structured_decline_is_not_dispatch_proof(env, reply):
     """A full job block quoted back with a refusal underneath means the
     job was NOT taken."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T8"), NOW - timedelta(minutes=10))
     observe(env, "decline", "disp@g.us", job_text("T8") + "\n" + reply,
             NOW - timedelta(minutes=9))
@@ -254,8 +269,8 @@ def test_8_a_structured_decline_is_not_dispatch_proof(env, reply):
 # ===================================================== TEST 9 ==========
 @pytest.mark.parametrize("reply", ["20 min", "no answer", "quoted 195", "on my way"])
 def test_9_a_structured_update_is_not_initial_dispatch_proof(env, reply):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T10"), NOW - timedelta(minutes=10))
     # A technician's status is their own utterance, written clear of the
     # forwarded block. Wording tucked directly under a field line is the
@@ -271,8 +286,8 @@ def test_9b_a_real_job_description_is_not_mistaken_for_an_update(env):
     """REGRESSION from live data: a customer wrote "he needs the storage
     open in the next hour and a half". That matched the ETA pattern and
     rejected genuine dispatch evidence, re-offering a job already sent."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     wordy = job_text("WORD1") + "\nhe needs the storage open in the next hour and a half please"
     observe(env, "in", "intake@g.us", wordy, NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", wordy, NOW - timedelta(minutes=9))
@@ -290,10 +305,10 @@ def test_10_unconfirmed_company_fails_conservatively(env):
     """A technician group with no owner-confirmed company cannot identify
     whose job it carried. It must not suppress, and it must not leave the
     intake looking freely dispatchable either."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company=None)
     observe(env, "in", "intake@g.us", job_text("NUL12"), NOW - timedelta(minutes=10))
-    observe(env, "sent", "disp@g.us", job_text("NUL12"), NOW - timedelta(minutes=9))
+    observe(env, "sent", "disp@g.us", unlabelled_text("NUL12"), NOW - timedelta(minutes=9))
 
     c = find(candidates(env), "NUL12")
     assert c["status"] == dc.STATUS_HUMAN_REVIEW
@@ -305,7 +320,7 @@ def test_10b_an_unconfirmed_intake_group_never_routes(env):
     conn = storage.connect(env)
     storage.upsert_group_registry_entry(conn, {
         "group_id": "unconf@g.us", "exact_name": "unconfirmed", "role": "COMPANY_JOB_INTAKE",
-        "company": "Company A", "service_area": "Augusta", "technician_id": None,
+        "company": "Mike Jobs", "service_area": "Augusta", "technician_id": None,
         "technician_name_unconfirmed": None, "is_active": True,
         "confirmed_by_owner": False, "source": "name_heuristic", "notes": None,
     })
@@ -317,8 +332,8 @@ def test_10b_an_unconfirmed_intake_group_never_routes(env):
 
 # =================================================== invariants ========
 def test_no_held_back_candidate_is_ever_sendable(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T14"), NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", job_text("T14"), NOW - timedelta(minutes=9))
     for c in candidates(env):
@@ -327,7 +342,7 @@ def test_no_held_back_candidate_is_ever_sendable(env):
 
 
 def test_the_route_creates_no_canonical_state(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T15"), NOW - timedelta(minutes=5))
 
     conn = storage.connect(env)
@@ -351,8 +366,8 @@ def test_the_route_creates_no_canonical_state(env):
 def test_an_ignore_group_is_never_dispatch_evidence(env):
     """Trio Dispatch is internal dispatcher chat. Even if a job block is
     pasted there, it proves nothing about dispatch."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "internal@g.us", "internal chat", "IGNORE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "internal@g.us", "internal chat", "IGNORE", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T20"), NOW - timedelta(minutes=10))
     observe(env, "pasted", "internal@g.us", job_text("T20"), NOW - timedelta(minutes=9))
 
@@ -362,14 +377,14 @@ def test_an_ignore_group_is_never_dispatch_evidence(env):
 
 
 def test_an_ignore_group_produces_no_candidate_of_its_own(env):
-    group(env, "internal@g.us", "internal chat", "IGNORE", company="Company A")
+    group(env, "internal@g.us", "internal chat", "IGNORE", company="Mike Jobs")
     observe(env, "chat", "internal@g.us", job_text("T21"), NOW - timedelta(minutes=5))
     assert find(candidates(env), "T21") is None
 
 
 def test_a_closing_group_sighting_is_not_a_dispatch(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("CLOS2"), NOW - timedelta(minutes=10))
     observe(env, "closing", "clos@g.us", job_text("CLOS2"), NOW - timedelta(minutes=9))
 
@@ -381,7 +396,7 @@ def test_a_closing_group_sighting_is_not_a_dispatch(env):
 def test_an_ignored_intake_does_not_appear_as_actionable_work(env):
     """Queue resolution still governs the ACTIONABLE list, even though it
     no longer erases dispatch evidence."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("T23"), NOW - timedelta(minutes=5), resolved=True)
     assert find(candidates(env), "T23") is None
 
@@ -390,7 +405,7 @@ def test_a_real_job_survives_a_flood_of_newer_jobs_too(env):
     """The window is applied after sequencing, and ticket-bearing work is
     ordered ahead of chatter -- but volume of real jobs is bounded by
     real work, so the newest must still be present."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     for i in range(70):
         observe(env, f"j{i}", "intake@g.us", job_text(f"BULK{i}"),
                 NOW - timedelta(minutes=70 - i))
@@ -406,7 +421,7 @@ def test_a1_confirmed_intake_without_a_company_is_never_sendable(env):
     """Company identity is the correlation namespace. Without it nothing
     can be checked against a prior dispatch, so nothing may be sent."""
     group(env, "nocompany@g.us", "intake no company", "COMPANY_JOB_INTAKE", company=None)
-    observe(env, "in", "nocompany@g.us", job_text("A1"), NOW - timedelta(minutes=5))
+    observe(env, "in", "nocompany@g.us", unlabelled_text("A1"), NOW - timedelta(minutes=5))
 
     c = find(candidates(env), "A1")
     assert c is not None, "the job must still be visible"
@@ -417,8 +432,8 @@ def test_a1_confirmed_intake_without_a_company_is_never_sendable(env):
 
 def test_a2_a_safety_review_survives_a_flood_of_informational_rows(env):
     """A repost must not be windowed away by 60+ already-dispatched rows."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
 
     observe(env, "old-sent", "disp@g.us", job_text("KEEP1"), NOW - timedelta(days=2))
     observe(env, "repost", "intake@g.us", job_text("KEEP1"), NOW - timedelta(days=1))
@@ -438,7 +453,7 @@ def test_a2_a_safety_review_survives_a_flood_of_informational_rows(env):
 def test_a3_duplicate_intakes_with_unprovable_order_are_reviewed(env):
     """Two intakes for the same job at the SAME instant: which is the
     repost cannot be known, so neither is offered as sendable."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     same = NOW - timedelta(minutes=10)
     observe(env, "d1", "intake@g.us", job_text("A3"), same)
     observe(env, "d2", "intake@g.us", job_text("A3"), same)
@@ -452,7 +467,7 @@ def test_a3_duplicate_intakes_with_unprovable_order_are_reviewed(env):
 def test_a4_event_time_beats_reversed_ingestion_at_final_selection(env):
     """Ingestion order reversed against event order, checked at the FINAL
     window rather than only inside correlation."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     observe(env, "newest-event", "intake@g.us", job_text("A4NEW"),
             event_at=NOW - timedelta(minutes=1), received_at=NOW - timedelta(days=3))
     observe(env, "oldest-event", "intake@g.us", job_text("A4OLD"),
@@ -466,8 +481,8 @@ def test_a4_event_time_beats_reversed_ingestion_at_final_selection(env):
 def test_a5_multi_ticket_outgoing_evidence_protects_every_ticket(env):
     """A hand-sent message covering two jobs proves neither. The SECOND
     ticket must not stay freely sendable."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in1", "intake@g.us", job_text("A5ONE"), NOW - timedelta(minutes=20))
     observe(env, "in2", "intake@g.us", job_text("A5TWO"), NOW - timedelta(minutes=19))
 
@@ -490,8 +505,8 @@ def test_a5_multi_ticket_outgoing_evidence_protects_every_ticket(env):
 def test_a6_customer_wording_inside_a_field_does_not_veto_dispatch(env):
     """POSITIVE CONTROL. Customer availability wording is job content,
     not a technician refusal."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     # The spec's case: the wording lives INSIDE a customer/job field.
     text = job_text("CUST6").replace("Desc: Car lockout",
                                   "Desc: Car lockout - customer not available until 3 PM")
@@ -505,8 +520,8 @@ def test_a6_customer_wording_inside_a_field_does_not_veto_dispatch(env):
 
 def test_a7_a_long_technician_update_is_not_dispatch_proof(env):
     """No length rule: this is long, and still a technician status."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("A7"), NOW - timedelta(minutes=10))
     observe(env, "upd", "disp@g.us",
             job_text("A7") + "\n\nI am 45 minutes away from the customer",
@@ -517,8 +532,8 @@ def test_a7_a_long_technician_update_is_not_dispatch_proof(env):
 
 
 def test_a8_mixed_job_and_unrelated_status_is_ambiguous(env):
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("A8"), NOW - timedelta(minutes=10))
     observe(env, "mixed", "disp@g.us",
             job_text("A8") + "\n\nTicket: OTHER99\nwants an ETA",
@@ -532,8 +547,8 @@ def test_a8_mixed_job_and_unrelated_status_is_ambiguous(env):
 def test_a9_a_clean_single_ticket_forward_still_works(env):
     """POSITIVE CONTROL. Real dispatch must still be recognised -- a
     repair that reviews everything is a broken repair."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("POS09"), NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", job_text("POS09"), NOW - timedelta(minutes=9))
 
@@ -545,8 +560,8 @@ def test_a9_a_clean_single_ticket_forward_still_works(env):
 def test_a9b_an_undispatched_job_is_still_offered(env):
     """POSITIVE CONTROL. Nothing has been sent, so the operator must be
     able to send it."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("A9B"), NOW - timedelta(minutes=5))
 
     c = find(candidates(env), "A9B")
@@ -573,8 +588,8 @@ def agn_text(ticket):
 def test_b1_multi_ticket_closing_protects_every_ticket(env):
     """A closing covering two jobs must not leave the second one looking
     untouched and therefore still sendable."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Mike Jobs")
     observe(env, "in1", "intake@g.us", job_text("B1ONE"), NOW - timedelta(minutes=30))
     observe(env, "in2", "intake@g.us", job_text("B1TWO"), NOW - timedelta(minutes=29))
     observe(env, "closing", "clos@g.us",
@@ -591,8 +606,8 @@ def test_b1_multi_ticket_closing_protects_every_ticket(env):
 
 def test_b1_a_single_ticket_closing_still_reads_as_a_closing(env):
     """POSITIVE CONTROL for blocker 1."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "clos@g.us", "closings", "TECH_CLOSINGS", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("SOLO1"), NOW - timedelta(minutes=20))
     observe(env, "closing", "clos@g.us", job_text("SOLO1"), NOW - timedelta(minutes=5))
 
@@ -608,8 +623,8 @@ def test_b2a_agn_ref_header_is_not_a_second_ticket(env):
     assert dc.count_tickets(agn_text("ZN6YF")) == 1
     assert dc.all_tickets(agn_text("ZN6YF")) == ["ZN6YF"]
 
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="AGN")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="AGN")
     observe(env, "in", "intake@g.us", agn_text("ZN6YF"), NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", agn_text("ZN6YF"), NOW - timedelta(minutes=9))
 
@@ -623,8 +638,8 @@ def test_b2b_two_real_agn_tickets_are_still_multi_ticket(env):
     assert dc.count_tickets(two) == 2
     assert set(dc.all_tickets(two)) == {"ZN6YF", "QQ7RT"}
 
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="AGN")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="AGN")
     observe(env, "in1", "intake@g.us", agn_text("ZN6YF"), NOW - timedelta(minutes=30))
     observe(env, "in2", "intake@g.us", agn_text("QQ7RT"), NOW - timedelta(minutes=29))
     observe(env, "sent", "disp@g.us", two, NOW - timedelta(minutes=5))
@@ -652,8 +667,8 @@ INLINE_UPDATES = ["20 min", "30 min", "45 minutes", "on my way", "eta 20",
 def test_b3_inline_update_without_a_blank_line_is_not_dispatch(env, reply):
     """A technician status typed straight under the block, with NO blank
     separator, must not read as a completed dispatch."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     observe(env, "in", "intake@g.us", job_text("B3"), NOW - timedelta(minutes=10))
     observe(env, "reply", "disp@g.us", job_text("B3") + "\n" + reply,
             NOW - timedelta(minutes=9))
@@ -667,8 +682,8 @@ def test_b3_customer_prose_on_the_same_line_shape_is_still_a_dispatch(env):
     """POSITIVE CONTROL, from real production wording. Structurally the
     same position as the updates above, but it names concrete things --
     storage, open, needs -- so it is job description, not an ETA."""
-    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Company A")
-    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Company A")
+    group(env, "intake@g.us", "intake", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    group(env, "disp@g.us", "dispatch", "TECH_DISPATCH", company="Mike Jobs")
     text = job_text("B3POS") + "\nhe needs the storage open in the next hour"
     observe(env, "in", "intake@g.us", text, NOW - timedelta(minutes=10))
     observe(env, "sent", "disp@g.us", text, NOW - timedelta(minutes=9))
@@ -704,11 +719,11 @@ def routed(env):
         dispatch_group="Sebai Augusta Dispatch", closing_group="Sebai augusta closing",
     )
     conn.close()
-    group(env, "intake@g.us", "Augusta - Adam", "COMPANY_JOB_INTAKE", company="Company A")
+    group(env, "intake@g.us", "Augusta - Adam", "COMPANY_JOB_INTAKE", company="Mike Jobs")
     group(env, "disp@g.us", "Sebai Augusta Dispatch", "TECH_DISPATCH",
-          company="Company A", technician_id=tech_id)
+          company="Mike Jobs", technician_id=tech_id)
     group(env, "clos@g.us", "Sebai augusta closing", "TECH_CLOSINGS",
-          company="Company A", technician_id=tech_id)
+          company="Mike Jobs", technician_id=tech_id)
     return env
 
 
@@ -800,11 +815,11 @@ def test_second_ticket_present_in_confirmed_intake_stays_ambiguous_downstream(ro
 
 def test_known_ticket_is_still_scoped_by_company(routed):
     ticket = "WJFBT"
-    group(routed, "b-intake@g.us", "Company B intake", "COMPANY_JOB_INTAKE",
-          company="Company B")
+    group(routed, "b-intake@g.us", "Lucky intake", "COMPANY_JOB_INTAKE",
+          company="Lucky")
     observe(routed, "a-in", "intake@g.us", job_text(ticket),
             NOW - timedelta(minutes=10))
-    observe(routed, "b-in", "b-intake@g.us", job_text(ticket),
+    observe(routed, "b-in", "b-intake@g.us", lucky_text(ticket),
             NOW - timedelta(minutes=8))
     outgoing(routed, "a-out", job_text(ticket), NOW - timedelta(minutes=9))
 
@@ -942,3 +957,242 @@ def test_one_extractor_is_the_authority_for_the_route():
     assert "dispatch_candidates.validated_tickets" in source
     assert "norm(parsed.ticket_number.value)" not in source, (
         "evidence gating must not use the colon-requiring parser regex")
+
+
+# ================= PER-MESSAGE COMPANY RESOLVER (route level) ==========
+# These use the REAL owner-confirmed group ids, because the allowlist is
+# keyed by exact id and nothing else: not technician name, not area, not
+# group-name similarity.
+
+SEBAI_DISPATCH = "120363424227833077@g.us"
+SEBAI_CLOSING = "120363426584048614@g.us"
+MIXED_DISPATCH = "120363555000111222@g.us"      # deliberately NOT allowlisted
+
+
+@pytest.fixture
+def mike(env):
+    """A Mike Jobs intake plus a technician who can actually take the work."""
+    conn = storage.connect(env)
+    tech_id = storage.add_technician(
+        conn, name="Sebai", areas=["Augusta"], skills=[], vehicle_restrictions=[],
+        dispatch_group="Sebai Augusta Dispatch", closing_group="Sebai augusta closing")
+    conn.close()
+    group(env, "intake@g.us", "Adam - Greenville", "COMPANY_JOB_INTAKE", company="Mike Jobs")
+    return env, tech_id
+
+
+# ------------------------------------------------------------- 15, 20 --
+def test_r15_allowlisted_group_is_single_company_evidence(mike):
+    """The owner-confirmed Sebai group carries only Mike work, so a
+    forward there is Mike evidence even with no marker in the text."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("SEB01"), NOW - timedelta(minutes=10))
+    observe(env, "sent", SEBAI_DISPATCH, unlabelled_text("SEB01"), NOW - timedelta(minutes=9))
+
+    c = find(candidates(env), "SEB01")
+    assert c["status"] == dc.STATUS_ALREADY_DISPATCHED
+    assert c["proposed_message"] is None
+
+
+def test_r20_previously_dispatched_mike_work_stays_non_sendable(mike):
+    """Regression: today's real Sebai traffic must keep behaving."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("SEB02"), NOW - timedelta(minutes=20))
+    observe(env, "sent", SEBAI_DISPATCH, job_text("SEB02"), NOW - timedelta(minutes=19))
+
+    c = find(candidates(env), "SEB02")
+    assert c["status"] == dc.STATUS_ALREADY_DISPATCHED
+    assert c["proposed_message"] is None
+
+
+# ----------------------------------------------------------------- 16 --
+def test_r16_static_company_on_unlisted_group_is_not_trusted(mike):
+    """A technician group carrying a static company value the owner has
+    NOT confirmed as single-company may not claim the dispatch. Those
+    groups demonstrably carry more than one company's work, and trusting
+    them is how one company's forward suppresses another's job."""
+    env, tech_id = mike
+    group(env, MIXED_DISPATCH, "Fares Virginia Beach Dispatch", "TECH_DISPATCH",
+          company="Mike Jobs", technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("MIX01"), NOW - timedelta(minutes=20))
+    observe(env, "sent", MIXED_DISPATCH, unlabelled_text("MIX01"), NOW - timedelta(minutes=19))
+
+    c = find(candidates(env), "MIX01")
+    assert c["status"] != dc.STATUS_ALREADY_DISPATCHED
+    # Not merely "no evidence": the sighting WAS recorded, as unattributable.
+    assert c["review_reason"] == dc.REVIEW_COMPANY_UNRESOLVED
+    assert c["proposed_message"] is None
+
+
+# ----------------------------------------------------------------- 18 --
+def test_r18_mixed_group_resolves_each_message_on_its_own_marker(mike):
+    """Same untrusted destination, three companies, one ticket string."""
+    env, tech_id = mike
+    group(env, "agn-intake@g.us", "AGN intake", "COMPANY_JOB_INTAKE", company="AGN")
+    group(env, "lucky-intake@g.us", "Lucky intake", "COMPANY_JOB_INTAKE", company="Lucky")
+    group(env, MIXED_DISPATCH, "Kimo Alabama Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+
+    observe(env, "mike-in", "intake@g.us", job_text("SHARE"), NOW - timedelta(minutes=40))
+    observe(env, "agn-in", "agn-intake@g.us", agn_text("SHARE"), NOW - timedelta(minutes=39))
+    observe(env, "lucky-in", "lucky-intake@g.us", lucky_text("SHARE"), NOW - timedelta(minutes=38))
+    # Only MIKE's copy is forwarded.
+    observe(env, "sent", MIXED_DISPATCH, job_text("SHARE"), NOW - timedelta(minutes=30))
+
+    rows = [c for c in candidates(env) if c["ticket"] == "SHARE"]
+    by_company = {c["source"]: c for c in rows}
+    assert by_company["Mike Jobs"]["status"] == dc.STATUS_ALREADY_DISPATCHED
+    for competitor in ("AGN", "Lucky"):
+        assert by_company[competitor]["status"] != dc.STATUS_ALREADY_DISPATCHED, (
+            "%s's job must not be suppressed by Mike's forward" % competitor)
+
+
+def test_r18b_unlabelled_message_in_a_mixed_group_is_review(mike):
+    env, tech_id = mike
+    group(env, MIXED_DISPATCH, "Tarek Columbia Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("UNL01"), NOW - timedelta(minutes=20))
+    observe(env, "sent", MIXED_DISPATCH, unlabelled_text("UNL01"), NOW - timedelta(minutes=19))
+
+    c = find(candidates(env), "UNL01")
+    assert c["review_reason"] == dc.REVIEW_COMPANY_UNRESOLVED
+    assert c["proposed_message"] is None
+
+
+# ------------------------------------------------------------- 19, 21 --
+def test_r19_competitor_marker_inside_a_mike_group_is_not_forced_either_way(mike):
+    """13 real messages do exactly this. Neither the group nor the marker
+    may win: the operator decides."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("CONF1"), NOW - timedelta(minutes=20))
+    observe(env, "sent", SEBAI_DISPATCH, agn_text("CONF1"), NOW - timedelta(minutes=19))
+
+    c = find(candidates(env), "CONF1")
+    assert c["status"] != dc.STATUS_ALREADY_DISPATCHED, (
+        "a conflicted sighting must not be claimed as Mike's dispatch")
+    # The conflict is surfaced, not silently dropped.
+    assert c["review_reason"] == dc.REVIEW_COMPANY_UNRESOLVED
+    assert c["proposed_message"] is None
+
+
+def test_r21_lucky_job_is_not_suppressed_by_a_mike_confirmed_group(mike):
+    """A Lucky-marked message sitting in Sebai history is conflicted, so
+    it can neither be read as Mike's nor suppress Lucky's own job."""
+    env, tech_id = mike
+    group(env, "lucky-intake@g.us", "Lucky intake", "COMPANY_JOB_INTAKE", company="Lucky")
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "lucky-in", "lucky-intake@g.us", lucky_text("LUK01"), NOW - timedelta(minutes=20))
+    observe(env, "sent", SEBAI_DISPATCH, lucky_text("LUK01"), NOW - timedelta(minutes=19))
+
+    c = find(candidates(env), "LUK01")
+    assert c["source"] == "Lucky"
+    assert c["status"] != dc.STATUS_ALREADY_DISPATCHED
+
+
+# ----------------------------------------------------------------- 22 --
+def test_r22_a_genuinely_new_job_is_still_actionable(mike):
+    """POSITIVE CONTROL. If this ever fails, every "not sendable"
+    assertion above is passing for the wrong reason."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("NEW01"), NOW - timedelta(minutes=3))
+
+    c = find(candidates(env), "NEW01")
+    assert c["status"] == dc.STATUS_WAITING_HUMAN
+    assert c["recommended"] == "Sebai"
+    assert c["proposed_message"], "an undispatched eligible job must be actionable"
+
+
+# ------------------------------------------------------------- 24-26 --
+def test_r24_26_the_projection_writes_nothing(mike):
+    """No send, no job, no status mutation -- the route is a projection."""
+    env, _tech = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH", company=None)
+    observe(env, "in", "intake@g.us", job_text("RO001"), NOW - timedelta(minutes=5))
+
+    def snapshot():
+        conn = storage.connect(env)
+        try:
+            return (
+                conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM whatsapp_outgoing_audit").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM whatsapp_pending_observations").fetchone()[0],
+                conn.execute("SELECT group_concat(COALESCE(status, '')) FROM jobs").fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    before = snapshot()
+    assert candidates(env) is not None
+    assert snapshot() == before, "the candidate projection must not write anything"
+
+
+# ============ RE-REVIEW BLOCKER 1: no fail-open fallback ==============
+def test_r_no_group_company_fallback_for_a_conflicted_item(mike):
+    """Mike intake + AGN marker + Mike-allowlisted destination.
+
+    The resolver returns UNRESOLVED because the signals conflict. Nothing
+    downstream may quietly restore the group's static company: that would
+    hand back the identity the resolver just refused to grant and make a
+    conflicted item sendable."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company="Mike Jobs", technician_id=tech_id)
+    conflicted = job_text("FALL1") + "\nRef: AGN Locksmith Services"
+    observe(env, "in", "intake@g.us", conflicted, NOW - timedelta(minutes=5))
+
+    c = find(candidates(env), "FALL1")
+    assert c is not None, "the job must stay visible"
+    assert c["status"] == dc.STATUS_HUMAN_REVIEW
+    assert c["status"] != dc.STATUS_WAITING_HUMAN
+    assert c["review_reason"] == dc.REVIEW_COMPANY_UNRESOLVED
+    assert c["proposed_message"] is None
+    # "source" is a DISPLAY field (company or group name). With no resolved
+    # company it must fall back to the group name -- never to the company
+    # the resolver just refused to grant.
+    assert c["source"] != "Mike Jobs", (
+        "a conflicted item must not be relabelled with the group's company")
+
+
+def test_r_clean_mike_observation_still_resolves(mike):
+    """POSITIVE CONTROL for the same path."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company="Mike Jobs", technician_id=tech_id)
+    observe(env, "in", "intake@g.us", job_text("CLEAN1"), NOW - timedelta(minutes=5))
+
+    c = find(candidates(env), "CLEAN1")
+    assert c["source"] == "Mike Jobs"
+    assert c["status"] == dc.STATUS_WAITING_HUMAN
+    assert c["proposed_message"], "clean deterministic evidence must stay actionable"
+
+
+def test_r_corrupt_linked_parent_stays_in_human_review(mike):
+    """Blocker 3 through the real route."""
+    env, tech_id = mike
+    group(env, SEBAI_DISPATCH, "Sebai Augusta Dispatch", "TECH_DISPATCH",
+          company=None, technician_id=tech_id)
+    observe(env, "parent", "intake@g.us", job_text("CORR1"), NOW - timedelta(minutes=20))
+    conn = storage.connect(env)
+    conn.execute("UPDATE whatsapp_pending_observations SET job_id=999 WHERE message_id='parent'")
+    conn.commit()
+    conn.close()
+    observe(env, "child", "intake@g.us", job_text("CORR2"), NOW - timedelta(minutes=10),
+            )
+    conn = storage.connect(env)
+    conn.execute("UPDATE whatsapp_pending_observations "
+                 "SET quoted_message_id='parent' WHERE message_id='child'")
+    conn.commit()
+    conn.close()
+
+    c = find(candidates(env), "CORR2")
+    assert c["review_reason"] == dc.REVIEW_COMPANY_UNRESOLVED
+    assert c["proposed_message"] is None

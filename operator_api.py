@@ -79,6 +79,7 @@ from dispatcher import branding  # noqa: E402
 from dispatcher import live_feed  # noqa: E402
 from dispatcher import apprentice  # noqa: E402
 from dispatcher import dispatch_candidates  # noqa: E402
+from dispatcher import company_resolver  # noqa: E402
 from dispatcher import formatter  # noqa: E402
 from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
@@ -2600,6 +2601,30 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         norm = dispatch_candidates.normalize_ticket
         all_observations = storage.list_whatsapp_pending_observations(
             conn, include_resolved=True)
+        registry_rows = storage.list_group_registry(conn)
+        outgoing_audit = storage.list_whatsapp_outgoing_audit(conn)
+
+        # Company identity is decided PER MESSAGE, not per group. Several
+        # technician groups carry work for more than one company, so a
+        # destination cannot name the company unless the owner confirmed
+        # that exact group as single-company -- and even then an explicit
+        # competitor marker in the text produces a conflict rather than
+        # being overruled. One context, built once: every resolution below
+        # is an index hit, never a query.
+        resolver_context = company_resolver.ResolverContext(
+            registry_rows=registry_rows,
+            observations=all_observations,
+            outgoing_audit=outgoing_audit,
+            jobs=all_jobs,
+            normalize_ticket=dispatch_candidates.normalize_ticket,
+        )
+
+        def company_of(observation):
+            """Resolved company, or None when signals are missing or
+            disagree. None always means human review -- never a guess and
+            never a sendable message."""
+            return company_resolver.resolve_company(
+                observation, resolver_context)["company"]
 
         # Correlation evidence is allowed to name only ticket identities
         # deterministically known in the relevant owner-confirmed company
@@ -2613,13 +2638,19 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 known_tickets_by_company.setdefault(company_key, set()).add(ticket_key)
 
         for persisted_job in all_jobs:
-            remember_known_ticket(persisted_job.get("source"),
-                                  persisted_job.get("ticket_number"))
+            # jobs.source is a parser FORMAT name ("Main Leads"); the
+            # company it belongs to is only knowable through the persisted
+            # job itself, which is exactly the link being followed here.
+            remember_known_ticket(
+                company_resolver.company_for_job_source(persisted_job.get("source")),
+                persisted_job.get("ticket_number"))
 
         for known_obs in all_observations:
             if (known_obs.get("group_role") != "COMPANY_JOB_INTAKE"
-                    or not known_obs.get("group_mapping_confirmed")
-                    or not known_obs.get("group_company")):
+                    or not known_obs.get("group_mapping_confirmed")):
+                continue
+            intake_company = company_of(known_obs)
+            if not intake_company:
                 continue
             # The confirmed intake itself is deterministic identity evidence.
             # Keep every production-shaped label it carries, including a
@@ -2629,7 +2660,7 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
             # make the primary, already-forwarded job sendable again.
             for known_ticket in dispatch_candidates.all_tickets(
                     known_obs.get("text") or ""):
-                remember_known_ticket(known_obs.get("group_company"), known_ticket)
+                remember_known_ticket(intake_company, known_ticket)
 
         known_tickets_any_company = set().union(
             *known_tickets_by_company.values()) if known_tickets_by_company else set()
@@ -2680,9 +2711,12 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 continue
             text = obs.get("text") or ""
             parsed = extract_job(text, vehicle_rules)
+            # Whose work this message is about, decided from THIS message.
+            # A mixed technician group yields a different answer per
+            # message, and a conflicted one yields None -> ambiguous.
+            evidence_company = company_of(obs)
             # ONE authority for validated company-scoped ticket evidence.
-            evidence_tickets = validated_evidence_tickets(
-                text, obs.get("group_company"))
+            evidence_tickets = validated_evidence_tickets(text, evidence_company)
             if not evidence_tickets:
                 continue
             ticket_key = evidence_tickets[0]
@@ -2723,7 +2757,7 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                     continue
                 if not forwarded_structure(parsed, evidence_tickets):
                     continue
-            record_evidence(role, ticket_key, obs.get("group_company"), {
+            record_evidence(role, ticket_key, evidence_company, {
                 "group_name": obs.get("group_name"),
                 "technician": obs.get("group_technician_name"),
                 # The read model exposes the WhatsApp event time as
@@ -2737,16 +2771,20 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         # Read-only evidence: never an actionable observation, never a
         # job, never a send. Same predicate as inbound evidence.
         confirmed_dispatch_groups = {
-            r["group_id"]: r for r in storage.list_group_registry(conn)
+            r["group_id"]: r for r in registry_rows
             if r.get("confirmed_by_owner") and r.get("role") == "TECH_DISPATCH"
         }
-        for sent in storage.list_whatsapp_outgoing_audit(conn):
+        for sent in outgoing_audit:
             reg = confirmed_dispatch_groups.get(sent.get("group_id"))
             if reg is None:
                 continue
             text = sent.get("text") or ""
             parsed = extract_job(text, vehicle_rules)
-            evidence_tickets = validated_evidence_tickets(text, reg.get("company"))
+            # Resolved from the sent message itself, on the same terms as
+            # inbound evidence -- the registry row proves the destination
+            # is a confirmed dispatch group, not whose job was sent.
+            sent_company = company_of(sent)
+            evidence_tickets = validated_evidence_tickets(text, sent_company)
             if not evidence_tickets:
                 continue
             ticket_key = evidence_tickets[0]
@@ -2765,7 +2803,7 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 continue
             if verdict != dispatch_candidates.POSITIVE_DISPATCH:
                 continue
-            record_evidence("TECH_DISPATCH", ticket_key, reg.get("company"), {
+            record_evidence("TECH_DISPATCH", ticket_key, sent_company, {
                 "group_name": sent.get("group_name"),
                 "technician": (_resolve_registry_technician(conn, reg) or {}).get("name"),
                 "event_at": sent.get("whatsapp_timestamp"),
@@ -2783,8 +2821,8 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 "obs": obs,
                 "job": job,
                 "ticket_key": norm(job.ticket_number.value),
-                # Owner-confirmed company identity, or None -> review.
-                "company": obs.get("group_company"),
+                # Deterministically resolved identity, or None -> review.
+                "company": company_of(obs),
                 "event_at": obs.get("timestamp"),
                 "order_key": dispatch_candidates.parse_event_time(obs.get("timestamp")),
             })
@@ -2838,7 +2876,8 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
             if scope:
                 for candidate_job in all_jobs:
                     if (norm(candidate_job.get("ticket_number")) == row["ticket_key"]
-                            and candidate_job.get("source") == row["company"]):
+                            and company_resolver.company_for_job_source(
+                                candidate_job.get("source")) == row["company"]):
                         correlated_job_id = candidate_job.get("id")
                         break
 
@@ -2848,7 +2887,14 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
                 event_at=row["event_at"],
                 group_name=obs.get("group_name"),
                 group_confirmed=bool(obs.get("group_mapping_confirmed")),
-                company=row["company"] or obs.get("group_company"),
+                # The resolver's verdict is FINAL. There is deliberately no
+                # fallback to obs["group_company"] here: when the resolver
+                # returns None it is because the signals conflict, a link
+                # is corrupt, or nothing deterministic was found -- and
+                # restoring the group's static company at that point would
+                # hand back exactly the identity the resolver refused to
+                # grant, making a conflicted item actionable again.
+                company=row["company"],
                 ticket=job.ticket_number.value,
                 service=job.service_type.value,
                 city=job.city.value,
