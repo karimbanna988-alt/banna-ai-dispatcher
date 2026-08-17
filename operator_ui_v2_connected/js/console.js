@@ -48,6 +48,7 @@
     offline: false,
     lastGood: null,       // Date of the last successful load
     screen: "jobs",       // which bottom-nav screen owns the viewport
+    candidatesAll: [],    // every evaluated candidate, for the shadow session
     liveOpen: false,      // Live screen is the visible one
     apprenticeOpen: false,// Apprentice screen is the visible one
     health: null,         // last /api/live_health payload
@@ -118,6 +119,85 @@
     return /^[A-Z0-9_ ]+$/.test(raw)
       ? raw.charAt(0) + raw.slice(1).toLowerCase().replace(/_/g, " ")
       : raw;
+  }
+
+  /* ------------------------------------------------- ACTIVE SHADOW --
+     Banna runs the SAME deterministic pipeline the console already uses
+     -- parser, company resolver, correlation, routing -- and shows the
+     decision it WOULD take on real traffic. It is called active because
+     the analysis genuinely runs on every captured job, and shadow
+     because nothing leaves the building: there is no send path in this
+     file, and the proposed text is display-only until a human copies it.
+
+     No model is involved. Calling an LLM here would make the demo look
+     clever while replacing the software that actually makes the
+     decision, which is the opposite of what this is for.
+
+     The session starts when the console loads. Jobs captured BEFORE
+     that point still inform correlation (they are real evidence), but
+     the visible shadow session follows current work rather than
+     replaying months of history. */
+  const SHADOW_SESSION_START = new Date();
+
+  function shadowDecision(c) {
+    const s = c.status;
+    if (c.review_reason || s === "HUMAN_REVIEW_NEEDED")
+      return { label: "Human review", tone: "rev" };
+    if (s === "ALREADY DISPATCHED") return { label: "Already dispatched", tone: "done" };
+    if (s === "REPOST AFTER PRIOR DISPATCH") return { label: "Human review", tone: "rev" };
+    if (s === "CLOSING OBSERVED") return { label: "Waiting for closing", tone: "done" };
+    if (s === "GROUP MAPPING REQUIRED") return { label: "Cannot route", tone: "na" };
+    if (s === "WAITING FOR HUMAN DISPATCH") {
+      return c.recommended && c.proposed_message
+        ? { label: "Dispatch", tone: "act" }
+        : { label: "Cannot route", tone: "na" };
+    }
+    return { label: displayLabel(s), tone: "na" };
+  }
+
+  // Real work captured since this session began. Historical rows stay
+  // available to correlation; they just do not flood the demonstration.
+  function shadowJobs() {
+    const all = [].concat(state.candidates || [], state.candidateReviews || [],
+                          state.candidatesAll || []);
+    const seen = new Set();
+    return all.filter((c) => {
+      if (!c || seen.has(c.message_id)) return false;
+      seen.add(c.message_id);
+      const t = Date.parse(c.received_at || "");
+      return !isNaN(t) && t >= SHADOW_SESSION_START.getTime();
+    });
+  }
+
+  // What the human actually did, taken from evidence the system already
+  // observes read-only: messages the owner sent by hand from the paired
+  // account, plus sightings in confirmed technician groups.
+  function humanAction(c) {
+    // `actual_destination` is where the job was ACTUALLY seen going --
+    // derived server-side from messages the owner sent by hand and from
+    // sightings in confirmed technician groups. It is the human's real
+    // decision, observed read-only, never asked for.
+    const dest = c.actual_destination;
+    if (!dest) return null;
+    return { technician: dest, at: c.received_at || null,
+             verified: c.routing_match || null };
+  }
+
+  function comparison(c) {
+    const human = humanAction(c);
+    if (!human) return { state: "waiting", text: "Waiting for human action" };
+    const banna = c.recommended || null;
+    // The server already compared its own recommendation against the
+    // observed destination; trust that verdict rather than re-deriving a
+    // second opinion here.
+    if (human.verified === "MATCH") return { state: "match", text: "Match" };
+    if (!banna) {
+      return { state: "waiting",
+               text: "Human dispatched " + human.technician + " · Banna had no recommendation to compare" };
+    }
+    return String(banna).trim().toLowerCase() === String(human.technician).trim().toLowerCase()
+      ? { state: "match", text: "Match" }
+      : { state: "diff", text: "Different · Banna " + banna + ", human " + human.technician };
   }
 
   function age(mins) {
@@ -214,6 +294,10 @@
       // the operator cannot see is a decision taken on their behalf
       // without telling them. They carry no send or copy action.
       state.candidateReviews = (wa.candidates || []).filter((c) => c.review_reason);
+      // The shadow session reports on EVERY real job Banna evaluated,
+      // including the ones it decided not to act on -- that judgement is
+      // exactly what the owner is here to watch.
+      state.candidatesAll = (wa.candidates || []);
 
       state.failures = 0;
       state.lastGood = new Date();
@@ -299,7 +383,11 @@
       $("hbQueue").textContent = q.depth == null ? "unknown" : (q.depth === 0 ? "healthy" : q.depth);
       $("hbQueue").className = q.depth == null ? "warnv" : (q.depth === 0 ? "" : "badv");
 
-      $("hbShadow").textContent = h.shadow_mode || "--";
+      // The backend's capture mode is reported as-is; the console states
+      // what is actually happening on top of it -- deterministic
+      // analysis of every captured job, with no external action.
+      $("hbShadow").textContent = h.shadow_mode
+        ? h.shadow_mode + " capture · active shadow" : "--";
       if (state.screen === "more") renderMore();
     } catch (e) {
       if (e.authRequired) return showLogin();
@@ -329,6 +417,7 @@
       // Compact by default: time, type, one line of substance. The
       // reasoning ("why") is real operational evidence and is kept, but
       // it waits behind a tap instead of burying the stream in prose.
+      renderShadow();
       $("loBody").innerHTML = events.length ? events.map((ev) => `
         <div class="lo-ev lo-${esc((ev.type || "").toLowerCase().replace(/\s+/g, "-"))}${
              ev.needs_human ? " needs" : ""}" data-ev="1">
@@ -345,6 +434,86 @@
       if (e.authRequired) return showLogin();
       $("loBody").innerHTML = `<div class="empty">Live feed unavailable: ${esc(e.message)}</div>`;
     }
+  }
+
+  // Renders the shadow session: what Banna would have done for each real
+  // job captured since the console opened, and what the human did.
+  function renderShadow() {
+    const el = $("shadowBody");
+    if (!el) return;
+    $("shadowStart").textContent = formatDisplayTime(SHADOW_SESSION_START);
+    const jobs = shadowJobs();
+
+    const counts = { dispatch: 0, review: 0, already: 0, match: 0, diff: 0 };
+    jobs.forEach((c) => {
+      const d = shadowDecision(c);
+      if (d.tone === "act") counts.dispatch += 1;
+      else if (d.tone === "rev") counts.review += 1;
+      else if (d.label === "Already dispatched") counts.already += 1;
+      const cmp = comparison(c);
+      if (cmp.state === "match") counts.match += 1;
+      if (cmp.state === "diff") counts.diff += 1;
+    });
+    $("shadowSummary").textContent = jobs.length
+      ? `${jobs.length} real job${jobs.length === 1 ? "" : "s"} · ${counts.dispatch} dispatch · `
+        + `${counts.review} review · ${counts.already} already dispatched · `
+        + `${counts.match} match · ${counts.diff} different`
+      : "No new real jobs since this session started.";
+
+    el.innerHTML = jobs.length ? jobs.map((c) => {
+      const d = shadowDecision(c);
+      const cmp = comparison(c);
+      const human = humanAction(c);
+      const area = [c.city, c.state].filter(Boolean).join(", ");
+      return `<div class="sh-job">
+        <div class="sh-top">
+          <span class="sh-company">${esc(c.source || "company not stated")}</span>
+          <span class="sh-ticket">${esc(c.ticket || "no ticket")}</span>
+        </div>
+        <div class="sh-title">${esc(c.service || "service not stated")}${area ? " · " + esc(area) : ""}</div>
+        <span class="sh-decision ${d.tone}">${esc(d.label)}</span>
+
+        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
+          <span class="sh-k">Received</span>
+          <span class="sh-v">${esc(c.group_name || "")}</span></div>
+        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
+          <span class="sh-k">Company</span>
+          <span class="sh-v">${esc(c.source || "unresolved")}</span></div>
+        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
+          <span class="sh-k">Routed</span>
+          <span class="sh-v">${esc(c.recommended || "no technician matched")}${
+            c.confidence ? " · " + esc(displayLabel(c.confidence)) : ""}</span></div>
+
+        ${d.tone === "act" ? `
+        <div class="sh-would">
+          <div class="sh-would-h">Banna would dispatch</div>
+          <div class="sh-v"><b>${esc(c.recommended)}</b></div>
+          <div class="sh-msg">${esc(c.proposed_message || "")}</div>
+          <div class="sh-sim">Simulation only &mdash; nothing sent</div>
+        </div>` : `
+        <div class="sh-would">
+          <div class="sh-would-h">Banna would not dispatch</div>
+          <div class="sh-v">${esc(c.review_reason ? displayLabel(c.review_reason) : d.label)}</div>
+          <div class="sh-sim">Simulation only &mdash; nothing sent</div>
+        </div>`}
+
+        <div class="sh-compare">
+          ${human ? `Human dispatched <b>${esc(human.technician || "unnamed")}</b>${
+              human.destination ? " · " + esc(human.destination) : ""}${
+              human.at ? " · " + esc(formatDisplayTime(parseEventStamp(human.at))) : ""}<br>` : ""}
+          <span class="sh-${cmp.state === "match" ? "match" : cmp.state === "diff" ? "diff" : "waiting"}">${esc(cmp.text)}</span>
+        </div>
+      </div>`;
+    }).join("") : `<div class="empty">Nothing captured since this session started.
+        Banna is watching; it will evaluate the next real job as it arrives.</div>`;
+  }
+
+  // Evidence timestamps arrive either as an ISO string or the TEXT epoch
+  // the bridge records. Both describe the same instant.
+  function parseEventStamp(v) {
+    if (v == null || v === "") return null;
+    if (/^\d{9,}$/.test(String(v))) return new Date(parseInt(v, 10) * 1000);
+    return v;
   }
 
   // Apprentice review. READ-ONLY by construction: there is no approve
@@ -464,7 +633,7 @@
       b.classList.toggle("on", b.getAttribute("data-screen") === name));
     state.liveOpen = name === "live";
     state.apprenticeOpen = name === "apprentice";
-    if (name === "live") loadLive();
+    if (name === "live") { loadLive(); renderShadow(); }
     if (name === "apprentice") loadApprentice();
     if (name === "techs") loadTechs();
     if (name === "more") renderMore();
@@ -828,11 +997,45 @@
         <div class="missing">Not a committed job yet &mdash; this is what Banna understood
           from WhatsApp. Copy the message and send it yourself.</div>
       </div>
+      ${shadowSection(c)}
       <div class="sec">
         <div class="sec-h">Proposed technician message</div>
         <div class="msgbox" id="msgBox">${esc(c.proposed_message || "")}</div>
       </div>
       ${timelineSection(c)}`;
+  }
+
+  // What Banna decided, and what the human actually did. Display only:
+  // the proposed text is shown, never transmitted, and a review hold
+  // states its decision without offering a way to act on it.
+  function shadowSection(c) {
+    const d = shadowDecision(c);
+    const cmp = comparison(c);
+    const human = humanAction(c);
+    return `
+      <div class="sec">
+        <div class="sec-h">Banna decision &mdash; simulation only</div>
+        <div class="decision">
+          <div class="d-detected">${esc(d.label)}${
+            c.recommended ? " &middot; " + esc(c.recommended) : ""}</div>
+          ${c.confidence ? `<div class="d-why">Confidence: ${esc(displayLabel(c.confidence))}</div>` : ""}
+          ${(c.why || []).map((w) => `<div class="d-why">${esc(w)}</div>`).join("")}
+          <div class="d-why"><b>Banna sent nothing.</b> Every message here is a
+            draft for a human to send.</div>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="sec-h">Human action</div>
+        <div class="decision">
+          ${human
+            ? `<div class="d-detected">${esc(human.technician || "dispatched")}${
+                 human.destination ? " &middot; " + esc(human.destination) : ""}</div>
+               ${human.at ? `<div class="d-why">${esc(formatDisplayTime(parseEventStamp(human.at)))}</div>` : ""}
+               ${human.channel ? `<div class="d-why">${esc(human.channel)}</div>` : ""}`
+            : `<div class="d-detected">Waiting for human action</div>`}
+          <div class="d-why sh-${cmp.state === "match" ? "match" : cmp.state === "diff" ? "diff" : "waiting"}">${esc(cmp.text)}</div>
+        </div>
+      </div>`;
   }
 
   // Operational trace. Real, and kept -- but collapsed, because it is

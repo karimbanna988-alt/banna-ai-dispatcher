@@ -413,6 +413,78 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 .tl-type { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
 .tl-d { grid-column: 2; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
 
+/* --------------------------------------------------- active shadow --
+   Banna runs the same deterministic pipeline the dispatcher would, and
+   shows the decision it WOULD take. Nothing here can transmit, so the
+   styling states that plainly rather than implying an action occurred. */
+.shadow-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .07em;
+  color: var(--purple); background: var(--purple-soft);
+  border-radius: 999px; padding: 4px 10px; white-space: nowrap;
+}
+.sb-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--purple); }
+
+.shadow-panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-left: 3px solid var(--purple);
+  border-radius: var(--r); box-shadow: var(--shadow-card);
+  padding: 14px; margin-bottom: 18px;
+}
+.sp-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sp-title { font-size: 14px; font-weight: 700; }
+.sp-mode { font-size: 11px; color: var(--purple); }
+.sp-meta {
+  display: flex; flex-direction: column; gap: 2px;
+  margin-top: 8px; font-size: 12px; color: var(--ink-2);
+}
+.sp-body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.sp-foot { margin-top: 12px; font-size: 11px; color: var(--ink-3); }
+
+.sh-job {
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface-2); padding: 12px;
+}
+.sh-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sh-company { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+.sh-ticket { margin-left: auto; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-3); }
+.sh-title { font-size: 15px; font-weight: 640; margin: 3px 0 8px; overflow-wrap: anywhere; }
+
+.sh-decision {
+  display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .05em;
+  padding: 3px 9px; border-radius: 999px; text-transform: uppercase;
+}
+.sh-decision.act { color: var(--blue);   background: var(--blue-soft); }
+.sh-decision.rev { color: var(--amber);  background: var(--amber-soft); }
+.sh-decision.done{ color: var(--green);  background: var(--green-soft); }
+.sh-decision.na  { color: var(--ink-2);  background: var(--surface); }
+
+.sh-step { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; padding: 5px 0; }
+.sh-t { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sh-k { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-2); }
+.sh-v { grid-column: 2; font-size: 13px; overflow-wrap: anywhere; }
+
+.sh-would {
+  margin-top: 10px; padding: 10px; border-radius: var(--r-sm);
+  background: var(--surface); border: 1px dashed var(--purple);
+}
+.sh-would-h { font-size: 10px; font-weight: 700; letter-spacing: .07em; color: var(--purple); text-transform: uppercase; }
+.sh-msg {
+  margin-top: 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2);
+}
+.sh-sim { margin-top: 8px; font-size: 10px; font-weight: 700; letter-spacing: .06em; color: var(--purple); }
+
+.sh-compare { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line-soft); font-size: 12px; }
+.sh-match   { color: var(--green); font-weight: 650; }
+.sh-diff    { color: var(--amber); font-weight: 650; }
+.sh-waiting { color: var(--ink-3); }
+
+.lo-title-sep {
+  font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--ink-3); margin: 4px 0 10px;
+}
+
 /* ---------------------------------------------------------- tabbar --- */
 /* A floating card of navigation rather than a bar welded to the edge:
    rounded top corners, a real shadow, and the home-indicator inset kept

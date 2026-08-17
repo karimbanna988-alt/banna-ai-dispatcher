@@ -17,7 +17,7 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=5">
+<link rel="stylesheet" href="css/console.css?v=6">
 </head>
 <body>
 
@@ -43,6 +43,9 @@
 
     <div class="topbar-right">
       <input type="search" id="searchInput" class="search" placeholder="Search ticket, tech, city  ( / )" autocomplete="off">
+      <span class="shadow-badge" id="shadowBadge" title="Banna evaluates every real job and shows what it would do. It never sends.">
+        <span class="sb-dot"></span>ACTIVE SHADOW
+      </span>
       <div class="health" id="health" title="Service health">
         <span class="dot" id="dotCrm"></span><span class="dot-l">CRM</span>
         <span class="dot" id="dotAdapter"></span><span class="dot-l">ADP</span>
@@ -121,8 +124,23 @@
   <section class="screen" id="screenLive" data-screen="live" hidden>
     <div class="screen-head">
       <h1>Live operations</h1>
-      <span class="screen-note" id="loNote">passive capture &middot; no model required</span>
+      <span class="screen-note" id="loNote">real traffic &middot; deterministic analysis &middot; no external action</span>
     </div>
+    <section class="shadow-panel" id="shadowPanel">
+      <div class="sp-head">
+        <span class="sp-title">Active shadow</span>
+        <span class="sp-mode">Deterministic analysis &middot; simulation only</span>
+      </div>
+      <div class="sp-meta">
+        <span>Session started <b id="shadowStart">--</b></span>
+        <span id="shadowSummary">No real jobs yet this session.</span>
+      </div>
+      <div class="sp-body" id="shadowBody"></div>
+      <div class="sp-foot">Banna never sends. Every message below is a simulation
+        the human dispatcher may use or ignore.</div>
+    </section>
+
+    <div class="lo-title-sep">Event stream</div>
     <div class="lo-body" id="loBody"></div>
   </section>
 
@@ -234,7 +252,7 @@
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=5"></script>
-<script src="js/console.js?v=5"></script>
+<script src="js/api.js?v=6"></script>
+<script src="js/console.js?v=6"></script>
 </body>
 </html>
