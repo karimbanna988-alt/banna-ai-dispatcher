@@ -134,15 +134,22 @@ def test_every_visible_clock_goes_through_the_helper(js):
 
 
 # ================================================ information layers ===
-def test_bottom_navigation_has_the_five_screens(index_html):
-    for screen in ("jobs", "live", "apprentice", "techs", "more"):
-        assert f'data-screen="{screen}"' in index_html
-    assert 'id="tabbar"' in index_html
+def test_bottom_navigation_has_four_primary_screens(index_html):
+    """Four destinations, not ten. Technicians, Apprentice, Shadow and
+    System are tools reached from More -- they are not the daily job."""
+    nav = index_html[index_html.index('id="tabbar"'):index_html.index("</nav>", index_html.index('id="tabbar"'))]
+    for screen in ("today", "jobs", "reports", "more"):
+        assert f'data-screen="{screen}"' in nav
+    assert nav.count("data-screen=") == 4, "the primary nav must stay at four"
+    for secondary in ("live", "apprentice", "techs", "shadow"):
+        assert f'data-screen="{secondary}"' not in nav, f"{secondary} is not primary navigation"
+        assert f'data-goto="{secondary}"' in index_html, f"{secondary} must be reachable from More"
 
 
-def test_jobs_is_the_default_screen(index_html, js):
-    assert re.search(r'id="screenJobs"[^>]*class=|class="screen on" id="screenJobs"', index_html)
-    assert 'screen: "jobs"' in js
+def test_today_is_the_default_screen(index_html, js):
+    """The owner opens Banna to see the business, not the dispatch board."""
+    assert 'class="screen on" id="screenToday"' in index_html
+    assert 'screen: "today"' in js
     assert "setScreen(state.screen)" in js
 
 
@@ -375,7 +382,7 @@ def test_backend_values_are_not_rewritten_anywhere(js):
 # ============================================= BOTTOM NAV ICONS =======
 def test_bottom_nav_uses_real_svg_icons(index_html):
     nav = index_html[index_html.index('class="tabbar"'):index_html.index("</nav>", index_html.index('class="tabbar"'))]
-    assert nav.count("<svg") == 5, "every tab needs a real icon"
+    assert nav.count("<svg") == 4, "every tab needs a real icon"
     for placeholder in ("&#9632;", "&#9679;", "&#9670;", "&#9650;", "&#8943;"):
         assert placeholder not in nav, "geometric placeholder survived"
     # No emoji, no external icon font.
@@ -384,8 +391,8 @@ def test_bottom_nav_uses_real_svg_icons(index_html):
 
 def test_every_tab_is_labelled_for_assistive_tech(index_html):
     nav = index_html[index_html.index('class="tabbar"'):index_html.index("</nav>", index_html.index('class="tabbar"'))]
-    assert nav.count("aria-label=") == 5
-    assert nav.count('aria-hidden="true"') == 5
+    assert nav.count("aria-label=") == 4
+    assert nav.count('aria-hidden="true"') == 4
 
 
 def test_the_active_tab_uses_a_soft_pill(css):
@@ -395,16 +402,18 @@ def test_the_active_tab_uses_a_soft_pill(css):
 
 
 # ================================================= COLOUR SYSTEM ======
-def test_the_page_is_a_light_cool_gray_not_pure_white(css):
+def test_the_page_is_warm_stone_not_white(css):
     root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
-    assert "--bg:        #F4F7FB" in root, "page background must lift the white cards"
-    assert "--surface:   #FFFFFF" in root
+    assert "--bg:        #E7E2D9" in root, "warm stone page"
+    assert "--surface:   #F1ECE4" in root, "parchment cards"
 
 
 def test_the_specified_accents_are_used(css):
     root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
-    assert "#2F6BFF" in root, "primary blue"
-    assert "#22A06B" in root, "success green"
+    assert "#5D7462" in root, "sage identity"
+    assert "#557B60" in root, "success green"
+    assert "#B68142" in root, "warning amber"
+    assert "#A65A52" in root, "danger brick"
 
 
 def test_cards_separate_from_the_page(css):

@@ -147,23 +147,18 @@ def test_console_escapes_dynamic_values(console_js):
 
 
 # ---------------------------------------------------------- visual ----
-def test_console_uses_the_light_operations_palette():
-    """The console is a WHITE operations product, not a developer
-    console. The dark telemetry palette this replaced made every screen
-    read as equally urgent, which is the opposite of what a phone-first
-    board needs.
-
-    Colour has to stay meaningful: blue is the active stage and the one
-    primary action, amber is a decision the operator owes, red is an
-    actual fault, purple is Apprentice."""
+def test_console_uses_the_warm_crm_palette():
+    """Banna is a CRM now -- looked at all day, not a dashboard glanced
+    at. Warm stone page, parchment surfaces, sage identity. The blue/white
+    SaaS look and the earlier dark console are both deliberately gone."""
     css = CONSOLE_CSS.read_text(encoding="utf-8")
-    assert "--surface:   #FFFFFF" in css, "cards must be white"
-    assert "color-scheme" not in css or "dark" not in css.split("color-scheme")[-1][:40]
-    for token in ("--blue:", "--green:", "--amber:", "--red:", "--purple:"):
-        assert token in css, f"missing semantic colour token {token}"
-    # The neon accents of the old console must be gone.
-    for neon in ("#00D4FF", "#00BFFF", "#0B0E14"):
-        assert neon not in css, f"cyberpunk accent {neon} survived the redesign"
+    assert "--bg:        #E7E2D9" in css, "page must be warm stone, not white"
+    assert "--surface:   #F1ECE4" in css, "cards must be parchment, not pure white"
+    assert "--blue:      #5D7462" in css, "identity colour is sage"
+    for banned in ("#2F6BFF", "#0B69F5", "#00D4FF", "#0B0E14", "#FFFFFF;"):
+        assert banned not in css, f"{banned} survived the CRM redesign"
+    for token in ("--green:", "--amber:", "--red:"):
+        assert token in css, f"missing semantic colour {token}"
 
 
 def test_console_is_responsive_for_mobile():

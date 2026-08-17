@@ -8,7 +8,7 @@
 <!-- Phone/PWA. Installable only over HTTPS (or localhost); over plain
      LAN http these are inert but harmless -- see docs/PHONE_DISPATCH_PILOT.md -->
 <link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#F4F7FB">
+<meta name="theme-color" content="#E7E2D9">
 <meta name="color-scheme" content="light">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -17,7 +17,7 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=6">
+<link rel="stylesheet" href="css/console.css?v=7">
 </head>
 <body>
 
@@ -43,11 +43,10 @@
 
     <div class="topbar-right">
       <input type="search" id="searchInput" class="search" placeholder="Search ticket, tech, city  ( / )" autocomplete="off">
-      <span class="shadow-badge" id="shadowBadge" title="Banna evaluates every real job and shows what it would do. It never sends.">
-        <span class="sb-dot"></span>ACTIVE SHADOW
-      </span>
-      <div class="health" id="health" title="Service health">
-        <span class="dot" id="dotCrm"></span><span class="dot-l">CRM</span>
+      <span class="conn" id="connState" title="System status"><span class="dot" id="dotCrm"></span><span id="connLabel">Connected</span></span>
+      <!-- Detail dots stay in the DOM for the System screen to drive, but
+           only surface here when something is actually wrong. -->
+      <div class="health" id="health" title="Service health" hidden>
         <span class="dot" id="dotAdapter"></span><span class="dot-l">ADP</span>
         <span class="dot" id="dotWa"></span><span class="dot-l">WA</span>
       </div>
@@ -73,8 +72,51 @@
     <b>OFFLINE</b> <span id="offlineDetail">not live &middot; showing last known state</span>
   </div>
 
-  <!-- ============================ JOBS (default screen) ============ -->
-  <section class="screen on" id="screenJobs" data-screen="jobs">
+  <!-- ============================ TODAY (default) ================== -->
+  <section class="screen on" id="screenToday" data-screen="today">
+    <div class="day-head">
+      <span class="day-label" id="todayLabel">Today</span>
+      <span class="day-tz" id="todayTz"></span>
+    </div>
+
+    <div class="stat-row" id="todayStats">
+      <button class="stat" data-jump-jobs="all">
+        <span class="stat-n" id="statJobs">--</span><span class="stat-l">Jobs today</span>
+      </button>
+      <button class="stat" data-jump-jobs="open">
+        <span class="stat-n" id="statOpen">--</span><span class="stat-l">Open</span>
+      </button>
+      <button class="stat" data-jump-jobs="completed">
+        <span class="stat-n" id="statDone">--</span><span class="stat-l">Completed</span>
+      </button>
+      <button class="stat attention" data-jump-jobs="needs_attention">
+        <span class="stat-n" id="statAttention">--</span><span class="stat-l">Attention</span>
+      </button>
+    </div>
+
+    <div class="stat wide" id="revenueCard">
+      <span class="stat-n" id="statRevenue">&mdash;</span>
+      <span class="stat-l" id="revenueNote">Verified closing revenue</span>
+    </div>
+
+    <section class="panel">
+      <div class="panel-h">Today by company</div>
+      <div class="rank" id="byCompany"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-h">Top areas today</div>
+      <div class="rank" id="byArea"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-h">Recent jobs</div>
+      <div class="rows" id="recentJobs"></div>
+    </section>
+  </section>
+
+  <!-- ============================ JOBS ============================= -->
+  <section class="screen" id="screenJobs" data-screen="jobs" hidden>
 
     <!-- Phone stage switcher. One tap per stage; only one stage occupies
          the phone viewport at a time. The selected card carries the blue
@@ -120,13 +162,36 @@
     </main>
   </section>
 
+  <!-- ============================ REPORTS ========================== -->
+  <section class="screen" id="screenReports" data-screen="reports" hidden>
+    <div class="screen-head">
+      <h1>Reports</h1>
+      <span class="screen-note" id="reportRange">Business summary</span>
+    </div>
+    <div class="chips" id="reportRanges">
+      <button class="chip-btn on" data-range="today">Today</button>
+      <button class="chip-btn" data-range="yesterday">Yesterday</button>
+      <button class="chip-btn" data-range="week">This week</button>
+      <button class="chip-btn" data-range="month">This month</button>
+    </div>
+    <div class="rows" id="reportTotals"></div>
+    <section class="panel">
+      <div class="panel-h">By company</div>
+      <div class="rank" id="reportCompany"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-h">By area</div>
+      <div class="rank" id="reportArea"></div>
+    </section>
+  </section>
+
   <!-- ============================ LIVE OPERATIONS ================== -->
   <section class="screen" id="screenLive" data-screen="live" hidden>
     <div class="screen-head">
       <h1>Live operations</h1>
       <span class="screen-note" id="loNote">real traffic &middot; deterministic analysis &middot; no external action</span>
     </div>
-    <section class="shadow-panel" id="shadowPanel">
+    <section class="shadow-panel" id="shadowPanel" hidden>
       <div class="sp-head">
         <span class="sp-title">Active shadow</span>
         <span class="sp-mode">Deterministic analysis &middot; simulation only</span>
@@ -142,6 +207,19 @@
 
     <div class="lo-title-sep">Event stream</div>
     <div class="lo-body" id="loBody"></div>
+  </section>
+
+  <!-- ============================ ACTIVE SHADOW ==================== -->
+  <section class="screen" id="screenShadow" data-screen="shadow" hidden>
+    <div class="screen-head">
+      <h1>Active shadow</h1>
+      <span class="screen-note">deterministic analysis &middot; simulation only &middot; nothing is sent</span>
+    </div>
+    <div class="sp-meta">
+      <span>Session started <b id="shadowStart2">--</b></span>
+      <span id="shadowSummary2">No real jobs yet this session.</span>
+    </div>
+    <div class="sp-body" id="shadowBody2"></div>
   </section>
 
   <!-- ============================ APPRENTICE ======================= -->
@@ -165,9 +243,18 @@
   <!-- ============================ MORE / SYSTEM ==================== -->
   <section class="screen" id="screenMore" data-screen="more" hidden>
     <div class="screen-head">
-      <h1>System</h1>
-      <span class="screen-note">health &middot; diagnostics &middot; back office</span>
+      <h1>More</h1>
+      <span class="screen-note">tools, intelligence and system status</span>
     </div>
+
+    <div class="menu">
+      <button class="menu-item" data-goto="live">Live operations<span>Event stream</span></button>
+      <button class="menu-item" data-goto="apprentice">Apprentice<span>Suggested patterns &middot; read-only</span></button>
+      <button class="menu-item" data-goto="techs">Technicians<span>Routing coverage</span></button>
+      <button class="menu-item" data-goto="shadow">Active shadow<span>What Banna would dispatch</span></button>
+    </div>
+
+    <div class="panel-h">System</div>
 
     <!-- Real health, from real sources. Never decorative. -->
     <section class="healthbar" id="healthbar">
@@ -209,7 +296,14 @@
        safe-area inset, and the screens reserve matching bottom padding
        so it never covers the last card. -->
   <nav class="tabbar" id="tabbar">
-    <button class="tab on" data-screen="jobs" aria-label="Jobs">
+    <button class="tab on" data-screen="today" aria-label="Today">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3.5" y="5" width="17" height="15.5" rx="2.5"></rect>
+        <path d="M3.5 9.5h17"></path><path d="M8 3.5v3"></path><path d="M16 3.5v3"></path>
+      </svg>
+      <span class="tab-l">Today</span>
+    </button>
+    <button class="tab" data-screen="jobs" aria-label="Jobs">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <rect x="3" y="7.5" width="18" height="12.5" rx="2.5"></rect>
         <path d="M9 7.5V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1.5"></path>
@@ -217,27 +311,12 @@
       </svg>
       <span class="tab-l">Jobs</span>
     </button>
-    <button class="tab" data-screen="live" aria-label="Live operations">
+    <button class="tab" data-screen="reports" aria-label="Reports">
       <svg viewBox="0 0 24 24" aria-hidden="true">
-        <polyline points="2.5 12.5 7 12.5 9.5 6.5 14 17.5 16.5 12.5 21.5 12.5"></polyline>
+        <path d="M4 20V9.5"></path><path d="M10 20V4.5"></path>
+        <path d="M16 20v-8"></path><path d="M21 20H3"></path>
       </svg>
-      <span class="tab-l">Live</span>
-    </button>
-    <button class="tab" data-screen="apprentice" aria-label="Apprentice">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9-1.9 4.6-1.9-4.6L5.5 10l4.6-1.9z"></path>
-        <path d="M18 16.5l.8 1.9 1.9.8-1.9.8-.8 1.9-.8-1.9-1.9-.8 1.9-.8z"></path>
-      </svg>
-      <span class="tab-l">Apprentice</span>
-    </button>
-    <button class="tab" data-screen="techs" aria-label="Technicians">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="9" cy="8" r="3.2"></circle>
-        <path d="M3.5 19.5a5.5 5.5 0 0 1 11 0"></path>
-        <path d="M16 5.4a3.2 3.2 0 0 1 0 5.2"></path>
-        <path d="M17.5 14.4a5.5 5.5 0 0 1 3 5.1"></path>
-      </svg>
-      <span class="tab-l">Techs</span>
+      <span class="tab-l">Reports</span>
     </button>
     <button class="tab" data-screen="more" aria-label="More">
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -252,7 +331,7 @@
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=6"></script>
-<script src="js/console.js?v=6"></script>
+<script src="js/api.js?v=7"></script>
+<script src="js/console.js?v=7"></script>
 </body>
 </html>

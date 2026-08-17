@@ -158,6 +158,9 @@ const Api = {
   getLiveHealth() { return this._call("GET", "/api/live_health"); },
   getApprenticeSuggestions() { return this._call("GET", "/api/apprentice_suggestions"); },
   getWhatsappCandidates() { return this._call("GET", "/api/whatsapp_candidates"); },
+  // The CRM home/reports summary. One read-only call rather than the
+  // phone joining several endpoints and reconciling them itself.
+  getCrmSummary(range) { return this._call("GET", "/api/crm/summary?range=" + encodeURIComponent(range || "today")); },
   promoteWhatsappToJob(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});
   },

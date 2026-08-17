@@ -47,7 +47,9 @@
     failures: 0,          // consecutive failed polls
     offline: false,
     lastGood: null,       // Date of the last successful load
-    screen: "jobs",       // which bottom-nav screen owns the viewport
+    screen: "today",      // which bottom-nav screen owns the viewport
+    crm: null,            // last /api/crm/summary payload
+    reportRange: "today",
     candidatesAll: [],    // every evaluated candidate, for the shadow session
     liveOpen: false,      // Live screen is the visible one
     apprenticeOpen: false,// Apprentice screen is the visible one
@@ -107,6 +109,9 @@
     "REPOST AFTER PRIOR DISPATCH": "Posted again after dispatch",
     "CLOSING OBSERVED": "Closing seen",
     "MAPPING_REQUIRED": "Group not mapped yet",
+    "open": "Open",
+    "completed": "Completed",
+    "needs_attention": "Attention",
   };
 
   function displayLabel(value) {
@@ -304,6 +309,7 @@
       if (state.offline) setOffline(false);
 
       render();
+      if (state.screen === "today") loadToday();
       loadDemo();
       $("updatedAt").textContent = formatDisplayTime(state.lastGood);
     } catch (e) {
@@ -360,6 +366,15 @@
       }
       if (h.tenant_name) $("brandTenant").textContent = h.tenant_name;
 
+      const allUp = (h.crm && h.crm.up) && (h.adapter && h.adapter.up) && (h.whatsapp && h.whatsapp.up);
+      const conn = $("connState"), label = $("connLabel");
+      if (conn && label) {
+        conn.classList.toggle("bad", !allUp);
+        label.textContent = allUp ? "Connected"
+          : (h.whatsapp && !h.whatsapp.up) ? "WhatsApp not capturing" : "Degraded";
+      }
+      // The per-service dots only appear when something is actually wrong.
+      const health = $("health"); if (health) health.hidden = allUp;
       $("dotCrm").className = "dot " + (h.crm && h.crm.up ? "up" : "down");
       $("dotAdapter").className = "dot " + (h.adapter && h.adapter.up ? "up" : "down");
       $("dotWa").className = "dot " + (h.whatsapp && h.whatsapp.up ? "up" : "down");
@@ -436,12 +451,99 @@
     }
   }
 
+  /* ------------------------------------------------------- the CRM --
+     Banna's daily value is that real dispatch work becomes structured
+     business history without anyone typing it in. TODAY answers the
+     questions an owner asks out loud -- how many jobs, what state, whose
+     work, which areas -- and stops there. Everything technical lives one
+     tap away.
+
+     All of it comes from ONE read-only endpoint. The phone does not join
+     five sources and hope they agree. */
+  function money(value, available) {
+    // A number nobody can compute is not zero. Closing amounts are not
+    // recorded yet, so this shows a dash rather than a $0 that reads
+    // like a terrible day.
+    if (!available || value == null) return { text: "—", unknown: true };
+    return { text: "$" + Number(value).toLocaleString("en-US"), unknown: false };
+  }
+
+  function rankRows(items, emptyText) {
+    if (!items || !items.length) return `<div class="empty">${esc(emptyText)}</div>`;
+    const top = items.slice(0, 5);
+    const max = Math.max.apply(null, top.map((i) => i.count)) || 1;
+    return top.map((i) => `
+      <div class="rank-row">
+        <span>${esc(i.name)}</span><span class="rank-n">${esc(i.count)}</span>
+        <span class="rank-bar"><i style="width:${Math.round((i.count / max) * 100)}%"></i></span>
+      </div>`).join("");
+  }
+
+  function jobRow(j) {
+    const area = j.area || "area not stated";
+    return `<div class="job-row" data-col="candidate" data-id="${esc(j.message_id)}">
+      <span class="jr-t">${esc(formatDisplayTime(j.at))}</span>
+      <span class="jr-co">${esc(j.company)}</span>
+      <span class="jr-state ${esc(j.bucket)}">${esc(displayLabel(j.bucket))}</span>
+      <span class="jr-main">${esc(area)}${j.service ? " · " + esc(j.service) : ""}</span>
+      <span class="jr-sub">${esc(j.technician || "no technician yet")}${
+        j.ticket ? " · " + esc(j.ticket) : ""}</span>
+    </div>`;
+  }
+
+  async function loadToday() {
+    try {
+      const r = await Api.getCrmSummary("today");
+      state.crm = r;
+      $("todayLabel").textContent = "Today · " + (r.range_label || "");
+      $("todayTz").textContent = r.timezone;
+      $("statJobs").textContent = r.jobs_received;
+      $("statOpen").textContent = r.open;
+      $("statDone").textContent = r.completed;
+      $("statAttention").textContent = r.needs_attention;
+      const m = money(r.verified_revenue, r.revenue_available);
+      $("statRevenue").textContent = m.text;
+      $("statRevenue").className = "stat-n" + (m.unknown ? " unknown" : "");
+      $("revenueNote").textContent = m.unknown
+        ? "Verified closing revenue — not recorded yet"
+        : "Verified closing revenue";
+      $("byCompany").innerHTML = rankRows(r.by_company, "No jobs recorded today.");
+      $("byArea").innerHTML = rankRows(r.by_area, "No areas recorded today.");
+      $("recentJobs").innerHTML = (r.recent_jobs || []).length
+        ? r.recent_jobs.map(jobRow).join("")
+        : `<div class="empty">No jobs captured today yet.</div>`;
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("recentJobs").innerHTML = `<div class="empty">Summary unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function loadReports() {
+    try {
+      const r = await Api.getCrmSummary(state.reportRange);
+      $("reportRange").textContent = r.timezone + " · " + r.range_start.slice(0, 10)
+        + " to " + r.range_end.slice(0, 10);
+      const m = money(r.verified_revenue, r.revenue_available);
+      $("reportTotals").innerHTML = [
+        ["Jobs received", r.jobs_received], ["Open", r.open],
+        ["Completed", r.completed], ["Needs attention", r.needs_attention],
+        ["Verified revenue", m.text],
+      ].map(([k, v]) => `<div class="rank-row"><span>${esc(k)}</span><span class="rank-n">${esc(v)}</span></div>`).join("");
+      $("reportCompany").innerHTML = rankRows(r.by_company, "No jobs in this range.");
+      $("reportArea").innerHTML = rankRows(r.by_area, "No areas in this range.");
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("reportTotals").innerHTML = `<div class="empty">Reports unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
   // Renders the shadow session: what Banna would have done for each real
   // job captured since the console opened, and what the human did.
   function renderShadow() {
-    const el = $("shadowBody");
+    const el = $("shadowBody2") || $("shadowBody");
     if (!el) return;
-    $("shadowStart").textContent = formatDisplayTime(SHADOW_SESSION_START);
+    const startEl = $("shadowStart2") || $("shadowStart");
+    if (startEl) startEl.textContent = formatDisplayTime(SHADOW_SESSION_START);
     const jobs = shadowJobs();
 
     const counts = { dispatch: 0, review: 0, already: 0, match: 0, diff: 0 };
@@ -454,7 +556,8 @@
       if (cmp.state === "match") counts.match += 1;
       if (cmp.state === "diff") counts.diff += 1;
     });
-    $("shadowSummary").textContent = jobs.length
+    const summaryEl = $("shadowSummary2") || $("shadowSummary");
+    summaryEl.textContent = jobs.length
       ? `${jobs.length} real job${jobs.length === 1 ? "" : "s"} · ${counts.dispatch} dispatch · `
         + `${counts.review} review · ${counts.already} already dispatched · `
         + `${counts.match} match · ${counts.diff} different`
@@ -623,17 +726,24 @@
   function setScreen(name) {
     if (!name) return;
     state.screen = name;
-    const map = { jobs: "screenJobs", live: "screenLive", apprentice: "screenApprentice",
-                  techs: "screenTechs", more: "screenMore" };
+    const map = { today: "screenToday", jobs: "screenJobs", reports: "screenReports",
+                  live: "screenLive", apprentice: "screenApprentice",
+                  techs: "screenTechs", shadow: "screenShadow", more: "screenMore" };
     Object.keys(map).forEach((k) => {
       const el = $(map[k]);
       if (el) { el.hidden = k !== name; el.classList.toggle("on", k === name); }
     });
+    // Secondary screens are reached FROM More, so More stays lit while
+    // one of its tools is open -- the operator is still "in" that section.
+    const primary = ({ live: "more", apprentice: "more", techs: "more", shadow: "more" })[name] || name;
     document.querySelectorAll(".tab").forEach((b) =>
-      b.classList.toggle("on", b.getAttribute("data-screen") === name));
+      b.classList.toggle("on", b.getAttribute("data-screen") === primary));
     state.liveOpen = name === "live";
     state.apprenticeOpen = name === "apprentice";
-    if (name === "live") { loadLive(); renderShadow(); }
+    if (name === "today") loadToday();
+    if (name === "reports") loadReports();
+    if (name === "live") loadLive();
+    if (name === "shadow") renderShadow();
     if (name === "apprentice") loadApprentice();
     if (name === "techs") loadTechs();
     if (name === "more") renderMore();
@@ -1206,6 +1316,17 @@
     }
     const tabEl = ev.target.closest(".tab");
     if (tabEl) return setScreen(tabEl.getAttribute("data-screen"));
+    const menuEl = ev.target.closest("[data-goto]");
+    if (menuEl) return setScreen(menuEl.getAttribute("data-goto"));
+    const rangeEl = ev.target.closest("[data-range]");
+    if (rangeEl) {
+      state.reportRange = rangeEl.getAttribute("data-range");
+      document.querySelectorAll("[data-range]").forEach((b) =>
+        b.classList.toggle("on", b === rangeEl));
+      return loadReports();
+    }
+    const statEl = ev.target.closest("[data-jump-jobs]");
+    if (statEl) return setScreen("jobs");
     const evEl = ev.target.closest("[data-ev]");
     if (evEl) { evEl.classList.toggle("open"); return; }
     const card = ev.target.closest(".card");
@@ -1281,6 +1402,7 @@
     $("app").hidden = false;
     setStage(state.stage);
     setScreen(state.screen);
+    loadToday();
     load(); health();
     setInterval(load, POLL_MS);
     setInterval(health, 15000);

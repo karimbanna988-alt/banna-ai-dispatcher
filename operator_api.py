@@ -80,6 +80,7 @@ from dispatcher import live_feed  # noqa: E402
 from dispatcher import apprentice  # noqa: E402
 from dispatcher import dispatch_candidates  # noqa: E402
 from dispatcher import company_resolver  # noqa: E402
+from dispatcher import crm_summary  # noqa: E402
 from dispatcher import formatter  # noqa: E402
 from dispatcher.db_safety import UnsafeDatabasePathError  # noqa: E402
 from dispatcher.action_names import ActionName  # noqa: E402
@@ -2961,6 +2962,29 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         conn.close()
 
 
+def route_crm_summary(handler: "Handler", match: dict, body: dict) -> dict:
+    """The business day, for the CRM home screen. READ-ONLY.
+
+    Deliberately thin: it reuses the SAME candidate projection the board
+    already renders -- no second interpretation of the data, no new
+    business rule -- and hands it to crm_summary, which only counts and
+    groups. Writing nothing is a property of both halves.
+
+    One endpoint rather than a frontend that joins five unrelated ones,
+    because "how many jobs today" should be one question to the server,
+    not five requests and a reconciliation the phone has to get right.
+    """
+    range_key = (body.get("range") or "today").lower()
+    if range_key not in crm_summary.RANGES:
+        range_key = crm_summary.RANGE_TODAY
+    projection = route_whatsapp_candidates(handler, match, {})
+    return crm_summary.summarize(
+        projection.get("candidates") or [],
+        datetime.now(timezone.utc),
+        range_key=range_key,
+    )
+
+
 def route_demo_console(handler: "Handler", match: dict, body: dict) -> dict:
     """Read-only demo feed for the owner demo, shown in the Dispatch
     Console beside real work but never mixed into it.
@@ -3114,6 +3138,7 @@ ROUTES = [
     ("GET", r"^/api/live_health$", route_live_health, {}),
     ("GET", r"^/api/apprentice_suggestions$", route_apprentice_suggestions, {}),
     ("GET", r"^/api/whatsapp_candidates$", route_whatsapp_candidates, {}),
+    ("GET", r"^/api/crm/summary$", route_crm_summary, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]
