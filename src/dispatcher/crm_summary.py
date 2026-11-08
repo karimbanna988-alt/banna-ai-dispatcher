@@ -92,6 +92,78 @@ def _bucket(candidate) -> str:
     return "open"
 
 
+def job_rows(candidates, now_utc: datetime, range_key: str = RANGE_MONTH,
+             tz_name: str = OPERATIONAL_TIMEZONE, company=None, area=None,
+             status=None, query=None, limit: int = 300) -> dict:
+    """Every job in range as a flat, filterable list.
+
+    This is the record the dispatcher opens instead of scrolling
+    WhatsApp. It applies the SAME range, identity and bucket rules as
+    summarize(), so a count on Today and the list it opens can never
+    disagree -- the number you tap and the rows you land on come from
+    one definition of "a job".
+
+    Filtering is exact on company and status and substring on area and
+    the free-text query; nothing here re-interprets a job.
+    """
+    start, end = range_bounds(range_key, now_utc, tz_name)
+
+    seen, rows = set(), []
+    for candidate in candidates or []:
+        stamp = _parse(candidate.get("event_at")) or _parse(candidate.get("received_at"))
+        if stamp is None or not (start <= stamp < end):
+            continue
+        if not candidate.get("ticket"):
+            continue
+        key = (candidate.get("source"), str(candidate.get("ticket")).strip().upper())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        row_company = candidate.get("source") or "Unknown"
+        row_area = ", ".join(p for p in (candidate.get("city"), candidate.get("state")) if p) or "Unknown"
+        bucket = _bucket(candidate)
+        technician = candidate.get("recommended") or candidate.get("actual_destination")
+
+        if company and row_company != company:
+            continue
+        if area and area.lower() not in row_area.lower():
+            continue
+        if status and bucket != status:
+            continue
+        if query:
+            needle = query.strip().lower()
+            haystack = " ".join(str(v or "") for v in (
+                candidate.get("ticket"), row_company, row_area,
+                candidate.get("service"), technician)).lower()
+            if needle not in haystack:
+                continue
+
+        rows.append({
+            "message_id": candidate.get("message_id"),
+            "at": stamp.isoformat(),
+            "company": row_company,
+            "area": row_area,
+            "service": candidate.get("service"),
+            "technician": technician,
+            "ticket": candidate.get("ticket"),
+            "bucket": bucket,
+            "status": candidate.get("status"),
+            "review_reason": candidate.get("review_reason"),
+        })
+
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    return {
+        "range": range_key,
+        "timezone": tz_name,
+        "range_start": start.isoformat(),
+        "range_end": end.isoformat(),
+        "total": len(rows),
+        "filters": {"company": company, "area": area, "status": status, "query": query},
+        "jobs": rows[:limit],
+    }
+
+
 def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
               tz_name: str = OPERATIONAL_TIMEZONE, recent_limit: int = 12) -> dict:
     """The business day as an owner reads it.

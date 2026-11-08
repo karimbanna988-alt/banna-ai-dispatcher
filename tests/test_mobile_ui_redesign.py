@@ -146,6 +146,30 @@ def test_bottom_navigation_has_four_primary_screens(index_html):
         assert f'data-goto="{secondary}"' in index_html, f"{secondary} must be reachable from More"
 
 
+def test_primary_navigation_precedes_every_screen_inside_sticky_chrome(index_html, css):
+    """Desktop must not place the primary navigation after the job list.
+
+    The same source-ordered nav remains fixed at the bottom on phones, but
+    its desktop in-flow position is immediately below the header.
+    """
+    chrome_start = index_html.index('class="app-chrome"')
+    chrome_end = index_html.index("</div>", index_html.index('id="offlineBar"'))
+    chrome = index_html[chrome_start:chrome_end]
+    assert chrome.index('class="topbar"') < chrome.index('id="tabbar"')
+    assert chrome.index('id="tabbar"') < chrome.index('id="offlineBar"')
+    assert index_html.index('id="tabbar"') < index_html.index('id="screenToday"')
+
+    chrome_css = css[css.index(".app-chrome {"):css.index("}", css.index(".app-chrome {") + 1)]
+    assert "position: sticky" in chrome_css and "top: 0" in chrome_css
+
+    base_nav = css[css.index(".tabbar {"):css.index("}", css.index(".tabbar {") + 1)]
+    assert "position: fixed" in base_nav and "bottom: 0" in base_nav
+
+    desktop = css[css.index("@media (min-width: 769px)"):css.index("@media (max-width: 768px)")]
+    desktop_nav = desktop[desktop.index(".tabbar {"):desktop.index("}", desktop.index(".tabbar {") + 1)]
+    assert "position: static" in desktop_nav
+
+
 def test_today_is_the_default_screen(index_html, js):
     """The owner opens Banna to see the business, not the dispatch board."""
     assert 'class="screen on" id="screenToday"' in index_html
@@ -402,18 +426,68 @@ def test_the_active_tab_uses_a_soft_pill(css):
 
 
 # ================================================= COLOUR SYSTEM ======
-def test_the_page_is_warm_stone_not_white(css):
+def test_the_day_theme_is_a_light_neutral_with_white_cards(css):
     root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
-    assert "--bg:        #E7E2D9" in root, "warm stone page"
-    assert "--surface:   #F1ECE4" in root, "parchment cards"
+    assert "--bg:        #F2F4F7" in root, "light neutral page"
+    assert "--surface:   #FFFFFF" in root, "white cards"
 
 
 def test_the_specified_accents_are_used(css):
     root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
-    assert "#5D7462" in root, "sage identity"
-    assert "#557B60" in root, "success green"
-    assert "#B68142" in root, "warning amber"
-    assert "#A65A52" in root, "danger brick"
+    assert "#E2663B" in root, "day accent"
+    assert "#15803D" in root, "success green"
+    assert "#C2410C" in root, "warning amber"
+    assert "#B91C1C" in root, "danger red"
+
+
+# ============================================ day / night themes ======
+def test_the_theme_follows_the_operational_clock_not_the_device(js):
+    """The laptop runs UTC+3 while the business runs on America/New_York.
+    A device-local switch would turn the screen dark in the middle of
+    the shift, so the theme reads the same clock the CRM reports on."""
+    body = _function_body(js, "shiftHour")
+    assert '"America/New_York"' in body
+    assert "Intl.DateTimeFormat" in body
+    assert "getTimezoneOffset" not in body
+
+
+def test_day_starts_before_eight_so_the_shift_opens_bright(js):
+    assert "DAY_STARTS_HOUR = 6" in js
+    assert "NIGHT_STARTS_HOUR = 18" in js
+    body = _function_body(js, "themeForHour")
+    assert "DAY_STARTS_HOUR" in body and "NIGHT_STARTS_HOUR" in body
+
+
+@needs_node
+@pytest.mark.parametrize("iso,expected", [
+    ("2026-11-08T10:30:00Z", "night"),   # 05:30 ET, still dark
+    ("2026-11-08T11:30:00Z", "day"),     # 06:30 ET, day has begun
+    ("2026-11-08T12:45:00Z", "day"),     # 07:45 ET, shift start -> bright
+    ("2026-11-08T22:30:00Z", "day"),     # 17:30 ET
+    ("2026-11-08T23:30:00Z", "night"),   # 18:30 ET
+    ("2026-11-09T04:00:00Z", "night"),   # 23:00 ET
+])
+def test_theme_boundaries_run_correctly(iso, expected):
+    """Executes the real functions, so a timezone mistake fails here."""
+    src = _function_body(JS.read_text(encoding="utf-8"), "shiftHour")
+    src += "\n" + _function_body(JS.read_text(encoding="utf-8"), "themeForHour")
+    src += ("\nconst DAY_STARTS_HOUR = 6, NIGHT_STARTS_HOUR = 18;"
+            "\nprocess.stdout.write(themeForHour(shiftHour(new Date(%r))));" % iso)
+    out = subprocess.run([NODE, "-e", src.replace("'", '"', 0)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == expected
+
+
+def test_the_theme_is_re_evaluated_during_a_long_shift(js):
+    """A dispatcher who opens the app at 5pm must not still be on the
+    day theme at midnight."""
+    assert "setInterval(applyTheme" in js
+
+
+def test_the_browser_chrome_follows_the_theme(js):
+    body = _function_body(js, "applyTheme")
+    assert 'meta[name="theme-color"]' in body
+    assert "#11151B" in body
 
 
 def test_cards_separate_from_the_page(css):

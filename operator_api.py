@@ -93,6 +93,7 @@ from dispatcher.updates import reply_for_update_type  # noqa: E402
 from dispatcher import technician_ack  # noqa: E402
 from dispatcher import message_patterns  # noqa: E402
 from dispatcher import demo_dispatcher  # noqa: E402
+from dispatcher import quo_dispatch_shadow  # noqa: E402
 from dispatcher.parser import extract_job  # noqa: E402
 from dispatcher import pipeline  # noqa: E402
 from dispatcher.workflow_projection import (  # noqa: E402
@@ -2344,6 +2345,31 @@ def route_whatsapp_shadow_feed(handler: "Handler", match: dict, body: dict) -> d
         conn.close()
 
 
+def route_quo_dispatch_shadow(handler: "Handler", match: dict, body: dict) -> dict:
+    """Current-session AGN/Lucky Quo dispatch episodes, read-only.
+
+    ``mode=historical`` is the sole replay switch.  It reads a small slice
+    of persisted real evidence and labels it explicitly; the default uses
+    the API process start as a hard event-time boundary so the old Quo
+    backlog can never masquerade as live work.
+    """
+    historical_replay = body.get("mode") == "historical"
+    started_epoch = _RUNTIME.get("started_at")
+    session_started_at = None
+    if started_epoch is not None and not historical_replay:
+        session_started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).isoformat()
+    conn = get_conn()
+    try:
+        return quo_dispatch_shadow.project_quo_dispatch_shadow(
+            conn,
+            session_started_at=session_started_at,
+            historical_replay=historical_replay,
+            limit=12 if historical_replay else 100,
+        )
+    finally:
+        conn.close()
+
+
 # Real process state, populated by run(). Never guessed: if a value was
 # not actually recorded, /api/live_health omits it rather than inventing
 # an uptime or a green light.
@@ -2978,11 +3004,134 @@ def route_crm_summary(handler: "Handler", match: dict, body: dict) -> dict:
     if range_key not in crm_summary.RANGES:
         range_key = crm_summary.RANGE_TODAY
     projection = route_whatsapp_candidates(handler, match, {})
-    return crm_summary.summarize(
+    payload = crm_summary.summarize(
         projection.get("candidates") or [],
         datetime.now(timezone.utc),
         range_key=range_key,
     )
+    # A zero has to be explainable. Without this the dispatcher cannot
+    # tell a quiet morning from a dead bridge or an unmapped group.
+    conn = get_conn()
+    try:
+        payload["intake_health"] = storage.intake_health(conn)
+    finally:
+        conn.close()
+    return payload
+
+
+GROUP_ROLES = ("COMPANY_JOB_INTAKE", "COMPANY_CLOSINGS", "TECH_DISPATCH",
+               "TECH_CLOSINGS", "UNMAPPED_WORK", "IGNORE")
+
+
+def route_crm_jobs(handler: "Handler", match: dict, body: dict) -> dict:
+    """The Jobs list behind every number on Today. READ-ONLY.
+
+    Shares the candidate projection and the crm_summary rules, so a
+    counter and the list it opens always agree.
+    """
+    range_key = (body.get("range") or "month").lower()
+    if range_key not in crm_summary.RANGES:
+        range_key = crm_summary.RANGE_MONTH
+    projection = route_whatsapp_candidates(handler, match, {})
+    return crm_summary.job_rows(
+        projection.get("candidates") or [],
+        datetime.now(timezone.utc),
+        range_key=range_key,
+        company=(body.get("company") or "").strip() or None,
+        area=(body.get("area") or "").strip() or None,
+        status=(body.get("status") or "").strip() or None,
+        query=(body.get("q") or "").strip() or None,
+    )
+
+
+def route_groups(handler: "Handler", match: dict, body: dict) -> dict:
+    """Every captured WhatsApp group, busiest-unclassified first.
+
+    This is the screen that makes the CRM's numbers true. Banna can only
+    attribute a job to a company when the group it arrived in is mapped;
+    an unmapped group with real traffic is business the CRM is silently
+    getting wrong. READ-ONLY.
+    """
+    conn = get_conn()
+    try:
+        groups = storage.list_group_activity(conn)
+        # Registry history plus the companies the resolver itself can
+        # identify, so the owner picks from a known set instead of
+        # typing a fourth competitor into existence by accident.
+        companies = sorted(set(storage.known_companies(conn)) | {
+            company_resolver.MIKE_JOBS, company_resolver.LUCKY, company_resolver.AGN})
+        technicians = [
+            {"id": t.get("id"), "name": t.get("name")}
+            for t in storage.list_technicians(conn)
+        ]
+    finally:
+        conn.close()
+
+    unclassified = [
+        g for g in groups
+        if not g["confirmed_by_owner"] or not g["role"] or g["role"] == "UNMAPPED_WORK"
+    ]
+    return {
+        "groups": groups,
+        "companies": companies,
+        "technicians": technicians,
+        "roles": list(GROUP_ROLES),
+        "total": len(groups),
+        "unclassified": len(unclassified),
+        "unclassified_with_recent_traffic": sum(
+            1 for g in unclassified if g["recent_count"] > 0),
+    }
+
+
+def route_group_map(handler: "Handler", match: dict, body: dict) -> dict:
+    """Owner maps one group. The ONLY way mapping ever changes.
+
+    Nothing here is inferred. Banna never promotes a group on its own,
+    because a wrong company mapping silently corrupts correlation for
+    every job that group carries: a technician destination is not a
+    company identity, and a guess here would spread into the counts the
+    owner is trying to trust.
+    """
+    group_id = (match or {}).get("group_id") or body.get("group_id")
+    if not group_id:
+        raise HttpError(400, "group_id is required")
+
+    role = (body.get("role") or "").strip().upper()
+    if role not in GROUP_ROLES:
+        raise HttpError(400, "role must be one of: %s" % ", ".join(GROUP_ROLES))
+
+    company = (body.get("company") or "").strip() or None
+    service_area = (body.get("service_area") or "").strip() or None
+    technician_id = body.get("technician_id")
+    if technician_id in ("", "null"):
+        technician_id = None
+
+    # An intake group with no company cannot attribute its jobs to
+    # anyone, which is the exact defect this screen exists to remove.
+    if role == "COMPANY_JOB_INTAKE" and not company:
+        raise HttpError(400, "a job-intake group needs a company")
+
+    conn = get_conn()
+    try:
+        existing = storage.get_group_registry_entry(conn, group_id)
+        if existing is None:
+            raise HttpError(404, "unknown group")
+        storage.upsert_group_registry_entry(conn, {
+            "group_id": group_id,
+            "exact_name": existing.get("exact_name"),
+            "role": role,
+            "company": company,
+            "service_area": service_area,
+            "technician_id": technician_id,
+            "technician_name_unconfirmed": existing.get("technician_name_unconfirmed"),
+            "is_active": True,
+            "confirmed_by_owner": True,
+            "source": "owner_manual",
+            "notes": existing.get("notes"),
+        })
+        return {"ok": True, "group": storage.get_group_registry_entry(conn, group_id)}
+    finally:
+        conn.close()
 
 
 def route_demo_console(handler: "Handler", match: dict, body: dict) -> dict:
@@ -3133,12 +3282,16 @@ ROUTES = [
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/attach$", route_whatsapp_attach, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/ignore$", route_whatsapp_ignore, {}),
     ("GET", r"^/api/whatsapp_shadow_feed$", route_whatsapp_shadow_feed, {}),
+    ("GET", r"^/api/quo_dispatch_shadow$", route_quo_dispatch_shadow, {}),
     ("GET", r"^/api/demo_console$", route_demo_console, {}),
     ("GET", r"^/api/live_feed$", route_live_feed, {}),
     ("GET", r"^/api/live_health$", route_live_health, {}),
     ("GET", r"^/api/apprentice_suggestions$", route_apprentice_suggestions, {}),
     ("GET", r"^/api/whatsapp_candidates$", route_whatsapp_candidates, {}),
     ("GET", r"^/api/crm/summary$", route_crm_summary, {}),
+    ("GET", r"^/api/crm/jobs$", route_crm_jobs, {}),
+    ("GET", r"^/api/groups$", route_groups, {}),
+    ("POST", r"^/api/groups/(?P<group_id>[^/]+)/map$", route_group_map, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
 ]
 _COMPILED_ROUTES = [(method, re.compile(pattern), fn, opts) for method, pattern, fn, opts in ROUTES]

@@ -153,6 +153,9 @@ const Api = {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/ignore`, {});
   },
   getWhatsappShadowFeed() { return this._call("GET", "/api/whatsapp_shadow_feed"); },
+  getQuoDispatchShadow(historicalReplay) {
+    return this._call("GET", "/api/quo_dispatch_shadow" + (historicalReplay ? "?mode=historical" : ""));
+  },
   getDemoConsole() { return this._call("GET", "/api/demo_console"); },
   getLiveFeed() { return this._call("GET", "/api/live_feed"); },
   getLiveHealth() { return this._call("GET", "/api/live_health"); },
@@ -160,6 +163,15 @@ const Api = {
   getWhatsappCandidates() { return this._call("GET", "/api/whatsapp_candidates"); },
   // The CRM home/reports summary. One read-only call rather than the
   // phone joining several endpoints and reconciling them itself.
+  getCrmJobs(params) {
+    const q = new URLSearchParams();
+    Object.keys(params || {}).forEach((k) => { if (params[k]) q.set(k, params[k]); });
+    return this._call("GET", "/api/crm/jobs" + (q.toString() ? "?" + q.toString() : ""));
+  },
+  getGroups() { return this._call("GET", "/api/groups"); },
+  mapGroup(groupId, mapping) {
+    return this._call("POST", `/api/groups/${encodeURIComponent(groupId)}/map`, mapping);
+  },
   getCrmSummary(range) { return this._call("GET", "/api/crm/summary?range=" + encodeURIComponent(range || "today")); },
   promoteWhatsappToJob(messageId) {
     return this._call("POST", `/api/whatsapp_pending/${encodeURIComponent(messageId)}/promote_to_job`, {});

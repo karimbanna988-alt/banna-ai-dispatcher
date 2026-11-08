@@ -17,7 +17,7 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=7">
+<link rel="stylesheet" href="css/console.css?v=10">
 </head>
 <body>
 
@@ -33,6 +33,9 @@
 
 <div id="app" class="app" hidden>
 
+  <!-- The desktop header and primary navigation are one sticky chrome
+       region. On phones the same nav is fixed at the bottom by CSS. -->
+  <div class="app-chrome">
   <!-- Header. Health lives here as three small dots: when everything is
        healthy it should read as punctuation, not as a section. -->
   <header class="topbar">
@@ -67,9 +70,46 @@
     </div>
   </header>
 
-  <!-- Connectivity truth. Never let cached pixels read as live work. -->
-  <div id="offlineBar" class="offline-bar" hidden>
-    <b>OFFLINE</b> <span id="offlineDetail">not live &middot; showing last known state</span>
+    <!-- Primary navigation is deliberately before every screen in source
+         order. Desktop keeps it below the header; phones pin it to the
+         thumb-reachable bottom edge. -->
+    <nav class="tabbar" id="tabbar">
+      <button class="tab on" data-screen="today" aria-label="Today">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="3.5" y="5" width="17" height="15.5" rx="2.5"></rect>
+          <path d="M3.5 9.5h17"></path><path d="M8 3.5v3"></path><path d="M16 3.5v3"></path>
+        </svg>
+        <span class="tab-l">Today</span>
+      </button>
+      <button class="tab" data-screen="jobs" aria-label="Jobs">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="3" y="7.5" width="18" height="12.5" rx="2.5"></rect>
+          <path d="M9 7.5V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1.5"></path>
+          <path d="M3 12.5h18"></path>
+        </svg>
+        <span class="tab-l">Jobs</span>
+      </button>
+      <button class="tab" data-screen="reports" aria-label="Reports">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 20V9.5"></path><path d="M10 20V4.5"></path>
+          <path d="M16 20v-8"></path><path d="M21 20H3"></path>
+        </svg>
+        <span class="tab-l">Reports</span>
+      </button>
+      <button class="tab" data-screen="more" aria-label="More">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle class="solid" cx="5.5" cy="12" r="1.5"></circle>
+          <circle class="solid" cx="12" cy="12" r="1.5"></circle>
+          <circle class="solid" cx="18.5" cy="12" r="1.5"></circle>
+        </svg>
+        <span class="tab-l">More</span>
+      </button>
+    </nav>
+
+    <!-- Connectivity truth. Never let cached pixels read as live work. -->
+    <div id="offlineBar" class="offline-bar" hidden>
+      <b>OFFLINE</b> <span id="offlineDetail">not live &middot; showing last known state</span>
+    </div>
   </div>
 
   <!-- ============================ TODAY (default) ================== -->
@@ -94,6 +134,8 @@
       </button>
     </div>
 
+    <div class="zero-state" id="zeroState" hidden></div>
+
     <div class="stat wide" id="revenueCard">
       <span class="stat-n" id="statRevenue">&mdash;</span>
       <span class="stat-l" id="revenueNote">Verified closing revenue</span>
@@ -117,49 +159,66 @@
 
   <!-- ============================ JOBS ============================= -->
   <section class="screen" id="screenJobs" data-screen="jobs" hidden>
+    <div class="screen-head">
+      <h1>Jobs</h1>
+      <span class="screen-note" id="jobsNote">All job records</span>
+    </div>
 
-    <!-- Phone stage switcher. One tap per stage; only one stage occupies
-         the phone viewport at a time. The selected card carries the blue
-         accent. Hidden on desktop, where all three columns are visible. -->
-    <nav class="stages" id="stages">
-      <button class="stage on" data-stage="dispatch">
-        <span class="stage-n" id="stDispatch">0</span><span class="stage-l">To dispatch</span>
-      </button>
-      <button class="stage" data-stage="progress">
-        <span class="stage-n" id="stProgress">0</span><span class="stage-l">In progress</span>
-      </button>
-      <button class="stage" data-stage="close">
-        <span class="stage-n" id="stClose">0</span><span class="stage-l">To close</span>
-      </button>
-    </nav>
+    <input type="search" id="jobSearch" class="search wide" placeholder="Search ticket, company, area, technician" autocomplete="off">
 
-    <div id="searchResults" class="search-results" hidden></div>
+    <div class="chips" id="jobRanges">
+      <button class="chip-btn" data-jrange="today">Today</button>
+      <button class="chip-btn" data-jrange="yesterday">Yesterday</button>
+      <button class="chip-btn" data-jrange="week">This week</button>
+      <button class="chip-btn on" data-jrange="month">This month</button>
+    </div>
+    <div class="chips" id="jobStatuses">
+      <button class="chip-btn on" data-jstatus="">All</button>
+      <button class="chip-btn" data-jstatus="open">Open</button>
+      <button class="chip-btn" data-jstatus="completed">Completed</button>
+      <button class="chip-btn" data-jstatus="needs_attention">Attention</button>
+    </div>
+    <div class="active-filter" id="jobFilterNote" hidden></div>
 
-    <section class="demo-strip" id="demoStrip" hidden>
-      <div class="demo-head">
-        <span class="demo-tag">DEMO</span>
-        <span id="demoState" class="demo-state"></span>
-        <span class="demo-note">isolated &middot; no production job is created</span>
-      </div>
-      <div class="demo-steps" id="demoSteps"></div>
-    </section>
+    <div class="rows" id="jobList"></div>
 
-    <main class="board" id="board" data-stage="dispatch">
-      <section class="col" id="colDispatch" data-col="dispatch">
-        <div class="col-head"><h2>To dispatch</h2><span class="col-count" id="hdDispatch">0</span></div>
-        <div class="col-body" id="listDispatch"></div>
+    <!-- The dispatch board stays available; it is the live working
+         surface, while the list above is the record. -->
+    <details class="board-wrap">
+      <summary>Dispatch board</summary>
+      <nav class="stages" id="stages">
+        <button class="stage on" data-stage="dispatch">
+          <span class="stage-n" id="stDispatch">0</span><span class="stage-l">To dispatch</span>
+        </button>
+        <button class="stage" data-stage="progress">
+          <span class="stage-n" id="stProgress">0</span><span class="stage-l">In progress</span>
+        </button>
+        <button class="stage" data-stage="close">
+          <span class="stage-n" id="stClose">0</span><span class="stage-l">To close</span>
+        </button>
+      </nav>
+      <div id="searchResults" class="search-results" hidden></div>
+      <section class="demo-strip" id="demoStrip" hidden>
+        <div class="demo-head"><span class="demo-tag">DEMO</span>
+          <span id="demoState" class="demo-state"></span>
+          <span class="demo-note">isolated &middot; no production job is created</span></div>
+        <div class="demo-steps" id="demoSteps"></div>
       </section>
-
-      <section class="col" id="colProgress" data-col="progress">
-        <div class="col-head"><h2>In progress</h2><span class="col-count" id="hdProgress">0</span></div>
-        <div class="col-body" id="listProgress"></div>
-      </section>
-
-      <section class="col" id="colClose" data-col="close">
-        <div class="col-head"><h2>To close</h2><span class="col-count" id="hdClose">0</span></div>
-        <div class="col-body" id="listClose"></div>
-      </section>
-    </main>
+      <main class="board" id="board" data-stage="dispatch">
+        <section class="col" id="colDispatch" data-col="dispatch">
+          <div class="col-head"><h2>To dispatch</h2><span class="col-count" id="hdDispatch">0</span></div>
+          <div class="col-body" id="listDispatch"></div>
+        </section>
+        <section class="col" id="colProgress" data-col="progress">
+          <div class="col-head"><h2>In progress</h2><span class="col-count" id="hdProgress">0</span></div>
+          <div class="col-body" id="listProgress"></div>
+        </section>
+        <section class="col" id="colClose" data-col="close">
+          <div class="col-head"><h2>To close</h2><span class="col-count" id="hdClose">0</span></div>
+          <div class="col-body" id="listClose"></div>
+        </section>
+      </main>
+    </details>
   </section>
 
   <!-- ============================ REPORTS ========================== -->
@@ -209,16 +268,32 @@
     <div class="lo-body" id="loBody"></div>
   </section>
 
+  <!-- ============================ GROUP MAPPING ==================== -->
+  <section class="screen" id="screenGroups" data-screen="groups" hidden>
+    <div class="screen-head">
+      <h1>WhatsApp groups</h1>
+      <span class="screen-note" id="groupsNote">Banna can only attribute a job when its group is mapped</span>
+    </div>
+    <div class="chips" id="groupFilters">
+      <button class="chip-btn on" data-gfilter="needs">Needs mapping</button>
+      <button class="chip-btn" data-gfilter="active">Has traffic</button>
+      <button class="chip-btn" data-gfilter="all">All</button>
+    </div>
+    <div class="rows" id="groupList"></div>
+  </section>
+
   <!-- ============================ ACTIVE SHADOW ==================== -->
   <section class="screen" id="screenShadow" data-screen="shadow" hidden>
     <div class="screen-head">
       <h1>Active shadow</h1>
       <span class="screen-note">deterministic analysis &middot; simulation only &middot; nothing is sent</span>
     </div>
+    <div class="shadow-safety">SIMULATION ONLY &mdash; NOTHING SENT</div>
     <div class="sp-meta">
-      <span>Session started <b id="shadowStart2">--</b></span>
+      <span><span id="shadowWindowLabel">Session started</span> <b id="shadowStart2">--</b></span>
       <span id="shadowSummary2">No real jobs yet this session.</span>
     </div>
+    <button class="shadow-replay" id="shadowReplayBtn" type="button" data-act="shadow-replay" hidden>Show real historical replay</button>
     <div class="sp-body" id="shadowBody2"></div>
   </section>
 
@@ -251,6 +326,7 @@
       <button class="menu-item" data-goto="live">Live operations<span>Event stream</span></button>
       <button class="menu-item" data-goto="apprentice">Apprentice<span>Suggested patterns &middot; read-only</span></button>
       <button class="menu-item" data-goto="techs">Technicians<span>Routing coverage</span></button>
+      <button class="menu-item" data-goto="groups">WhatsApp groups<span id="groupsMenuNote">Tell Banna what each group is</span></button>
       <button class="menu-item" data-goto="shadow">Active shadow<span>What Banna would dispatch</span></button>
     </div>
 
@@ -292,46 +368,10 @@
     <div class="detail-bar" id="detailBar" hidden></div>
   </aside>
 
-  <!-- Fixed bottom navigation. Sits above the home indicator via the
-       safe-area inset, and the screens reserve matching bottom padding
-       so it never covers the last card. -->
-  <nav class="tabbar" id="tabbar">
-    <button class="tab on" data-screen="today" aria-label="Today">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="3.5" y="5" width="17" height="15.5" rx="2.5"></rect>
-        <path d="M3.5 9.5h17"></path><path d="M8 3.5v3"></path><path d="M16 3.5v3"></path>
-      </svg>
-      <span class="tab-l">Today</span>
-    </button>
-    <button class="tab" data-screen="jobs" aria-label="Jobs">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="3" y="7.5" width="18" height="12.5" rx="2.5"></rect>
-        <path d="M9 7.5V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1.5"></path>
-        <path d="M3 12.5h18"></path>
-      </svg>
-      <span class="tab-l">Jobs</span>
-    </button>
-    <button class="tab" data-screen="reports" aria-label="Reports">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M4 20V9.5"></path><path d="M10 20V4.5"></path>
-        <path d="M16 20v-8"></path><path d="M21 20H3"></path>
-      </svg>
-      <span class="tab-l">Reports</span>
-    </button>
-    <button class="tab" data-screen="more" aria-label="More">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle class="solid" cx="5.5" cy="12" r="1.5"></circle>
-        <circle class="solid" cx="12" cy="12" r="1.5"></circle>
-        <circle class="solid" cx="18.5" cy="12" r="1.5"></circle>
-      </svg>
-      <span class="tab-l">More</span>
-    </button>
-  </nav>
-
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=7"></script>
-<script src="js/console.js?v=7"></script>
+<script src="js/api.js?v=10"></script>
+<script src="js/console.js?v=10"></script>
 </body>
 </html>

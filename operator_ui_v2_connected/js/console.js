@@ -49,8 +49,13 @@
     lastGood: null,       // Date of the last successful load
     screen: "today",      // which bottom-nav screen owns the viewport
     crm: null,            // last /api/crm/summary payload
+    groups: null,         // last /api/groups payload
+    groupFilter: "needs",
+    jobsQuery: { range: "month", status: "", company: "", area: "", q: "" },
     reportRange: "today",
     candidatesAll: [],    // every evaluated candidate, for the shadow session
+    quoShadow: { episodes: [] }, // read-only AGN/Lucky Quo -> WhatsApp episodes
+    quoShadowReplay: false,
     liveOpen: false,      // Live screen is the visible one
     apprenticeOpen: false,// Apprentice screen is the visible one
     health: null,         // last /api/live_health payload
@@ -145,32 +150,37 @@
   const SHADOW_SESSION_START = new Date();
 
   function shadowDecision(c) {
-    const s = c.status;
+    const s = c.state || c.status;
     if (c.review_reason || s === "HUMAN_REVIEW_NEEDED")
       return { label: "Human review", tone: "rev" };
     if (s === "ALREADY DISPATCHED") return { label: "Already dispatched", tone: "done" };
     if (s === "REPOST AFTER PRIOR DISPATCH") return { label: "Human review", tone: "rev" };
     if (s === "CLOSING OBSERVED") return { label: "Waiting for closing", tone: "done" };
     if (s === "GROUP MAPPING REQUIRED") return { label: "Cannot route", tone: "na" };
-    if (s === "WAITING FOR HUMAN DISPATCH") {
-      return c.recommended && c.proposed_message
+    if (s === "WAITING_FOR_HUMAN_DISPATCH" || s === "WAITING FOR HUMAN DISPATCH") {
+      return (c.recommended_technician || c.recommended) && (c.prepared_message || c.proposed_message)
         ? { label: "Dispatch", tone: "act" }
         : { label: "Cannot route", tone: "na" };
     }
+    if (s === "WAITING_FOR_TECHNICIAN_ACK") return { label: "Human dispatch observed", tone: "done" };
+    if (s === "TECHNICIAN_ACKNOWLEDGED") return { label: "Technician acknowledged", tone: "done" };
+    if (s === "HUMAN_DISPATCH_OBSERVED") return { label: "Human dispatch observed", tone: "done" };
+    if (s === "HUMAN_DISPATCH_AMBIGUOUS" || s === "ACKNOWLEDGEMENT_AMBIGUOUS")
+      return { label: "Human review", tone: "rev" };
     return { label: displayLabel(s), tone: "na" };
   }
 
-  // Real work captured since this session began. Historical rows stay
-  // available to correlation; they just do not flood the demonstration.
+  // The API already enforces the process-session event-time boundary.
+  // This display layer only enforces the AGN/Lucky product scope and
+  // deduplicates episode ids; it must not hide a job that arrived after
+  // the server session began but just before this browser tab opened.
   function shadowJobs() {
-    const all = [].concat(state.candidates || [], state.candidateReviews || [],
-                          state.candidatesAll || []);
+    const all = (state.quoShadow && state.quoShadow.episodes) || [];
     const seen = new Set();
     return all.filter((c) => {
-      if (!c || seen.has(c.message_id)) return false;
-      seen.add(c.message_id);
-      const t = Date.parse(c.received_at || "");
-      return !isNaN(t) && t >= SHADOW_SESSION_START.getTime();
+      if (!c || !["AGN", "Lucky"].includes(c.company || c.source) || seen.has(c.episode_id)) return false;
+      seen.add(c.episode_id);
+      return true;
     });
   }
 
@@ -184,25 +194,63 @@
     // decision, observed read-only, never asked for.
     const dest = c.actual_destination;
     if (!dest) return null;
-    return { technician: dest, at: c.received_at || null,
+    return { technician: dest, at: c.human_dispatch_timestamp || null,
              verified: c.routing_match || null };
   }
 
   function comparison(c) {
     const human = humanAction(c);
     if (!human) return { state: "waiting", text: "Waiting for human action" };
-    const banna = c.recommended || null;
+    const banna = c.recommended_technician || c.recommended || null;
     // The server already compared its own recommendation against the
     // observed destination; trust that verdict rather than re-deriving a
     // second opinion here.
     if (human.verified === "MATCH") return { state: "match", text: "Match" };
+    if (human.verified === "DIFFERENT") return { state: "diff", text: "Different destination" };
+    if (human.verified === "UNDETERMINED")
+      return { state: "waiting", text: "Outgoing evidence is ambiguous" };
     if (!banna) {
       return { state: "waiting",
                text: "Human dispatched " + human.technician + " · Banna had no recommendation to compare" };
     }
-    return String(banna).trim().toLowerCase() === String(human.technician).trim().toLowerCase()
-      ? { state: "match", text: "Match" }
-      : { state: "diff", text: "Different · Banna " + banna + ", human " + human.technician };
+    return { state: "waiting", text: "Waiting for comparable human evidence" };
+  }
+
+  /* ------------------------------------------------------ day/night --
+     Two themes on one clock. The dispatcher works US hours, and the CRM
+     already reports its business day in America/New_York, so the theme
+     follows that same clock rather than the laptop's timezone -- the
+     machine currently runs UTC+3, where a device-local switch would turn
+     the screen dark in the middle of the shift.
+
+     Day starts at 6am so the bright theme is already up before an 8am
+     start; night starts at 6pm. Colour MEANING never changes between
+     them, only surface and contrast, so nothing has to be relearned. */
+  const DAY_STARTS_HOUR = 6;
+  const NIGHT_STARTS_HOUR = 18;
+
+  function shiftHour(now) {
+    // Hour of day in the operational timezone, whatever the device is set to.
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", hour: "numeric", hour12: false,
+    }).formatToParts(now || new Date());
+    const hour = parts.find((p) => p.type === "hour");
+    return hour ? parseInt(hour.value, 10) % 24 : new Date().getHours();
+  }
+
+  function themeForHour(hour) {
+    return (hour >= DAY_STARTS_HOUR && hour < NIGHT_STARTS_HOUR) ? "day" : "night";
+  }
+
+  function applyTheme() {
+    const theme = themeForHour(shiftHour());
+    const root = document.documentElement;
+    if (root.getAttribute("data-theme") !== theme) {
+      root.setAttribute("data-theme", theme);
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", theme === "night" ? "#11151B" : "#F2F4F7");
+    }
+    return theme;
   }
 
   function age(mins) {
@@ -269,11 +317,12 @@
   async function load() {
     if (state.paused) return;
     try {
-      const [newJobs, active, closings, wa] = await Promise.all([
+      const [newJobs, active, closings, wa, quoShadow] = await Promise.all([
         Api.getNewJobs(), Api.getActive(), Api.getClosings(),
         // WhatsApp jobs understood and routed but NOT committed jobs.
         // A failure here must never blank the real board.
         Api.getWhatsappCandidates().catch(() => ({ candidates: [] })),
+        Api.getQuoDispatchShadow(state.quoShadowReplay).catch(() => ({ episodes: [] })),
       ]);
 
       // TO DISPATCH: live bucket first. `older` is deliberately excluded
@@ -303,6 +352,8 @@
       // including the ones it decided not to act on -- that judgement is
       // exactly what the owner is here to watch.
       state.candidatesAll = (wa.candidates || []);
+      state.quoShadow = quoShadow || { episodes: [] };
+      state.quoShadowReplay = Boolean(quoShadow && quoShadow.historical_replay);
 
       state.failures = 0;
       state.lastGood = new Date();
@@ -468,12 +519,12 @@
     return { text: "$" + Number(value).toLocaleString("en-US"), unknown: false };
   }
 
-  function rankRows(items, emptyText) {
+  function rankRows(items, emptyText, kind) {
     if (!items || !items.length) return `<div class="empty">${esc(emptyText)}</div>`;
     const top = items.slice(0, 5);
     const max = Math.max.apply(null, top.map((i) => i.count)) || 1;
     return top.map((i) => `
-      <div class="rank-row">
+      <div class="rank-row" data-rank-kind="${esc(kind || "")}" data-rank-value="${esc(i.name)}">
         <span>${esc(i.name)}</span><span class="rank-n">${esc(i.count)}</span>
         <span class="rank-bar"><i style="width:${Math.round((i.count / max) * 100)}%"></i></span>
       </div>`).join("");
@@ -507,8 +558,8 @@
       $("revenueNote").textContent = m.unknown
         ? "Verified closing revenue — not recorded yet"
         : "Verified closing revenue";
-      $("byCompany").innerHTML = rankRows(r.by_company, "No jobs recorded today.");
-      $("byArea").innerHTML = rankRows(r.by_area, "No areas recorded today.");
+      $("byCompany").innerHTML = rankRows(r.by_company, "No jobs recorded today.", "company");
+      $("byArea").innerHTML = rankRows(r.by_area, "No areas recorded today.", "area");
       $("recentJobs").innerHTML = (r.recent_jobs || []).length
         ? r.recent_jobs.map(jobRow).join("")
         : `<div class="empty">No jobs captured today yet.</div>`;
@@ -537,78 +588,103 @@
     }
   }
 
-  // Renders the shadow session: what Banna would have done for each real
-  // job captured since the console opened, and what the human did.
+  async function loadHistoricalShadow() {
+    try {
+      state.quoShadow = await Api.getQuoDispatchShadow(true);
+      state.quoShadowReplay = true;
+      renderShadow();
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      toast("Historical replay unavailable: " + e.message);
+    }
+  }
+
+  // Renders only the dedicated AGN/Lucky Quo projection. Other Quo groups
+  // remain in the shared ingestion queue, but cannot enter this demo view.
   function renderShadow() {
     const el = $("shadowBody2") || $("shadowBody");
     if (!el) return;
     const startEl = $("shadowStart2") || $("shadowStart");
-    if (startEl) startEl.textContent = formatDisplayTime(SHADOW_SESSION_START);
+    const sessionStart = (state.quoShadow && state.quoShadow.session_started_at) || SHADOW_SESSION_START;
     const jobs = shadowJobs();
+    const replay = Boolean(state.quoShadow && state.quoShadow.historical_replay);
+    if (startEl) startEl.textContent = replay ? "persisted real evidence" : formatDisplayTime(sessionStart);
+    if ($("shadowWindowLabel")) $("shadowWindowLabel").textContent = replay ? "Evidence window" : "Session started";
+    const replayBtn = $("shadowReplayBtn");
+    if (replayBtn) replayBtn.hidden = replay || jobs.length > 0;
 
-    const counts = { dispatch: 0, review: 0, already: 0, match: 0, diff: 0 };
+    const counts = { waiting: 0, review: 0, forwarded: 0, acknowledged: 0, diff: 0 };
     jobs.forEach((c) => {
-      const d = shadowDecision(c);
-      if (d.tone === "act") counts.dispatch += 1;
-      else if (d.tone === "rev") counts.review += 1;
-      else if (d.label === "Already dispatched") counts.already += 1;
-      const cmp = comparison(c);
-      if (cmp.state === "match") counts.match += 1;
-      if (cmp.state === "diff") counts.diff += 1;
+      if (c.review_reason || c.state === "HUMAN_DISPATCH_AMBIGUOUS" ||
+          c.state === "ACKNOWLEDGEMENT_AMBIGUOUS") counts.review += 1;
+      if (c.human_dispatch_state === "WAITING_FOR_HUMAN_DISPATCH") counts.waiting += 1;
+      if (c.human_dispatch_state === "HUMAN_DISPATCH_OBSERVED") counts.forwarded += 1;
+      if (c.ack_state === "TECHNICIAN_ACKNOWLEDGED") counts.acknowledged += 1;
+      if (c.routing_match === "DIFFERENT") counts.diff += 1;
     });
     const summaryEl = $("shadowSummary2") || $("shadowSummary");
     summaryEl.textContent = jobs.length
-      ? `${jobs.length} real job${jobs.length === 1 ? "" : "s"} · ${counts.dispatch} dispatch · `
-        + `${counts.review} review · ${counts.already} already dispatched · `
-        + `${counts.match} match · ${counts.diff} different`
+      ? `${jobs.length} real ${replay ? "historical " : ""}AGN/Lucky job${jobs.length === 1 ? "" : "s"} · `
+        + `${counts.waiting} waiting · ${counts.forwarded} human forwarded · `
+        + `${counts.acknowledged} K observed · ${counts.review} review · ${counts.diff} different`
       : "No new real jobs since this session started.";
 
     el.innerHTML = jobs.length ? jobs.map((c) => {
       const d = shadowDecision(c);
       const cmp = comparison(c);
       const human = humanAction(c);
-      const area = [c.city, c.state].filter(Boolean).join(", ");
+      const flow = [];
+      flow.push(`<b>QUO RECEIVED</b> · ${esc(formatDisplayTime(c.received_at))}`);
+      if (c.company) flow.push(`<b>COMPANY IDENTIFIED</b> · ${esc(c.company)}`);
+      if (c.area) flow.push(`<b>AREA RESOLVED</b> · ${esc(c.area)}`);
+      if (c.recommended_technician && c.prepared_message) {
+        flow.push(`<b>BANNA WOULD PREPARE FOR ${esc(c.recommended_technician)}</b>`);
+      }
+      if (c.human_dispatch_state === "WAITING_FOR_HUMAN_DISPATCH") {
+        flow.push("<b>WAITING FOR HUMAN DISPATCH</b>");
+      }
+      if (human) {
+        flow.push(`<b>HUMAN DISPATCH OBSERVED</b> · ${esc(human.technician)} · ${esc(c.routing_match || "")}`);
+      }
+      if (c.ack_text) {
+        flow.push(`<b>TECH K OBSERVED</b> · ${esc(c.ack_text)} · ${esc(c.ack_confidence || "")}`);
+      }
       return `<div class="sh-job">
+        ${replay ? `<div class="shadow-replay-label">REAL HISTORICAL REPLAY</div>` : ""}
         <div class="sh-top">
-          <span class="sh-company">${esc(c.source || "company not stated")}</span>
+          <span class="sh-company">${esc(c.company || c.source || "company unresolved")}</span>
           <span class="sh-ticket">${esc(c.ticket || "no ticket")}</span>
         </div>
-        <div class="sh-title">${esc(c.service || "service not stated")}${area ? " · " + esc(area) : ""}</div>
+        <div class="sh-title">${esc(c.service || "service not stated")}${c.area ? " · " + esc(c.area) : ""}</div>
         <span class="sh-decision ${d.tone}">${esc(d.label)}</span>
+        <div class="sh-flow">${flow.join("<br>↓<br>")}</div>
 
-        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
-          <span class="sh-k">Received</span>
-          <span class="sh-v">${esc(c.group_name || "")}</span></div>
-        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
-          <span class="sh-k">Company</span>
-          <span class="sh-v">${esc(c.source || "unresolved")}</span></div>
-        <div class="sh-step"><span class="sh-t">${esc(formatDisplayTime(c.received_at))}</span>
-          <span class="sh-k">Routed</span>
-          <span class="sh-v">${esc(c.recommended || "no technician matched")}${
-            c.confidence ? " · " + esc(displayLabel(c.confidence)) : ""}</span></div>
-
-        ${d.tone === "act" ? `
+        ${c.prepared_message ? `
         <div class="sh-would">
           <div class="sh-would-h">Banna would dispatch</div>
-          <div class="sh-v"><b>${esc(c.recommended)}</b></div>
-          <div class="sh-msg">${esc(c.proposed_message || "")}</div>
-          <div class="sh-sim">Simulation only &mdash; nothing sent</div>
+          <div class="sh-v"><b>${esc(c.recommended_technician)}</b> · ${esc(c.expected_destination)}</div>
+          <div class="sh-msg">${esc(c.prepared_message)}</div>
+          <div class="sh-sim">SIMULATION ONLY &mdash; NOTHING SENT</div>
         </div>` : `
         <div class="sh-would">
           <div class="sh-would-h">Banna would not dispatch</div>
-          <div class="sh-v">${esc(c.review_reason ? displayLabel(c.review_reason) : d.label)}</div>
-          <div class="sh-sim">Simulation only &mdash; nothing sent</div>
+          <div class="sh-v">${esc(c.review_reason || d.label)}</div>
+          <div class="sh-sim">SIMULATION ONLY &mdash; NOTHING SENT</div>
         </div>`}
 
         <div class="sh-compare">
-          ${human ? `Human dispatched <b>${esc(human.technician || "unnamed")}</b>${
-              human.destination ? " · " + esc(human.destination) : ""}${
+          ${human ? `Human dispatch observed at <b>${esc(human.technician || "unnamed destination")}</b>${
               human.at ? " · " + esc(formatDisplayTime(parseEventStamp(human.at))) : ""}<br>` : ""}
           <span class="sh-${cmp.state === "match" ? "match" : cmp.state === "diff" ? "diff" : "waiting"}">${esc(cmp.text)}</span>
+          ${c.ack_text ? `<br>Technician reply <b>${esc(c.ack_text)}</b> · ${esc(c.ack_confidence)} · ${
+              esc(formatDisplayTime(parseEventStamp(c.ack_timestamp)))}` : ""}
         </div>
+        <details><summary>Technical evidence</summary>
+          <div class="sh-v">${esc(c.decision_reason || "")} · ${esc(c.decision_confidence || "UNRESOLVED")}</div>
+        </details>
       </div>`;
-    }).join("") : `<div class="empty">Nothing captured since this session started.
-        Banna is watching; it will evaluate the next real job as it arrives.</div>`;
+    }).join("") : `<div class="empty">No current-session AGN or Lucky job yet.
+        Banna is watching read-only; use the real historical replay only when a live job is unavailable.</div>`;
   }
 
   // Evidence timestamps arrive either as an ISO string or the TEXT epoch
@@ -728,22 +804,26 @@
     state.screen = name;
     const map = { today: "screenToday", jobs: "screenJobs", reports: "screenReports",
                   live: "screenLive", apprentice: "screenApprentice",
-                  techs: "screenTechs", shadow: "screenShadow", more: "screenMore" };
+                  techs: "screenTechs", shadow: "screenShadow",
+                  groups: "screenGroups", more: "screenMore" };
     Object.keys(map).forEach((k) => {
       const el = $(map[k]);
       if (el) { el.hidden = k !== name; el.classList.toggle("on", k === name); }
     });
     // Secondary screens are reached FROM More, so More stays lit while
     // one of its tools is open -- the operator is still "in" that section.
-    const primary = ({ live: "more", apprentice: "more", techs: "more", shadow: "more" })[name] || name;
+    const primary = ({ live: "more", apprentice: "more", techs: "more",
+                       shadow: "more", groups: "more" })[name] || name;
     document.querySelectorAll(".tab").forEach((b) =>
       b.classList.toggle("on", b.getAttribute("data-screen") === primary));
     state.liveOpen = name === "live";
     state.apprenticeOpen = name === "apprentice";
     if (name === "today") loadToday();
     if (name === "reports") loadReports();
+    if (name === "jobs") loadJobs();
     if (name === "live") loadLive();
     if (name === "shadow") renderShadow();
+    if (name === "groups") loadGroups();
     if (name === "apprentice") loadApprentice();
     if (name === "techs") loadTechs();
     if (name === "more") renderMore();
@@ -821,7 +901,7 @@
         <span class="rec-v">${esc(c.recommended)}</span>
         ${confidenceChip(c.confidence)}
       </div>
-      <span class="waiting act">${esc(displayLabel(c.status))}</span>
+      <span class="waiting act">${esc(displayLabel(c.status))}</span>${staleBadge(c)}
       <div class="card-actions">
         <button class="btn primary" data-act="copy-candidate" data-id="${esc(c.message_id)}">Copy message</button>
       </div>
@@ -845,6 +925,301 @@
         <button class="btn ghost" data-act="review" data-id="${esc(c.message_id)}">Review</button>
       </div>
     </div>`;
+  }
+
+  /* ---------------------------------------------------- real dates --
+     "83d" is not something a dispatcher can act on. An actual date plus
+     the real gap since last activity is the difference between "an old
+     record" and "a job from August nobody ever closed". */
+  function formatDisplayDate(value, opts) {
+    if (value == null || value === "") return "";
+    const t = value instanceof Date ? value : new Date(value);
+    if (isNaN(t.getTime())) return "";
+    return t.toLocaleDateString("en-US",
+      Object.assign({ month: "short", day: "numeric" }, opts || {}));
+  }
+
+  function daysSince(value) {
+    if (value == null || value === "") return null;
+    const t = value instanceof Date ? value : new Date(value);
+    if (isNaN(t.getTime())) return null;
+    const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    return Math.round((startOf(new Date()) - startOf(t)) / 86400000);
+  }
+
+  // "Today 6:14 PM" / "Yesterday 7:59 PM" / "Aug 16, 7:59 PM". Absolute
+  // once it is older than yesterday, which is the point where a relative
+  // age stops carrying information.
+  function whenText(value) {
+    if (value == null || value === "") return "";
+    const t = value instanceof Date ? value : new Date(value);
+    if (isNaN(t.getTime())) return "";
+    const days = daysSince(t);
+    const clock = formatDisplayTime(t);
+    if (days === 0) return "Today " + clock;
+    if (days === 1) return "Yesterday " + clock;
+    const year = t.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" };
+    return formatDisplayDate(t, year) + ", " + clock;
+  }
+
+  function stalenessText(value) {
+    const days = daysSince(value);
+    if (days == null || days <= 0) return "";
+    if (days === 1) return "no activity since yesterday";
+    return "no activity for " + days + " days";
+  }
+
+  // Age NEVER decides whether open work is shown. A job that is
+  // genuinely open is open whether it arrived an hour ago or in August,
+  // so it stays in the queue and carries a stale warning instead of
+  // being filtered out. Age only separates HISTORICAL UNRESOLVED
+  // INTAKE -- items nobody could act on because their company was never
+  // resolved -- into a reconciliation list, so they stop masquerading
+  // as new jobs waiting to be dispatched.
+  const STALE_AFTER_DAYS = 2;
+
+  function isStale(item) {
+    const days = daysSince(item.event_at || item.received_at);
+    return days != null && days > STALE_AFTER_DAYS;
+  }
+
+  // A visible, non-destructive warning. The job stays exactly where it
+  // is; the operator is simply told how old it is.
+  function staleBadge(item) {
+    if (!isStale(item)) return "";
+    return `<span class="stale-badge">${esc(stalenessText(item.event_at || item.received_at))}</span>`;
+  }
+
+  // A backlog row leads with WHEN, because that is the fact that decides
+  // whether it still matters. Kept and labelled; never auto-closed.
+  function backlogCard(c) {
+    const stale = stalenessText(c.event_at || c.received_at);
+    const title = c.service || (c.review_reason ? displayLabel(c.review_reason) : "service not stated");
+    return `<div class="card candidate backlog" data-col="${
+      c.review_reason ? "candidate-review" : "candidate"}" data-id="${esc(c.message_id)}">
+      <div class="card-top">
+        <span class="card-company">${esc(c.source || "company not stated")}</span>
+        <span class="age">${esc(whenText(c.event_at || c.received_at))}</span>
+      </div>
+      <div class="card-title">${esc(title)}</div>
+      <div class="card-line">${esc([c.city, c.state].filter(Boolean).join(", ") || "location not stated")}</div>
+      <div class="card-line"><span class="ticket">${esc(c.ticket || "no ticket")}</span></div>
+      ${stale ? `<div class="card-line stale-line">${esc(stale)}</div>` : ""}
+    </div>`;
+  }
+
+  /* A zero that explains itself. "0 jobs" can mean a quiet morning, a
+     bridge that stopped capturing, or groups nobody mapped -- three
+     situations needing three different reactions. */
+  function renderZeroState(r) {
+    const box = $("zeroState");
+    if (!box) return;
+    if (!r || r.jobs_received > 0) { if (box) box.hidden = true; return; }
+    const health = (r && r.intake_health) || {};
+    const lines = [];
+
+    const capturedDays = daysSince(health.whatsapp_last_observation_at);
+    if (health.whatsapp_last_observation_at == null) {
+      lines.push(["bad", "WhatsApp has never captured a message"]);
+    } else if (capturedDays !== null && capturedDays >= 1) {
+      lines.push(["bad", "WhatsApp last captured " +
+        whenText(health.whatsapp_last_observation_at) + " — capture may be down"]);
+    } else {
+      lines.push(["ok", "WhatsApp capture live — last message " +
+        formatDisplayTime(health.whatsapp_last_observation_at)]);
+    }
+
+    const quoDays = daysSince(health.quo_last_checkpoint);
+    if (health.quo_last_checkpoint == null) {
+      lines.push(["warn", "Quo ingestion has never run"]);
+    } else if (quoDays !== null && quoDays >= 1) {
+      lines.push(["warn", "Quo ingestion stopped " + whenText(health.quo_last_checkpoint)]);
+    } else {
+      lines.push(["ok", "Quo ingestion running"]);
+    }
+
+    if (health.intake_groups_with_company != null) {
+      const mapped = health.intake_groups_with_company;
+      lines.push([mapped > 0 ? "warn" : "bad",
+        mapped + " group" + (mapped === 1 ? "" : "s") + " mapped as job intake" +
+        (health.groups_unmapped ? " · " + health.groups_unmapped + " still unmapped" : "")]);
+    }
+
+    box.hidden = false;
+    box.innerHTML = `<div class="zs-h">No jobs recorded today</div>`
+      + lines.map(([tone, text]) => `<div class="zs-row zs-${tone}">${esc(text)}</div>`).join("")
+      + `<button class="btn ghost" data-goto="groups">Map WhatsApp groups</button>`;
+  }
+
+  /* --------------------------------------------------- the Jobs list --
+     The record a dispatcher opens instead of scrolling WhatsApp, and the
+     destination for every number on Today. A counter that cannot be
+     opened is a dead end. */
+  function jobListRow(j) {
+    const label = j.bucket === "needs_attention" ? "Attention"
+      : j.bucket === "completed" ? "Completed" : "Open";
+    const stale = stalenessText(j.at);
+    return `<div class="job-row" data-col="candidate" data-id="${esc(j.message_id)}">
+      <span class="jr-t">${esc(whenText(j.at))}</span>
+      <span class="jr-co">${esc(j.company)}</span>
+      <span class="jr-state ${esc(j.bucket)}">${esc(label)}</span>
+      <span class="jr-main">${esc(j.area)}${j.service ? " · " + esc(j.service) : ""}</span>
+      <span class="jr-sub">${esc(j.technician || "no technician yet")}${
+        j.ticket ? " · " + esc(j.ticket) : ""}${stale ? " · " + esc(stale) : ""}</span>
+    </div>`;
+  }
+
+  function describeFilter(q) {
+    const bits = [];
+    if (q.company) bits.push(q.company);
+    if (q.area) bits.push(q.area);
+    if (q.status) bits.push(displayLabel(q.status));
+    return bits.join(" · ");
+  }
+
+  async function loadJobs() {
+    if (state.screen !== "jobs") return;
+    const q = state.jobsQuery;
+    const note = $("jobFilterNote");
+    const described = describeFilter(q);
+    if (note) {
+      if (described) {
+        note.hidden = false;
+        note.innerHTML = `Filtered: ${esc(described)}<button data-act="jobs-clear">Clear</button>`;
+      } else { note.hidden = true; }
+    }
+    try {
+      const r = await Api.getCrmJobs(q);
+      $("jobsNote").textContent = `${r.total} job${r.total === 1 ? "" : "s"} · ${r.timezone}`;
+      $("jobList").innerHTML = (r.jobs || []).length
+        ? r.jobs.map(jobListRow).join("")
+        : `<div class="empty">No jobs match this view.</div>`;
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("jobList").innerHTML = `<div class="empty">Jobs unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
+  // Tapping "AGN 9" lands on those nine rows.
+  function openJobs(filter) {
+    state.jobsQuery = Object.assign(
+      { range: "month", status: "", company: "", area: "", q: "" }, filter || {});
+    document.querySelectorAll("[data-jrange]").forEach((b) =>
+      b.classList.toggle("on", b.getAttribute("data-jrange") === state.jobsQuery.range));
+    document.querySelectorAll("[data-jstatus]").forEach((b) =>
+      b.classList.toggle("on", b.getAttribute("data-jstatus") === state.jobsQuery.status));
+    setScreen("jobs");
+  }
+
+  /* -------------------------------------------------- group mapping --
+     The CRM is only as truthful as its group mapping: an unmapped group
+     with real traffic is business Banna is silently mis-filing. Mapping
+     is always the owner's explicit choice, never Banna's guess. */
+  const ROLE_LABELS = {
+    COMPANY_JOB_INTAKE: "Job intake (leads arrive here)",
+    COMPANY_CLOSINGS: "Company closings",
+    TECH_DISPATCH: "Technician dispatch",
+    TECH_CLOSINGS: "Technician closings",
+    UNMAPPED_WORK: "Not classified yet",
+    IGNORE: "Ignore this group",
+  };
+
+  function groupNeedsMapping(g) {
+    return !g.confirmed_by_owner || !g.role || g.role === "UNMAPPED_WORK";
+  }
+
+  function groupRow(g, payload) {
+    const needs = groupNeedsMapping(g);
+    const roles = (payload.roles || []).map((r) =>
+      `<option value="${esc(r)}"${g.role === r ? " selected" : ""}>${esc(ROLE_LABELS[r] || r)}</option>`).join("");
+    const companies = ['<option value="">— no company —</option>'].concat(
+      (payload.companies || []).map((c) =>
+        `<option value="${esc(c)}"${g.company === c ? " selected" : ""}>${esc(c)}</option>`)).join("");
+    const techs = ['<option value="">— none —</option>'].concat(
+      (payload.technicians || []).map((t) =>
+        `<option value="${esc(t.id)}"${String(g.technician_id) === String(t.id) ? " selected" : ""}>${esc(t.name)}</option>`)).join("");
+    const seen = g.last_message_at ? whenText(g.last_message_at) : null;
+    return `<div class="grp ${needs ? "unmapped" : "mapped"}" data-group="${esc(g.group_id)}">
+      <div class="grp-top" data-grp-toggle="1">
+        <span class="grp-name">${esc(g.exact_name || g.group_id)}</span>
+        <span class="grp-count">${esc(g.message_count)} msgs</span>
+      </div>
+      <div class="grp-state" data-grp-toggle="1">
+        ${needs ? "Not mapped" : esc(ROLE_LABELS[g.role] || g.role)}${
+          g.company ? " · " + esc(g.company) : ""}${
+          g.service_area ? " · " + esc(g.service_area) : ""}${
+          seen ? " · last " + esc(seen) : ""}
+      </div>
+      <div class="grp-form">
+        <label>What is this group?</label>
+        <select data-grp-role>${roles}</select>
+        <label>Company</label>
+        <select data-grp-company>${companies}</select>
+        <label>Service area</label>
+        <input type="text" data-grp-area value="${esc(g.service_area || "")}" placeholder="e.g. Charlotte, NC">
+        <label>Technician (dispatch/closing groups)</label>
+        <select data-grp-tech>${techs}</select>
+        <div class="grp-hint" data-grp-hint hidden>A job-intake group needs a company.</div>
+        <div class="grp-actions">
+          <button class="btn primary" data-act="grp-save">Save mapping</button>
+          <button class="btn ghost" data-act="grp-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function renderGroups() {
+    const payload = state.groups;
+    if (!payload) return;
+    const filter = state.groupFilter;
+    let list = payload.groups || [];
+    if (filter === "needs") list = list.filter(groupNeedsMapping);
+    else if (filter === "active") list = list.filter((g) => g.message_count > 0);
+    $("groupsNote").textContent =
+      `${payload.unclassified} of ${payload.total} groups still need mapping`;
+    const note = $("groupsMenuNote");
+    if (note) note.textContent = payload.unclassified
+      ? `${payload.unclassified} groups need mapping` : "All groups mapped";
+    $("groupList").innerHTML = list.length
+      ? list.map((g) => groupRow(g, payload)).join("")
+      : `<div class="empty">Nothing in this view.</div>`;
+  }
+
+  async function loadGroups() {
+    if (state.screen !== "groups") return;
+    try {
+      state.groups = await Api.getGroups();
+      renderGroups();
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      $("groupList").innerHTML = `<div class="empty">Groups unavailable: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function saveGroupMapping(card) {
+    const groupId = card.getAttribute("data-group");
+    const role = card.querySelector("[data-grp-role]").value;
+    const company = card.querySelector("[data-grp-company]").value;
+    const area = card.querySelector("[data-grp-area]").value;
+    const tech = card.querySelector("[data-grp-tech]").value;
+    const hint = card.querySelector("[data-grp-hint]");
+    if (role === "COMPANY_JOB_INTAKE" && !company) {
+      hint.hidden = false;          // said before the request, not after
+      return;
+    }
+    hint.hidden = true;
+    try {
+      await Api.mapGroup(groupId, {
+        role, company, service_area: area,
+        technician_id: tech === "" ? null : Number(tech),
+      });
+      toast("Mapping saved");
+      await loadGroups();
+      load();
+    } catch (e) {
+      if (e.authRequired) return showLogin();
+      toast("Could not save: " + e.message);
+    }
   }
 
   function progressCard(e) {
@@ -911,16 +1286,22 @@
      ["hdDispatch", d], ["hdProgress", p], ["hdClose", c],
      ["stDispatch", d], ["stProgress", p], ["stClose", c]]
       .forEach(([id, list]) => { const el = $(id); if (el) el.textContent = list.length; });
-    const dispatchTotal = d.length + (state.candidates || []).length
-      + (state.candidateReviews || []).length;
+    // The badge counts CURRENT work only. Backlog keeps its own count so
+    // nothing disappears, but a stale record never inflates "to dispatch".
+    const dispatchTotal = d.length + cands.length + reviews.length;
     ["countDispatch", "hdDispatch", "stDispatch"].forEach((id) => {
       const el = $(id); if (el) el.textContent = dispatchTotal;
     });
     $("countDispatch").parentElement.classList.toggle("hot", dispatchTotal > 0);
     $("countClose").parentElement.classList.toggle("hot", c.length > 0);
 
+    // Genuinely open work is NEVER filtered by age -- an open job from
+    // August is still open. Only unresolved intake, which nobody can act
+    // on until its company is mapped, is split out for reconciliation.
     const cands = state.candidates || [];
-    const reviews = state.candidateReviews || [];
+    const allReviews = state.candidateReviews || [];
+    const reviews = allReviews.filter((c) => !isStale(c));
+    const reconcile = allReviews.filter(isStale);
 
     // THE OPERATING LINE. The actionable queue is taken in the order the
     // backend already returned -- committed jobs first, then understood
@@ -948,6 +1329,16 @@
     }
     if (!actionable.length && !reviews.length) {
       html = `<div class="empty">No jobs need action right now.</div>`;
+    }
+    if (reconcile.length) {
+      // Historical unresolved intake: real captured jobs that could never
+      // be acted on because their group has no company mapped. Listed for
+      // reconciliation, never closed, never reclassified.
+      html += `<div class="flow-h flow-up backlog-h">Needs reconciliation · ${reconcile.length}</div>`
+        + `<div class="backlog-note">Real captured intake that was never resolved &mdash; these could not be
+             dispatched because their group has no company mapped. Nothing here is closed or
+             reclassified automatically.</div>`
+        + reconcile.map(backlogCard).join("");
     }
     $("listDispatch").innerHTML = html;
     const staleActive = state.progressStale || [];
@@ -1301,12 +1692,25 @@
         const box = $("msgBox");
         return box ? copy(box.textContent, "Message") : null;
       }
+      if (act === "shadow-replay") return loadHistoricalShadow();
       if (act === "admin-job") { window.location.href = "admin.html"; return; }
       // A safety hold opens its detail. It is deliberately NOT a send,
       // NOT a copy, and NOT a dispatch -- the operator is being shown the
       // decision, not handed a way around it.
       if (act === "review") {
         return openDetail("candidate-review", actEl.getAttribute("data-id"));
+      }
+      if (act === "jobs-clear") {
+        return openJobs({ range: state.jobsQuery.range });
+      }
+      if (act === "grp-save") {
+        const card = actEl.closest(".grp");
+        return card ? saveGroupMapping(card) : null;
+      }
+      if (act === "grp-cancel") {
+        const card = actEl.closest(".grp");
+        if (card) card.classList.remove("open");
+        return;
       }
       if (act === "ap-evidence") {
         const card = actEl.closest(".ap-card");
@@ -1318,6 +1722,19 @@
     if (tabEl) return setScreen(tabEl.getAttribute("data-screen"));
     const menuEl = ev.target.closest("[data-goto]");
     if (menuEl) return setScreen(menuEl.getAttribute("data-goto"));
+    const grpToggle = ev.target.closest("[data-grp-toggle]");
+    if (grpToggle) {
+      const card = grpToggle.closest(".grp");
+      if (card) card.classList.toggle("open");
+      return;
+    }
+    const gfilterEl = ev.target.closest("[data-gfilter]");
+    if (gfilterEl) {
+      state.groupFilter = gfilterEl.getAttribute("data-gfilter");
+      document.querySelectorAll("[data-gfilter]").forEach((b) =>
+        b.classList.toggle("on", b === gfilterEl));
+      return renderGroups();
+    }
     const rangeEl = ev.target.closest("[data-range]");
     if (rangeEl) {
       state.reportRange = rangeEl.getAttribute("data-range");
@@ -1326,7 +1743,29 @@
       return loadReports();
     }
     const statEl = ev.target.closest("[data-jump-jobs]");
-    if (statEl) return setScreen("jobs");
+    if (statEl) {
+      const which = statEl.getAttribute("data-jump-jobs");
+      return openJobs({ range: "today", status: which === "all" ? "" : which });
+    }
+    const rankEl = ev.target.closest("[data-rank-kind]");
+    if (rankEl) {
+      const kind = rankEl.getAttribute("data-rank-kind");
+      const value = rankEl.getAttribute("data-rank-value");
+      return openJobs(kind === "company" ? { range: "today", company: value }
+                                         : { range: "today", area: value });
+    }
+    const jrangeEl = ev.target.closest("[data-jrange]");
+    if (jrangeEl) {
+      state.jobsQuery.range = jrangeEl.getAttribute("data-jrange");
+      document.querySelectorAll("[data-jrange]").forEach((b) => b.classList.toggle("on", b === jrangeEl));
+      return loadJobs();
+    }
+    const jstatusEl = ev.target.closest("[data-jstatus]");
+    if (jstatusEl) {
+      state.jobsQuery.status = jstatusEl.getAttribute("data-jstatus");
+      document.querySelectorAll("[data-jstatus]").forEach((b) => b.classList.toggle("on", b === jstatusEl));
+      return loadJobs();
+    }
     const evEl = ev.target.closest("[data-ev]");
     if (evEl) { evEl.classList.toggle("open"); return; }
     const card = ev.target.closest(".card");
@@ -1394,12 +1833,15 @@
   /* --------------------------------------------------------- boot -- */
 
   function showLogin() {
+    applyTheme();
     $("loginScreen").hidden = false;
     $("app").hidden = true;
   }
   function showApp() {
     $("loginScreen").hidden = true;
     $("app").hidden = false;
+    applyTheme();
+    setInterval(applyTheme, 60000);   // a shift outlives one render
     setStage(state.stage);
     setScreen(state.screen);
     loadToday();
@@ -1437,6 +1879,15 @@
   $("detailClose").addEventListener("click", closeDetail);
   $("adminBtn").addEventListener("click", () => { window.location.href = "admin.html"; });
   $("searchInput").addEventListener("input", onSearch);
+  (function wireJobSearch() {
+    const box = $("jobSearch");
+    if (!box) return;
+    let timer = null;
+    box.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { state.jobsQuery.q = box.value.trim(); loadJobs(); }, 220);
+    });
+  })();
   document.querySelectorAll("[data-jump]").forEach((b) =>
     b.addEventListener("click", () => { setScreen("jobs"); setStage(b.getAttribute("data-jump")); }));
 

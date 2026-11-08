@@ -15,40 +15,79 @@
    healthy it should read as punctuation, not as a section. */
 
 :root {
-  /* Warm stone page, parchment surfaces, sage identity. A CRM is looked
-     at all day; it should read like paper on a desk, not a dashboard.
-     There is deliberately no blue and no pure white anywhere. */
-  --bg:        #E7E2D9;
-  --surface:   #F1ECE4;
-  --surface-2: #F7F3EC;
-  --line:      #D6CFC3;
-  --line-soft: #E2DCD1;
+  /* DAY — clean neutral, one warm accent, coloured status pills.
+     This is what the dispatcher sees through the working day: bright,
+     high-contrast, legible in a van with sun on the screen. */
+  --bg:        #F2F4F7;
+  --surface:   #FFFFFF;
+  --surface-2: #F7F9FB;
+  --line:      #E3E7ED;
+  --line-soft: #EEF1F5;
 
-  --ink:       #202522;
-  --ink-2:     #6F746E;
-  --ink-3:     #8E938B;
+  --ink:       #0B1220;
+  --ink-2:     #5A6472;
+  --ink-3:     #8A93A1;
 
-  --blue:      #5D7462;          /* sage: brand + active state */
-  --blue-soft: #DCE4DC;
-  --blue-ring: rgba(93,116,98,.16);
-  --primary-strong: #405446;
-  --green:     #557B60;
-  --green-soft:#DDE7DE;
-  --amber:     #B68142;
-  --amber-soft:#F3E7D5;
-  --red:       #A65A52;
-  --red-soft:  #EFDEDB;
-  --purple:    #6E6480;
-  --purple-soft:#E5E1EA;
+  --blue:      #E2663B;          /* brand + active state */
+  --blue-soft: #FDEFE9;
+  --blue-ring: rgba(226,102,59,.16);
+  --primary-strong: #B44A24;
+  --green:     #15803D;
+  --green-soft:#E4F6EA;
+  --amber:     #C2410C;
+  --amber-soft:#FDEBE2;
+  --red:       #B91C1C;
+  --red-soft:  #FDE8E8;
+  --purple:    #6D28D9;
+  --purple-soft:#EFE9FD;
+
+  --state-open:      #1D4ED8;    /* status pills stay multi-coloured */
+  --state-open-soft: #E6EDFE;
 
   --r:    10px;
   --r-sm: 8px;
-  --shadow:      0 1px 1px rgba(60,50,35,.04), 0 1px 3px rgba(60,50,35,.05);
-  --shadow-card: 0 1px 2px rgba(60,50,35,.05), 0 2px 8px rgba(60,50,35,.05);
-  --shadow-up:   0 -2px 12px rgba(60,50,35,.07);
+  --shadow:      0 1px 2px rgba(11,18,32,.05), 0 1px 3px rgba(11,18,32,.06);
+  --shadow-card: 0 1px 3px rgba(11,18,32,.06), 0 2px 8px rgba(11,18,32,.05);
+  --shadow-up:   0 -2px 12px rgba(11,18,32,.08);
 
   --tabbar-h: 58px;
 }
+
+/* NIGHT — dark, low glare, cool blue-teal. Same layout, same meaning for
+   every colour; only the surface and contrast change, so a dispatcher
+   switching mid-shift never has to relearn the screen. */
+:root[data-theme="night"] {
+  --bg:        #11151B;
+  --surface:   #161B23;
+  --surface-2: #1B212A;
+  --line:      #242C37;
+  --line-soft: #1F262F;
+
+  --ink:       #E6EAF0;
+  --ink-2:     #9AA4B2;
+  --ink-3:     #7D8794;
+
+  --blue:      #6FB6A3;
+  --blue-soft: #1B2A26;
+  --blue-ring: rgba(111,182,163,.20);
+  --primary-strong: #8FD0BE;
+  --green:     #6FD39B;
+  --green-soft:#16271E;
+  --amber:     #E0A35C;
+  --amber-soft:#2A2317;
+  --red:       #E08A80;
+  --red-soft:  #2A1C1A;
+  --purple:    #A99BC4;
+  --purple-soft:#241F2C;
+
+  --state-open:      #8AB4F8;
+  --state-open-soft: #1B2638;
+
+  --shadow:      0 1px 2px rgba(0,0,0,.35);
+  --shadow-card: 0 1px 3px rgba(0,0,0,.40);
+  --shadow-up:   0 -2px 14px rgba(0,0,0,.45);
+}
+
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -95,6 +134,9 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 
 /* ------------------------------------------------------------- app --- */
 .app { padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom)); }
+.app-chrome { position: sticky; top: 0; z-index: 50; }
+.app-chrome .topbar,
+.app-chrome .offline-bar { position: static; }
 
 .topbar {
   position: sticky; top: 0; z-index: 30;
@@ -249,7 +291,7 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
   padding: 4px 10px; border-radius: 999px;
   color: var(--ink-2); background: var(--surface-2);
 }
-.waiting.act { color: var(--blue);  background: var(--blue-soft); }
+.waiting.act { color: var(--state-open); background: var(--state-open-soft); }
 .waiting.rev { color: var(--amber); background: var(--amber-soft); }
 .waiting.ok  { color: var(--green); background: var(--green-soft); }
 .waiting.bad { color: var(--red);   background: var(--red-soft); }
@@ -442,6 +484,20 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 }
 .sp-body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
 .sp-foot { margin-top: 12px; font-size: 11px; color: var(--ink-3); }
+.shadow-safety {
+  margin-top: 8px; padding: 8px 10px; border: 1px solid var(--purple);
+  border-radius: var(--r-sm); background: var(--purple-soft); color: var(--purple);
+  font-size: 11px; font-weight: 800; letter-spacing: .07em; text-align: center;
+}
+.shadow-replay {
+  margin-top: 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--ink-2); padding: 7px 11px;
+  font: inherit; font-size: 11px; cursor: pointer;
+}
+.shadow-replay-label {
+  margin-bottom: 10px; color: var(--amber); font-size: 11px; font-weight: 800;
+  letter-spacing: .07em; text-align: center;
+}
 
 .sh-job {
   border: 1px solid var(--line); border-radius: var(--r-sm);
@@ -465,6 +521,8 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 .sh-t { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .sh-k { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-2); }
 .sh-v { grid-column: 2; font-size: 13px; overflow-wrap: anywhere; }
+.sh-flow { margin-top: 9px; font-size: 11px; line-height: 1.65; color: var(--ink-2); }
+.sh-flow b { color: var(--ink); }
 
 .sh-would {
   margin-top: 10px; padding: 10px; border-radius: var(--r-sm);
@@ -538,7 +596,7 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jr-state { font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
             padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
-.jr-state.open      { color: var(--blue);  background: var(--blue-soft); }
+.jr-state.open      { color: var(--state-open); background: var(--state-open-soft); }
 .jr-state.completed { color: var(--green); background: var(--green-soft); }
 .jr-state.needs_attention { color: var(--amber); background: var(--amber-soft); }
 .jr-main { grid-column: 2; font-size: 13.5px; overflow-wrap: anywhere; }
@@ -572,7 +630,7 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   display: grid; grid-template-columns: repeat(4, 1fr);
-  background: rgba(241,236,228,.94);
+  background: rgba(255,255,255,.92);
   -webkit-backdrop-filter: saturate(180%) blur(18px);
   backdrop-filter: saturate(180%) blur(18px);
   border-top: 1px solid var(--line);
@@ -687,4 +745,93 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
   .stat-n { font-size: 19px; }
   .stat-l { font-size: 10px; }
   .stat { padding: 8px; }
+}
+
+/* The frosted tab bar is a surface colour, so it follows the theme. */
+:root[data-theme="night"] .tabbar { background: rgba(22,27,35,.94); }
+:root[data-theme="night"] .card.review { background: #1E2119; }
+:root[data-theme="night"] .card:hover { border-color: #2F3947; }
+
+/* ------------------------------------------------------ group mapping --
+   One row per group, the busiest unmapped first. Mapping is always an
+   explicit owner choice: Banna never guesses a company from a group,
+   because a wrong guess quietly corrupts every job that group carries. */
+.grp {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r); box-shadow: var(--shadow);
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.grp.unmapped { border-left: 3px solid var(--amber); }
+.grp.mapped   { border-left: 3px solid var(--green); }
+.grp-top { display: flex; align-items: baseline; gap: 8px; }
+.grp-name { font-size: 14px; font-weight: 640; overflow-wrap: anywhere; }
+.grp-count { margin-left: auto; font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.grp-state { font-size: 11px; color: var(--ink-2); margin-top: 2px; }
+.grp-form { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line-soft); }
+.grp.open .grp-form { display: block; }
+.grp-form label { display: block; font-size: 11px; color: var(--ink-3); margin: 8px 0 3px;
+  text-transform: uppercase; letter-spacing: .05em; }
+.grp-form select, .grp-form input {
+  width: 100%; min-height: 44px; padding: 0 10px; font: inherit; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.grp-actions { display: flex; gap: 8px; margin-top: 12px; }
+.grp-actions .btn { flex: 1; }
+.grp-hint { font-size: 11px; color: var(--amber); margin-top: 6px; }
+
+/* ----------------------------------------------------------- jobs ----
+   Every number on Today is a door into this list. A counter you cannot
+   open is a dead end, which is exactly what the first version shipped. */
+.search.wide { width: 100%; display: block; margin-bottom: 10px; }
+.active-filter {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+  font-size: 12px; color: var(--ink-2);
+  background: var(--blue-soft); border: 1px solid var(--line);
+  border-radius: 999px; padding: 7px 12px;
+}
+.active-filter button {
+  margin-left: auto; min-height: 28px; padding: 0 10px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--ink-2); font-size: 11px;
+}
+.board-wrap { margin-top: 16px; }
+.board-wrap summary {
+  cursor: pointer; min-height: 44px; display: flex; align-items: center;
+  font-size: 12px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.stat { cursor: pointer; }
+.rank-row { cursor: pointer; }
+.rank-row:hover { color: var(--blue); }
+
+/* ------------------------------------------------- backlog & zero ----
+   A stale record is kept and labelled, never hidden and never closed on
+   its own. A zero is explained, because "no jobs" and "no capture" need
+   opposite reactions from the dispatcher. */
+.flow-h.backlog-h { color: var(--ink-3); }
+.backlog-note { font-size: 11.5px; color: var(--ink-3); margin: -4px 0 10px; }
+.card.backlog { border-left: 3px solid var(--ink-3); }
+.card.backlog .card-title { font-size: 14px; }
+.stale-line { color: var(--amber); }
+
+.zero-state {
+  margin-top: 10px; padding: 12px; border-radius: var(--r);
+  background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow);
+}
+.zero-state[hidden] { display: none; }
+.zs-h { font-size: 14px; font-weight: 650; margin-bottom: 8px; }
+.zs-row { font-size: 12.5px; padding: 3px 0 3px 14px; position: relative; color: var(--ink-2); }
+.zs-row::before { content: ""; position: absolute; left: 0; top: 9px;
+  width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
+.zs-ok::before   { background: var(--green); }
+.zs-warn::before { background: var(--amber); }
+.zs-bad::before  { background: var(--red); }
+.zero-state .btn { margin-top: 10px; width: 100%; }
+
+/* A warning, not a filter: an open job stays in the queue and simply
+   says how old it is. */
+.stale-badge {
+  display: inline-block; margin-left: 6px; font-size: 10.5px; font-weight: 650;
+  color: var(--amber); background: var(--amber-soft);
+  border-radius: 999px; padding: 2px 8px;
 }

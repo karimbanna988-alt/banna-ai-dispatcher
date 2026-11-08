@@ -147,18 +147,28 @@ def test_console_escapes_dynamic_values(console_js):
 
 
 # ---------------------------------------------------------- visual ----
-def test_console_uses_the_warm_crm_palette():
-    """Banna is a CRM now -- looked at all day, not a dashboard glanced
-    at. Warm stone page, parchment surfaces, sage identity. The blue/white
-    SaaS look and the earlier dark console are both deliberately gone."""
+def test_console_ships_a_day_and_a_night_palette():
+    """The owner works US hours and the screen is looked at for a whole
+    shift, so there are two themes: a bright one for the day and a
+    low-glare dark one for the night. Colour MEANING is identical in
+    both -- only surface and contrast change -- so nothing has to be
+    relearned when it flips mid-shift."""
     css = CONSOLE_CSS.read_text(encoding="utf-8")
-    assert "--bg:        #E7E2D9" in css, "page must be warm stone, not white"
-    assert "--surface:   #F1ECE4" in css, "cards must be parchment, not pure white"
-    assert "--blue:      #5D7462" in css, "identity colour is sage"
-    for banned in ("#2F6BFF", "#0B69F5", "#00D4FF", "#0B0E14", "#FFFFFF;"):
-        assert banned not in css, f"{banned} survived the CRM redesign"
-    for token in ("--green:", "--amber:", "--red:"):
-        assert token in css, f"missing semantic colour {token}"
+    assert ":root {" in css, "day palette is the default"
+    assert ':root[data-theme="night"]' in css, "night palette must exist"
+
+    day = css[css.index(":root {"):css.index(':root[data-theme="night"]')]
+    night = css[css.index(':root[data-theme="night"]'):]
+    assert "--bg:        #F2F4F7" in day, "day page is light neutral"
+    assert "--surface:   #FFFFFF" in day, "day cards are white"
+    assert "--bg:        #11151B" in night, "night page is dark"
+
+    # Every semantic token must be defined in BOTH, or a theme flip
+    # silently inherits a colour that means something else.
+    for token in ("--bg:", "--surface:", "--ink:", "--ink-2:", "--blue:",
+                  "--green:", "--amber:", "--red:", "--state-open:"):
+        assert token in day, f"day palette missing {token}"
+        assert token in night, f"night palette missing {token}"
 
 
 def test_console_is_responsive_for_mobile():

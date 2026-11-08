@@ -1411,6 +1411,61 @@ def list_group_registry(conn: sqlite3.Connection, active_only: bool = False) -> 
     return [_registry_row_to_dict(r) for r in rows]
 
 
+def list_group_activity(conn: sqlite3.Connection) -> list:
+    """Every captured group with how busy it actually is.
+
+    The owner cannot classify 85 groups from memory, and the ones worth
+    classifying first are the ones carrying traffic. This joins the
+    registry to observed message volume so the review screen can lead
+    with "this group sent 40 messages this week and Banna does not know
+    what it is".
+
+    Read-only. Counting messages never changes how any of them are
+    interpreted.
+    """
+    rows = conn.execute(
+        """
+        SELECT r.group_id,
+               r.exact_name,
+               r.role,
+               r.company,
+               r.service_area,
+               r.technician_id,
+               r.confirmed_by_owner,
+               r.is_active,
+               COUNT(o.id)            AS message_count,
+               MAX(o.received_at)     AS last_message_at,
+               SUM(CASE WHEN o.received_at >= datetime('now', '-7 days')
+                        THEN 1 ELSE 0 END) AS recent_count
+        FROM whatsapp_group_registry r
+        LEFT JOIN whatsapp_pending_observations o ON o.group_id = r.group_id
+        GROUP BY r.group_id
+        ORDER BY recent_count DESC, message_count DESC, r.group_id
+        """
+    ).fetchall()
+    return [
+        {
+            "group_id": r[0], "exact_name": r[1], "role": r[2], "company": r[3],
+            "service_area": r[4], "technician_id": r[5],
+            "confirmed_by_owner": bool(r[6]), "is_active": bool(r[7]),
+            "message_count": r[8] or 0, "last_message_at": r[9],
+            "recent_count": r[10] or 0,
+        }
+        for r in rows
+    ]
+
+
+def known_companies(conn: sqlite3.Connection) -> list:
+    """Companies the owner has already confirmed somewhere in the
+    registry. Offered as choices so a typo cannot silently create a
+    fourth competitor that correlates against nothing."""
+    rows = conn.execute(
+        "SELECT DISTINCT company FROM whatsapp_group_registry "
+        "WHERE company IS NOT NULL AND TRIM(company) <> '' ORDER BY company"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def _add_whatsapp_outgoing_audit_support(conn: sqlite3.Connection) -> None:
     """Deliberately a SEPARATE table from whatsapp_pending_observations,
     with no shared accessor function and no column linking it into the
@@ -2960,6 +3015,36 @@ def _apply_assignment_decision(
         technician_id=result_technician_id, technician_name=tech_name,
         dispatch_group=tech_dispatch_group, closing_group=tech_closing_group,
     )
+
+
+def intake_health(conn: sqlite3.Connection) -> dict:
+    """Why the board might be empty.
+
+    A bare zero is ambiguous: it can mean a quiet morning, a dead
+    capture, or groups nobody has mapped. Those demand completely
+    different reactions from the dispatcher, so the UI has to be able to
+    tell them apart. Read-only.
+    """
+    last_obs = conn.execute(
+        "SELECT MAX(received_at) FROM whatsapp_pending_observations").fetchone()[0]
+    quo_checkpoint = conn.execute(
+        "SELECT last_checkpoint FROM quo_poll_state WHERE id = 1").fetchone()
+    groups_total = conn.execute(
+        "SELECT COUNT(*) FROM whatsapp_group_registry").fetchone()[0]
+    groups_unmapped = conn.execute(
+        "SELECT COUNT(*) FROM whatsapp_group_registry "
+        "WHERE confirmed_by_owner = 0 OR role IS NULL OR role = 'UNMAPPED_WORK'").fetchone()[0]
+    intake_with_company = conn.execute(
+        "SELECT COUNT(*) FROM whatsapp_group_registry "
+        "WHERE role = 'COMPANY_JOB_INTAKE' AND company IS NOT NULL "
+        "AND TRIM(company) <> ''").fetchone()[0]
+    return {
+        "whatsapp_last_observation_at": last_obs,
+        "quo_last_checkpoint": quo_checkpoint[0] if quo_checkpoint else None,
+        "groups_total": groups_total,
+        "groups_unmapped": groups_unmapped,
+        "intake_groups_with_company": intake_with_company,
+    }
 
 
 def get_quo_checkpoint(conn: sqlite3.Connection) -> Optional[str]:
