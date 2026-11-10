@@ -19,3 +19,7 @@ whatsapp_shadow_bridge/.wwebjs_auth/
 ops/banna_services.log
 ops/service_status.json
 ops/service_status.json.tmp
+ops/bridge_probe_state.json
+ops/bridge_probe_state.json.tmp
+ops/bridge.out.log
+ops/bridge.err.log

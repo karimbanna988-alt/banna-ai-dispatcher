@@ -27,6 +27,58 @@ function createHealthServer(config, state) {
       });
     }
 
+    // Does the session still WORK, as opposed to merely claiming to?
+    //
+    // /health answers from state.paired, which is set once on "ready"
+    // and cleared only on an explicit disconnect or auth failure. When
+    // the underlying page dies -- a destroyed Puppeteer context, a
+    // WhatsApp Web reload -- none of those events fire, so /health goes
+    // on reporting "connected" while every real call fails. That is the
+    // worst shape of outage: the supervisor sees a listening port and a
+    // healthy answer, restarts nothing, and capture is silently dead.
+    //
+    // This exercises the real client and reports what happened. Read
+    // only, and bounded, so a hung session fails fast instead of
+    // holding the supervisor open.
+    if (req.method === "GET" && req.url === "/ready") {
+      if (!state.paired || !state.getGroups) {
+        return send(200, { ready: false, paired: !!state.paired, reason: "session_not_ready" });
+      }
+      const PROBE_TIMEOUT_MS = 20000;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        send(200, { ready: false, paired: true, reason: "probe_timed_out" });
+      }, PROBE_TIMEOUT_MS);
+
+      return state.getGroups()
+        .then((groups) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // A live account always has at least one chat. Zero means the
+          // store answered without really being populated, which is the
+          // same failure wearing a success code.
+          const count = Array.isArray(groups) ? groups.length : 0;
+          send(200, count > 0
+            ? { ready: true, paired: true, groups: count }
+            : { ready: false, paired: true, reason: "no_groups_returned" });
+        })
+        .catch((err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          let diagnostic;
+          try { diagnostic = formatDiagnosticError(err); } catch (e) { diagnostic = { formatterFailed: true }; }
+          console.error("WhatsApp Shadow Bridge: readiness probe failed -- local diagnostic:",
+                        JSON.stringify(diagnostic, null, 2));
+          // Same discipline as /groups: never echo the raw internal
+          // error over HTTP; the caller gets a fixed, sanitized reason.
+          send(200, { ready: false, paired: true, reason: "probe_failed" });
+        });
+    }
+
     if (req.method === "GET" && req.url === "/groups") {
       if (!state.paired || !state.getGroups) {
         return send(503, { error: "bridge_not_ready", message: "The WhatsApp session is not ready yet." });

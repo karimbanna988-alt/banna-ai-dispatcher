@@ -29,6 +29,7 @@ from dispatcher.policy import LUCKY_CLOSINGS_STREAM_KEY, get_policy
 from dispatcher.rules.market_aliases import resolve_market_and_area
 from dispatcher.rules.sla_config import format_age, urgency_level
 from dispatcher.rules.service_areas import find_service_area
+from dispatcher.rules import coverage_areas
 from dispatcher.storage import MessageType
 
 QUEUE_BUCKETS = ("Urgent", "New Jobs", "Corrections & Cancellations", "Status Requests", "Closings")
@@ -319,7 +320,22 @@ def resolve_job_routing(conn: sqlite3.Connection, job, raw_text: str):
     service_areas = shared.get_service_areas()
     market_label = shared.extract_market_label(raw_text) if job.source.value == "Main Leads" else None
     area_lookup = find_service_area(job.city.value, job.state.value, service_areas)
-    address_area = (area_lookup.record.city or area_lookup.record.state) if area_lookup.status == "confirmed" else None
+    # An inactive area stays unroutable -- unchanged, and checked first
+    # so the coverage map can never reopen somewhere deliberately closed.
+    if area_lookup.status == "inactive":
+        address_area = None
+    else:
+        # State-aware (city, state) -> coverage area. This runs BEFORE the
+        # service-area label because the two answer different questions:
+        # service_areas says "do we work here", the coverage map says
+        # "which area is this". Wilmington DE matched the whole-state DE
+        # entry and produced the label "DE" while every Delaware
+        # technician is registered as "Delaware", so nobody was eligible
+        # for a job three people could take.
+        address_area = coverage_areas.resolve_coverage_area(
+            job.city.value, job.state.value)
+        if not address_area and area_lookup.status == "confirmed":
+            address_area = area_lookup.record.city or area_lookup.record.state
     resolution = resolve_market_and_area(address_area, market_label)
     eligible = []
     if resolution.canonical_area:

@@ -29,6 +29,7 @@ from .models import ExtractedJob
 from .parser import REQUIRED_FIELDS
 from .rules import Decision
 from .rules.service_areas import ServiceAreaRecord, find_service_area
+from .rules import coverage_areas
 from .shadow import EXPORTABLE_REVIEW_STATES, SHADOW_EPISODE_SCHEMA_VERSION, ReviewStatus, ShadowChannel, ShadowEventType
 from .rules.service_categories import KNOWN_SERVICE_CATEGORIES, classify_service_categories, normalize_skill_label
 from .updates import map_status_to_reply
@@ -3085,10 +3086,19 @@ def assign_technician(
         problems.append("job has no city/state on record -- cannot verify area eligibility")
     else:
         area_lookup = find_service_area(city, state, service_areas)
-        if area_lookup.status != "confirmed":
+        # Same derivation as the recommendation path in
+        # luxor_desk_read_model.resolve_job_routing, deliberately. If
+        # these two disagree, the board names a technician the assign
+        # step then refuses -- the dispatcher is told to do something
+        # the system will not let them do.
+        coverage_area = (None if area_lookup.status == "inactive"
+                         else coverage_areas.resolve_coverage_area(city, state))
+        area_label = coverage_area or (
+            (area_lookup.record.city or area_lookup.record.state)
+            if area_lookup.status == "confirmed" else None)
+        if not area_label:
             problems.append(f"job's service area is not confirmed ({area_lookup.reason})")
         else:
-            area_label = area_lookup.record.city or area_lookup.record.state
             area_problem = _technician_area_problem(tech, area_label)
             if area_problem:
                 problems.append(area_problem)

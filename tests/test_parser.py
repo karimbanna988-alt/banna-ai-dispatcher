@@ -203,8 +203,8 @@ def test_bare_trailing_extension_is_split_from_phone(rules):
 def test_normally_spaced_phone_number_is_not_mistaken_for_an_extension(rules):
     from dispatcher.parser import extract_phone_and_extension
 
-    phone, ext = extract_phone_and_extension("Ph: (571) 431-9558")
-    assert phone.value == "(571) 431-9558"
+    phone, ext = extract_phone_and_extension("Ph: (555) 431-9558")
+    assert phone.value == "(555) 431-9558"
     assert ext.value is None
 
 

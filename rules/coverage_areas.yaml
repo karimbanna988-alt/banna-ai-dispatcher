@@ -1,0 +1,82 @@
+# (city, state) -> coverage area. Business rules, not code.
+#
+# WHY THIS EXISTS
+# ---------------
+# rules/service_areas.yaml answers "is this a place we work in". It does
+# NOT answer "which of our coverage areas does this place belong to",
+# and the two are different questions. A job in Wilmington DE was
+# resolving to the whole-state label "DE" while every Delaware
+# technician is registered as "Delaware", so no one was eligible and the
+# board said "no technician yet" about a job three people could take.
+#
+# STATE IS PART OF THE KEY, ALWAYS.
+# A city name alone is not an identity: Wilmington DE is Delaware
+# coverage, Wilmington NC is 400 miles away and is not covered at all.
+# Matching on the city alone would have silently dispatched one to the
+# other. Every entry here is keyed on (city, state), and an entry with
+# no state matches only a job that also has no state.
+#
+# NEVER FUZZY. This is an explicit list. A place that is not written
+# here does not resolve, which surfaces as "no coverage area" for a
+# human to answer -- never as a guess.
+#
+# `area` must match the coverage area technicians are registered against
+# (technicians.areas_json), because that is what eligibility compares.
+
+# --- Delaware ------------------------------------------------------
+- city: Wilmington
+  state: DE
+  area: Delaware
+  notes: Largest city in DE. Not to be confused with Wilmington NC.
+- city: Newark
+  state: DE
+  area: Delaware
+- city: Dover
+  state: DE
+  area: Delaware
+- city: Rehoboth Beach
+  state: DE
+  area: Delaware
+- city: null
+  state: DE
+  area: Delaware
+  notes: >
+    Bare-state fallback. service_areas.yaml holds DE as a whole-state
+    entry, which produced the label "DE"; technicians are registered as
+    "Delaware".
+
+# --- Alabama -------------------------------------------------------
+- city: Birmingham
+  state: AL
+  area: Alabama
+- city: Trussville
+  state: AL
+  area: Alabama
+- city: Pleasant Grove
+  state: AL
+  area: Alabama
+- city: null
+  state: AL
+  area: Alabama
+
+# --- Augusta (crosses the GA/SC state line) ------------------------
+# The Augusta market spans the Savannah River. These SC towns are
+# Augusta coverage, not Columbia or Charleston coverage.
+- city: Augusta
+  state: GA
+  area: Augusta
+- city: Evans
+  state: GA
+  area: Augusta
+- city: Martinez
+  state: GA
+  area: Augusta
+- city: Grovetown
+  state: GA
+  area: Augusta
+- city: Aiken
+  state: SC
+  area: Augusta
+- city: North Augusta
+  state: SC
+  area: Augusta
