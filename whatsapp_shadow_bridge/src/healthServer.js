@@ -51,6 +51,36 @@ function createHealthServer(config, state) {
         });
     }
 
+    // Owner-invoked history import. Loopback only, like everything
+    // else on this server. Reads recent messages from ALLOWLISTED
+    // groups and feeds them through the normal capture pipeline, so
+    // dedupe and every other rule applies exactly as for live
+    // messages. Reads only -- this can never send anything.
+    if (req.method === "POST" && req.url === "/history") {
+      if (!state.paired || !state.importHistory) {
+        return send(503, { error: "bridge_not_ready", message: "The WhatsApp session is not ready yet." });
+      }
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; if (body.length > 10000) req.destroy(); });
+      return req.on("end", () => {
+        let opts;
+        try {
+          opts = body ? JSON.parse(body) : {};
+        } catch (err) {
+          return send(400, { error: "bad_json" });
+        }
+        const hours = Number(opts.hours) > 0 ? Number(opts.hours) : 24;
+        const limitPerChat = Number(opts.limitPerChat) > 0 ? Number(opts.limitPerChat) : 150;
+        const sinceMs = Date.now() - hours * 3600 * 1000;
+        state.importHistory({ sinceMs, limitPerChat })
+          .then((report) => send(200, { ok: true, hours, report }))
+          .catch((err) => {
+            console.error("WhatsApp Shadow Bridge: history import failed --", err && err.message);
+            send(500, { error: "history_import_failed" });
+          });
+      });
+    }
+
     if (req.method === "GET" && req.url === "/allowlist") {
       return send(200, loadAllowlist(config.allowlistFile));
     }

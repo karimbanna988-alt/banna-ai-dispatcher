@@ -58,7 +58,7 @@ from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -73,6 +73,7 @@ import luxor_desk_shared  # noqa: E402
 import luxor_ops_shared as shared  # noqa: E402
 import whatsapp_bridge_adapter  # noqa: E402
 from dispatcher import commercial, kpi_read_model, storage  # noqa: E402
+from dispatcher import service_health
 from dispatcher import db_safety  # noqa: E402
 from dispatcher import operator_stage  # noqa: E402
 from dispatcher import branding  # noqa: E402
@@ -2354,11 +2355,18 @@ def route_quo_dispatch_shadow(handler: "Handler", match: dict, body: dict) -> di
     backlog can never masquerade as live work.
     """
     historical_replay = body.get("mode") == "historical"
-    started_epoch = _RUNTIME.get("started_at")
-    session_started_at = None
-    if started_epoch is not None and not historical_replay:
-        session_started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).isoformat()
     conn = get_conn()
+    session_started_at = None
+    if not historical_replay:
+        # The owner's shadow session, not this process's uptime. Using
+        # the process start meant every restart silently began a new
+        # session and discarded the shift being observed.
+        session_started_at = storage.get_shadow_session_started_at(conn)
+        if session_started_at is None:
+            started_epoch = _RUNTIME.get("started_at")
+            if started_epoch is not None:
+                session_started_at = datetime.fromtimestamp(
+                    started_epoch, tz=timezone.utc).isoformat()
     try:
         return quo_dispatch_shadow.project_quo_dispatch_shadow(
             conn,
@@ -2628,6 +2636,10 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         norm = dispatch_candidates.normalize_ticket
         all_observations = storage.list_whatsapp_pending_observations(
             conn, include_resolved=True)
+        # Owner-posted intake is merged into the INTAKE stage only (see
+        # below), never here: this list feeds the downstream-evidence
+        # scan, where an outgoing message genuinely is our own forward.
+        owner_posted_intake = storage.list_owner_posted_intake_observations(conn)
         registry_rows = storage.list_group_registry(conn)
         outgoing_audit = storage.list_whatsapp_outgoing_audit(conn)
 
@@ -2840,7 +2852,11 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
 
         # ------------------------------- intake: parse and order first ---
         prepared = []
-        for obs in storage.list_whatsapp_pending_observations(conn, include_resolved=False):
+        # Owner-posted rows are appended, then the whole list is sorted by
+        # event time immediately below, so merge order carries no meaning.
+        intake_source = (storage.list_whatsapp_pending_observations(conn, include_resolved=False)
+                         + owner_posted_intake)
+        for obs in intake_source:
             if obs.get("group_role") != "COMPANY_JOB_INTAKE":
                 continue
             job = extract_job(obs.get("text") or "", vehicle_rules)
@@ -2988,6 +3004,26 @@ def route_whatsapp_candidates(handler: "Handler", match: dict, body: dict) -> di
         conn.close()
 
 
+def route_crm_job(handler: "Handler", match: dict, body: dict) -> dict:
+    """One job's full record, by message_id. READ-ONLY.
+
+    The Jobs list is deliberately a thin row -- enough to scan, not
+    enough to act on. Opening a row has to produce the whole record,
+    and the whole record only exists in the candidate projection. The
+    list endpoint cannot simply return it inline: that would ship the
+    full projection for every row on every scroll.
+
+    Same projection as everywhere else, so the detail can never
+    disagree with the row that opened it.
+    """
+    message_id = match.get("message_id") or ""
+    projection = route_whatsapp_candidates(handler, match, {})
+    for candidate in projection.get("candidates") or []:
+        if str(candidate.get("message_id")) == message_id:
+            return {"job": candidate}
+    raise ApiError(404, "No job with that id in the current projection.")
+
+
 def route_crm_summary(handler: "Handler", match: dict, body: dict) -> dict:
     """The business day, for the CRM home screen. READ-ONLY.
 
@@ -3004,16 +3040,24 @@ def route_crm_summary(handler: "Handler", match: dict, body: dict) -> dict:
     if range_key not in crm_summary.RANGES:
         range_key = crm_summary.RANGE_TODAY
     projection = route_whatsapp_candidates(handler, match, {})
+    conn_go_live = get_conn()
+    go_live_at = storage.get_crm_go_live_at(conn_go_live)
     payload = crm_summary.summarize(
         projection.get("candidates") or [],
         datetime.now(timezone.utc),
         range_key=range_key,
+        go_live_at=go_live_at,
     )
     # A zero has to be explainable. Without this the dispatcher cannot
     # tell a quiet morning from a dead bridge or an unmapped group.
     conn = get_conn()
     try:
         payload["intake_health"] = storage.intake_health(conn)
+        # Whether Banna is actually RUNNING, which the data alone cannot
+        # say: a quiet board and a dead bridge look identical. Read from
+        # the watchdog's own report -- see service_health's docstring for
+        # why this is not an HTTP call.
+        payload["service_health"] = service_health.read_service_health()
     finally:
         conn.close()
     return payload
@@ -3041,6 +3085,7 @@ def route_crm_jobs(handler: "Handler", match: dict, body: dict) -> dict:
         area=(body.get("area") or "").strip() or None,
         status=(body.get("status") or "").strip() or None,
         query=(body.get("q") or "").strip() or None,
+        go_live_at=storage.get_crm_go_live_at(get_conn()),
     )
 
 
@@ -3290,6 +3335,7 @@ ROUTES = [
     ("GET", r"^/api/whatsapp_candidates$", route_whatsapp_candidates, {}),
     ("GET", r"^/api/crm/summary$", route_crm_summary, {}),
     ("GET", r"^/api/crm/jobs$", route_crm_jobs, {}),
+    ("GET", r"^/api/crm/job/(?P<message_id>.+)$", route_crm_job, {}),
     ("GET", r"^/api/groups$", route_groups, {}),
     ("POST", r"^/api/groups/(?P<group_id>[^/]+)/map$", route_group_map, {}),
     ("POST", r"^/api/whatsapp_pending/(?P<message_id>[^/]+)/promote_to_job$", route_whatsapp_promote_to_job, {}),
@@ -3383,6 +3429,15 @@ class Handler(BaseHTTPRequestHandler):
             m = pattern.match(path)
             if not m:
                 continue
+            # Path parameters arrive percent-encoded, because the browser
+            # encodes them. Every id in this table that is not \d+ is a
+            # WhatsApp message or group id, and those contain "@" -- which
+            # encodeURIComponent writes as %40. Matching the raw path meant
+            # a handler compared "...%40g.us" against "...@g.us" and
+            # concluded the record did not exist. Decoding once, here, is
+            # the only place that can be true for every route at once.
+            path_params = {k: (unquote(v) if v is not None else v)
+                           for k, v in m.groupdict().items()}
             try:
                 session_token = None
                 if not opts.get("public"):
@@ -3390,7 +3445,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "POST" and not opts.get("skip_csrf"):
                     self._require_csrf(session_token)
                 body = _read_json_body(self) if method == "POST" else _parse_query(self.path)
-                result = fn(self, m.groupdict(), body)
+                result = fn(self, path_params, body)
                 self._send_json(200, result)
             except ApiError as exc:
                 self._send_json(exc.status, {"error": exc.message})

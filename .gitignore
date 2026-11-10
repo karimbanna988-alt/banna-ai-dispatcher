@@ -14,3 +14,8 @@ whatsapp_shadow_bridge/.env
 whatsapp_shadow_bridge/*.log
 whatsapp_shadow_bridge/.wwebjs_cache/
 whatsapp_shadow_bridge/.wwebjs_auth/
+
+# Runtime status written by the service watchdog -- machine state, not source.
+ops/banna_services.log
+ops/service_status.json
+ops/service_status.json.tmp

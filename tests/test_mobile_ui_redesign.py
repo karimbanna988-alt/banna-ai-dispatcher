@@ -59,6 +59,15 @@ def _function_body(source: str, name: str) -> str:
     raise AssertionError(f"unterminated function {name}")
 
 
+def test_render_initializes_candidate_queues_before_counting_them(js):
+    """Regression: mobile Jobs crashed with a temporal-dead-zone error
+    because cands/reviews were read before their const declarations."""
+    body = _function_body(js, "render")
+    count_at = body.index("const dispatchTotal")
+    assert body.index("const cands") < count_at
+    assert body.index("const reviews") < count_at
+
+
 # =================================================== 12-hour clock =====
 def test_one_shared_time_formatter(js):
     """One helper, not formatting logic scattered through the file."""
@@ -80,25 +89,28 @@ def test_no_24_hour_formatting_survives(js):
 
 @needs_node
 @pytest.mark.parametrize("iso,expected", [
-    ("2026-08-16T21:50:20", "9:50 PM"),     # evening -- the reported case
-    ("2026-08-16T00:15:00", "12:15 AM"),    # midnight is 12 AM, never 00
-    ("2026-08-16T12:15:00", "12:15 PM"),    # noon is 12 PM, never 00
-    ("2026-08-16T09:05:00", "9:05 AM"),
-    ("2026-08-16T23:59:00", "11:59 PM"),
-    ("2026-08-16T12:00:00", "12:00 PM"),
-    ("2026-08-16T00:00:00", "12:00 AM"),
+    ("2026-08-17T01:50:20Z", "9:50 PM"),     # evening -- the reported case
+    ("2026-08-16T04:15:00Z", "12:15 AM"),    # midnight is 12 AM, never 00
+    ("2026-08-16T16:15:00Z", "12:15 PM"),    # noon is 12 PM, never 00
+    ("2026-08-16T13:05:00Z", "9:05 AM"),
+    ("2026-08-17T03:59:00Z", "11:59 PM"),
+    ("2026-08-16T16:00:00Z", "12:00 PM"),
+    ("2026-08-16T04:00:00Z", "12:00 AM"),
 ])
 def test_twelve_hour_rendering_is_correct(iso, expected):
-    """Runs the REAL helper. A local (not UTC) literal is used so the
-    test asserts on the same instant the browser would render, without
-    depending on the machine's zone."""
+    """Runs the REAL helper against an explicit instant.
+
+    These were naive local literals, which only asserted that the
+    machine running the tests agreed with itself. The product promise is
+    stronger: the screen prints "America/New_York" beside these numbers,
+    so the numbers must be New York's on any device."""
     assert _run_formatter(iso) == expected
 
 
 @needs_node
 def test_seconds_are_hidden_by_default_and_available_on_request():
-    assert _run_formatter("2026-08-16T21:50:20") == "9:50 PM"
-    assert _run_formatter("2026-08-16T21:50:20", seconds=True) == "9:50:20 PM"
+    assert _run_formatter("2026-08-17T01:50:20Z") == "9:50 PM"
+    assert _run_formatter("2026-08-17T01:50:20Z", seconds=True) == "9:50:20 PM"
 
 
 @needs_node
@@ -108,8 +120,25 @@ def test_unusable_timestamps_render_as_nothing(bad):
     assert _run_formatter(bad) == ""
 
 
+@needs_node
+def test_the_clock_is_the_business_clock_not_the_device_clock():
+    """A laptop two hours ahead of New York drew a 6:32am New York job
+    as "8:32 AM" under a heading that said America/New_York. Near
+    midnight that drift puts the time under the wrong DAY, so it
+    disagrees with the count printed beside it."""
+    # 03:30 UTC on Nov 10 is still 10:30 PM on Nov 9 in New York.
+    assert _run_formatter("2026-11-10T03:30:00Z") == "10:30 PM"
+
+
 def _run_formatter(value, seconds=False):
-    src = _function_body(JS.read_text(encoding="utf-8"), "formatDisplayTime")
+    js_src = JS.read_text(encoding="utf-8")
+    src = _function_body(js_src, "formatDisplayTime")
+    # The helper now depends on the shared operational-timezone
+    # constant. Take it from the REAL source rather than restating it
+    # here, so this can never pass against a zone the product does not use.
+    tz_line = re.search(r'const OPERATIONAL_TZ = "[^"]+";', js_src)
+    assert tz_line, "console.js must define OPERATIONAL_TZ"
+    src = tz_line.group(0) + chr(10) + src
     opts = '{ seconds: true }' if seconds else "undefined"
     script = f"{src}\nprocess.stdout.write(formatDisplayTime({json.dumps(value)}, {opts}));"
     out = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
@@ -480,8 +509,11 @@ def test_theme_boundaries_run_correctly(iso, expected):
 
 def test_the_theme_is_re_evaluated_during_a_long_shift(js):
     """A dispatcher who opens the app at 5pm must not still be on the
-    day theme at midnight."""
-    assert "setInterval(applyTheme" in js
+    day theme at midnight -- but only while the palette is Auto. An
+    explicit colour choice by the owner outranks the clock."""
+    assert "setInterval(" in js and "applyTheme()" in js
+    assert 'savedPalette() === "auto"' in js, (
+        "the clock must only drive the theme when the owner chose Auto")
 
 
 def test_the_browser_chrome_follows_the_theme(js):

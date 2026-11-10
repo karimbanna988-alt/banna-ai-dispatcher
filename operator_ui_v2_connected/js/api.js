@@ -168,6 +168,11 @@ const Api = {
     Object.keys(params || {}).forEach((k) => { if (params[k]) q.set(k, params[k]); });
     return this._call("GET", "/api/crm/jobs" + (q.toString() ? "?" + q.toString() : ""));
   },
+  // One job's full record, for when a Jobs-list row is opened. The
+  // list row carries only what a row needs; the detail needs the rest.
+  getCrmJob(messageId) {
+    return this._call("GET", "/api/crm/job/" + encodeURIComponent(messageId));
+  },
   getGroups() { return this._call("GET", "/api/groups"); },
   mapGroup(groupId, mapping) {
     return this._call("POST", `/api/groups/${encodeURIComponent(groupId)}/map`, mapping);

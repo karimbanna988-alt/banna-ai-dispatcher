@@ -35,7 +35,15 @@ RANGE_TODAY = "today"
 RANGE_YESTERDAY = "yesterday"
 RANGE_WEEK = "week"
 RANGE_MONTH = "month"
-RANGES = (RANGE_TODAY, RANGE_YESTERDAY, RANGE_WEEK, RANGE_MONTH)
+# "All" exists so the owner can see every job the system holds, which is
+# the only honest answer to "show me what my data looks like" when the
+# current month happens to be empty.
+RANGE_ALL = "all"
+# Jobs from before the owner's go-live boundary. They are not deleted,
+# not closed and not reclassified -- an old job is still an open job.
+# They simply stop crowding the day, and live behind one explicit chip.
+RANGE_BACKLOG = "backlog"
+RANGES = (RANGE_TODAY, RANGE_YESTERDAY, RANGE_WEEK, RANGE_MONTH, RANGE_ALL, RANGE_BACKLOG)
 
 # Candidate statuses, grouped the way an owner thinks about them rather
 # than the way the correlation engine names them.
@@ -56,6 +64,9 @@ def range_bounds(range_key: str, now_utc: datetime, tz_name: str = OPERATIONAL_T
     elif range_key == RANGE_MONTH:
         start_local = midnight.replace(day=1)
         end_local = (start_local + timedelta(days=32)).replace(day=1)
+    elif range_key == RANGE_ALL:
+        start_local = midnight.replace(year=2000, month=1, day=1)
+        end_local = midnight + timedelta(days=1)
     else:
         start_local, end_local = midnight, midnight + timedelta(days=1)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
@@ -92,9 +103,29 @@ def _bucket(candidate) -> str:
     return "open"
 
 
+def _split_on_go_live(candidates, go_live_at, range_key):
+    """Partition by the go-live boundary, honestly.
+
+    Returns (visible, hidden_count). With no boundary set, nothing is
+    hidden. The backlog range inverts the filter rather than widening
+    it, so the two views together always add up to everything -- a job
+    can never fall between them and disappear.
+    """
+    boundary = _parse(go_live_at)
+    if boundary is None:
+        return list(candidates or []), 0
+    before, after = [], []
+    for candidate in candidates or []:
+        stamp = _parse(candidate.get("event_at")) or _parse(candidate.get("received_at"))
+        (before if (stamp is not None and stamp < boundary) else after).append(candidate)
+    if range_key == RANGE_BACKLOG:
+        return before, len(after)
+    return after, len(before)
+
+
 def job_rows(candidates, now_utc: datetime, range_key: str = RANGE_MONTH,
              tz_name: str = OPERATIONAL_TIMEZONE, company=None, area=None,
-             status=None, query=None, limit: int = 300) -> dict:
+             status=None, query=None, limit: int = 300, go_live_at=None) -> dict:
     """Every job in range as a flat, filterable list.
 
     This is the record the dispatcher opens instead of scrolling
@@ -106,7 +137,10 @@ def job_rows(candidates, now_utc: datetime, range_key: str = RANGE_MONTH,
     Filtering is exact on company and status and substring on area and
     the free-text query; nothing here re-interprets a job.
     """
-    start, end = range_bounds(range_key, now_utc, tz_name)
+    candidates, hidden_by_go_live = _split_on_go_live(candidates, go_live_at, range_key)
+    # The backlog view is "everything before the line", regardless of age.
+    bounds_key = RANGE_ALL if range_key == RANGE_BACKLOG else range_key
+    start, end = range_bounds(bounds_key, now_utc, tz_name)
 
     seen, rows = set(), []
     for candidate in candidates or []:
@@ -160,12 +194,17 @@ def job_rows(candidates, now_utc: datetime, range_key: str = RANGE_MONTH,
         "range_end": end.isoformat(),
         "total": len(rows),
         "filters": {"company": company, "area": area, "status": status, "query": query},
+        "go_live_at": go_live_at,
+        # Never a silent omission: the UI states how many jobs this view
+        # is not showing, and the Backlog chip opens exactly those.
+        "hidden_by_go_live": hidden_by_go_live,
         "jobs": rows[:limit],
     }
 
 
 def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
-              tz_name: str = OPERATIONAL_TIMEZONE, recent_limit: int = 12) -> dict:
+              tz_name: str = OPERATIONAL_TIMEZONE, recent_limit: int = 12,
+              go_live_at=None) -> dict:
     """The business day as an owner reads it.
 
     `candidates` are the rows the frozen correlation projection already
@@ -173,7 +212,9 @@ def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
     and groups. Rows outside the range are excluded entirely: yesterday's
     unresolved review is real work, but it is not today's.
     """
-    start, end = range_bounds(range_key, now_utc, tz_name)
+    candidates, hidden_by_go_live = _split_on_go_live(candidates, go_live_at, range_key)
+    bounds_key = RANGE_ALL if range_key == RANGE_BACKLOG else range_key
+    start, end = range_bounds(bounds_key, now_utc, tz_name)
     tz = ZoneInfo(tz_name)
 
     in_range, seen = [], set()
@@ -206,6 +247,16 @@ def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
         return [{"name": name, "count": count}
                 for name, count in sorted(mapping.items(), key=lambda kv: (-kv[1], kv[0]))]
 
+    # By technician and by service. "Unassigned" is counted, not hidden:
+    # it is the number that shows work nobody could be routed to, which
+    # is revenue at risk rather than a cosmetic gap.
+    by_tech, by_service = {}, {}
+    for _stamp, candidate in in_range:
+        tech = candidate.get("recommended") or candidate.get("actual_destination") or "Unassigned"
+        by_tech[tech] = by_tech.get(tech, 0) + 1
+        service = candidate.get("service") or "Not stated"
+        by_service[service] = by_service.get(service, 0) + 1
+
     recent = []
     for stamp, candidate in in_range[:recent_limit]:
         recent.append({
@@ -227,6 +278,8 @@ def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
         # "%-d" is not portable (it fails on Windows), so the leading
         # zero is trimmed explicitly.
         "range_label": start.astimezone(tz).strftime("%b ") + str(start.astimezone(tz).day),
+        "go_live_at": go_live_at,
+        "hidden_by_go_live": hidden_by_go_live,
         "jobs_received": len(in_range),
         "open": counts["open"],
         "completed": counts["completed"],
@@ -237,5 +290,7 @@ def summarize(candidates, now_utc: datetime, range_key: str = RANGE_TODAY,
         "revenue_available": False,
         "by_company": ranked(by_company),
         "by_area": ranked(by_area),
+        "by_technician": ranked(by_tech),
+        "by_service": ranked(by_service),
         "recent_jobs": recent,
     }

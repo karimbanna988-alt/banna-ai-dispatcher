@@ -17,7 +17,7 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 
-<link rel="stylesheet" href="css/console.css?v=10">
+<link rel="stylesheet" href="css/console.css?v=19">
 </head>
 <body>
 
@@ -36,6 +36,15 @@
   <!-- The desktop header and primary navigation are one sticky chrome
        region. On phones the same nav is fixed at the bottom by CSS. -->
   <div class="app-chrome">
+
+  <!-- Service alarm. Hidden whenever Banna is healthy, so its presence
+       always means something. This answers the one question the data
+       cannot: a quiet board and a dead bridge look identical, and the
+       owner has twice read an outage as "no jobs today". -->
+  <div class="alarm" id="serviceAlarm" hidden role="alert" aria-live="assertive">
+    <div class="alarm-title" id="serviceAlarmTitle"></div>
+    <div class="alarm-body" id="serviceAlarmBody"></div>
+  </div>
   <!-- Header. Health lives here as three small dots: when everything is
        healthy it should read as punctuation, not as a section. -->
   <header class="topbar">
@@ -170,7 +179,9 @@
       <button class="chip-btn" data-jrange="today">Today</button>
       <button class="chip-btn" data-jrange="yesterday">Yesterday</button>
       <button class="chip-btn" data-jrange="week">This week</button>
-      <button class="chip-btn on" data-jrange="month">This month</button>
+      <button class="chip-btn" data-jrange="month">This month</button>
+      <button class="chip-btn on" data-jrange="all">All time</button>
+      <button class="chip-btn" data-jrange="backlog">Backlog</button>
     </div>
     <div class="chips" id="jobStatuses">
       <button class="chip-btn on" data-jstatus="">All</button>
@@ -178,6 +189,7 @@
       <button class="chip-btn" data-jstatus="completed">Completed</button>
       <button class="chip-btn" data-jstatus="needs_attention">Attention</button>
     </div>
+    <div class="chips" id="jobCompanies"></div>
     <div class="active-filter" id="jobFilterNote" hidden></div>
 
     <div class="rows" id="jobList"></div>
@@ -232,6 +244,7 @@
       <button class="chip-btn" data-range="yesterday">Yesterday</button>
       <button class="chip-btn" data-range="week">This week</button>
       <button class="chip-btn" data-range="month">This month</button>
+      <button class="chip-btn" data-range="all">All time</button>
     </div>
     <div class="rows" id="reportTotals"></div>
     <section class="panel">
@@ -241,6 +254,14 @@
     <section class="panel">
       <div class="panel-h">By area</div>
       <div class="rank" id="reportArea"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-h">By technician</div>
+      <div class="rank" id="reportTech"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-h">By service</div>
+      <div class="rank" id="reportService"></div>
     </section>
   </section>
 
@@ -266,6 +287,15 @@
 
     <div class="lo-title-sep">Event stream</div>
     <div class="lo-body" id="loBody"></div>
+  </section>
+
+  <!-- ============================ APPEARANCE ======================= -->
+  <section class="screen" id="screenAppearance" data-screen="appearance" hidden>
+    <div class="screen-head">
+      <h1>Appearance</h1>
+      <span class="screen-note">Applies immediately &middot; only colours change, never meaning</span>
+    </div>
+    <div class="pal-grid" id="palGrid"></div>
   </section>
 
   <!-- ============================ GROUP MAPPING ==================== -->
@@ -326,6 +356,7 @@
       <button class="menu-item" data-goto="live">Live operations<span>Event stream</span></button>
       <button class="menu-item" data-goto="apprentice">Apprentice<span>Suggested patterns &middot; read-only</span></button>
       <button class="menu-item" data-goto="techs">Technicians<span>Routing coverage</span></button>
+      <button class="menu-item" data-goto="appearance">Appearance<span id="appearanceNote">Choose a colour scheme</span></button>
       <button class="menu-item" data-goto="groups">WhatsApp groups<span id="groupsMenuNote">Tell Banna what each group is</span></button>
       <button class="menu-item" data-goto="shadow">Active shadow<span>What Banna would dispatch</span></button>
     </div>
@@ -371,7 +402,7 @@
   <div class="toast" id="toast" hidden></div>
 </div>
 
-<script src="js/api.js?v=10"></script>
-<script src="js/console.js?v=10"></script>
+<script src="js/api.js?v=19"></script>
+<script src="js/console.js?v=19"></script>
 </body>
 </html>

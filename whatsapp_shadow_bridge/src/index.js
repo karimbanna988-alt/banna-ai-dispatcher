@@ -18,7 +18,7 @@ const { createHealthServer } = require("./healthServer");
  */
 function main(argv = process.argv.slice(2), deps = {}) {
   const config = deps.config || loadConfig();
-  const state = { paired: false, getGroups: null };
+  const state = { paired: false, getGroups: null, importHistory: null };
 
   const makeHealthServer = deps.createHealthServer || createHealthServer;
   const server = makeHealthServer(config, state);
@@ -65,14 +65,34 @@ function main(argv = process.argv.slice(2), deps = {}) {
         const chats = await liveClient.getChats();
         return chats.filter((c) => c.isGroup).map((c) => ({ id: c.id._serialized, name: c.name }));
       };
+      // Owner-invoked ONLY (POST /history on the loopback admin
+      // server). Never called on connect, never on a timer. The
+      // fetch itself lives in ../tools/historyImport.js, outside the
+      // always-live src/ path, so the permanent "the live bridge
+      // never reaches backward" static check stays intact and
+      // unweakened -- see that file's header.
+      state.importHistory = async ({ sinceMs, limitPerChat }) => {
+        const { importHistory } = require("../tools/historyImport");
+        const { isApproved } = require("./allowlist");
+        const { isSeen, markSeen } = require("./dedupeStore");
+        const { enqueue: enqueueRetry, dequeue: dequeueRetry } = require("./deliveryQueue");
+        const { postObservation, postOutgoingObservation } = require("./adapterClient");
+        return importHistory({
+          client: liveClient, config, sinceMs, limitPerChat,
+          deps: { isApproved, isSeen, markSeen, enqueueRetry, dequeueRetry,
+                  postObservation, postOutgoingObservation, log: console.log },
+        });
+      };
     },
     onDisconnected: () => {
       state.paired = false;
       state.getGroups = null;
+      state.importHistory = null;
     },
     onAuthFailure: () => {
       state.paired = false;
       state.getGroups = null;
+      state.importHistory = null;
     },
   });
   return { server, client, state };

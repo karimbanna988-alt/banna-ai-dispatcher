@@ -1083,6 +1083,84 @@ def _add_console_activation_support(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _add_crm_go_live_support(conn: sqlite3.Connection) -> None:
+    """Additive: one nullable column on the existing single-row table.
+
+    Separate from live_queue_started_at on purpose. That boundary says
+    which messages the ACTIONABLE QUEUE may offer; this one says which
+    jobs the CRM shows by default. Conflating them would mean changing
+    where the board starts counting in order to change what the owner
+    sees, which is two decisions wearing one switch.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(console_activation_state)")}
+    if "crm_go_live_at" not in cols:
+        conn.execute("ALTER TABLE console_activation_state ADD COLUMN crm_go_live_at TEXT")
+        conn.commit()
+
+
+def get_shadow_session_started_at(conn: sqlite3.Connection) -> Optional[str]:
+    """When the current shadow-and-learn session began.
+
+    This has to be DURABLE, and it was not. The Quo side used the API
+    process start and the phone used the browser's page-load time, so
+    the learning window reset on every restart and every refresh --
+    the owner would open the screen and find an empty session, having
+    lost exactly the comparisons the session existed to collect.
+
+    One stored instant, shared by both sides, so Quo and WhatsApp can
+    never disagree about which shift is being observed.
+    """
+    _add_crm_go_live_support(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(console_activation_state)")}
+    if "shadow_session_started_at" not in cols:
+        conn.execute("ALTER TABLE console_activation_state ADD COLUMN shadow_session_started_at TEXT")
+        conn.commit()
+        return None
+    row = conn.execute(
+        "SELECT shadow_session_started_at FROM console_activation_state WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+def set_shadow_session_started_at(conn: sqlite3.Connection, value: Optional[str]) -> None:
+    """Starts (or with None, clears) the shadow-and-learn session."""
+    get_shadow_session_started_at(conn)        # ensures the column exists
+    now = _now()
+    conn.execute(
+        "INSERT INTO console_activation_state (id, live_queue_started_at, updated_at, shadow_session_started_at) "
+        "VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET shadow_session_started_at = excluded.shadow_session_started_at, "
+        "updated_at = excluded.updated_at",
+        (now, now, value),
+    )
+    conn.commit()
+
+
+def get_crm_go_live_at(conn: sqlite3.Connection) -> Optional[str]:
+    """The instant the CRM starts counting, or None for "show everything".
+
+    Nothing is deleted or closed by this. Jobs before the boundary stay
+    in the database, stay real, and stay reachable under an explicit
+    Backlog view -- an old job is still an open job, and a date is not
+    a reason to decide otherwise.
+    """
+    _add_crm_go_live_support(conn)
+    row = conn.execute("SELECT crm_go_live_at FROM console_activation_state WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+def set_crm_go_live_at(conn: sqlite3.Connection, value: Optional[str]) -> None:
+    """Moves (or clears, with None) the CRM's starting line."""
+    _add_crm_go_live_support(conn)
+    now = _now()
+    conn.execute(
+        "INSERT INTO console_activation_state (id, live_queue_started_at, updated_at, crm_go_live_at) "
+        "VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET crm_go_live_at = excluded.crm_go_live_at, updated_at = excluded.updated_at",
+        (now, now, value),
+    )
+    conn.commit()
+
+
 def get_live_queue_started_at(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute("SELECT live_queue_started_at FROM console_activation_state WHERE id = 1").fetchone()
     return row[0] if row else None
@@ -1510,6 +1588,82 @@ def list_whatsapp_outgoing_audit(conn: sqlite3.Connection) -> list:
     ).fetchall()
     cols = ("message_id", "group_id", "group_name", "whatsapp_timestamp", "text", "received_at", "created_at")
     return [dict(zip(cols, r)) for r in rows]
+
+
+def list_owner_posted_intake_observations(conn: sqlite3.Connection) -> list:
+    """Owner-sent messages that are genuine job intake.
+
+    A message the paired account sends itself is normally audit-only:
+    in a technician group it is the dispatcher FORWARDING a job that
+    already exists, and treating that as a new arrival would invent a
+    duplicate job out of our own outbound traffic. That rule is correct
+    and stays.
+
+    It is wrong in exactly one place. A group the owner has explicitly
+    confirmed as COMPANY_JOB_INTAKE is, by the owner's own definition,
+    where jobs ARRIVE -- and the owner pasting a job into it is the job
+    arriving, not an echo of one. Before this, such a message was
+    captured for audit and then silently excluded from the CRM, which
+    read to the owner as "the system lost my job".
+
+    Narrow on purpose:
+      * role must be COMPANY_JOB_INTAKE, and
+      * the mapping must be owner-confirmed.
+    Every other role, and every unconfirmed group, stays audit-only.
+
+    Identity is still (company, ticket) downstream, so a job that also
+    arrives through Quo or a reply does not become two jobs.
+    """
+    rows = conn.execute(
+        """
+        SELECT a.message_id, a.group_id, a.group_name, a.whatsapp_timestamp,
+               a.text, a.received_at, a.created_at,
+               r.role, r.company, r.service_area, r.technician_id,
+               r.technician_name_unconfirmed, r.confirmed_by_owner, r.notes
+        FROM whatsapp_outgoing_audit a
+        JOIN whatsapp_group_registry r ON r.group_id = a.group_id
+        WHERE r.role = 'COMPANY_JOB_INTAKE'
+          AND r.confirmed_by_owner = 1
+        ORDER BY a.id ASC
+        """
+    ).fetchall()
+
+    observations = []
+    for row in rows:
+        (message_id, group_id, group_name, timestamp, text, received_at, created_at,
+         role, company, service_area, technician_id, technician_name_unconfirmed,
+         confirmed_by_owner, notes) = row
+        observations.append({
+            "message_id": message_id,
+            "group_id": group_id,
+            "group_name": group_name,
+            # The owner is the sender; there is no third-party author.
+            "sender": None,
+            # Kept honest: this really was an outgoing message. Anything
+            # downstream that cares can still tell.
+            "direction": "outgoing",
+            "timestamp": timestamp,
+            "text": text,
+            "extracted_ticket": None,
+            "quoted_message_id": None,
+            "correlated_job_id": None,
+            "job_id": None,
+            "status": "pending",
+            "human_review_needed": False,
+            "human_review_reason": None,
+            "received_at": received_at,
+            "created_at": created_at,
+            "group_role": role,
+            "group_company": company,
+            "group_service_area": service_area,
+            "group_technician_id": technician_id,
+            "group_technician_name": technician_name_unconfirmed,
+            "group_mapping_confirmed": bool(confirmed_by_owner),
+            "group_mapping_status": "CONFIRMED" if confirmed_by_owner else "HUMAN_REVIEW",
+            "group_offline_notes": notes,
+            "owner_posted": True,
+        })
+    return observations
 
 
 def _add_technician_acceptance_support(conn: sqlite3.Connection) -> None:

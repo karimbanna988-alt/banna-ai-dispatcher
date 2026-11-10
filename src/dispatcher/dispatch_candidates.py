@@ -154,7 +154,7 @@ def _sequence(intake_at, occurrences: List[dict]) -> Tuple[str, List[dict]]:
     return "none", []
 
 
-def build_candidate(
+def _build_candidate_unstamped(
     *,
     message_id: str,
     received_at: Optional[str],
@@ -368,6 +368,29 @@ def build_candidate(
         status=status, missing=missing,
         proposed_message=proposed_message if recommended else None,
         correlated_job_id=correlated_job_id)
+
+
+def build_candidate(**kwargs) -> dict:
+    """Builds a candidate and stamps it with the business event time.
+
+    WHY THIS WRAPPER EXISTS: every candidate carries `received_at`,
+    which is when OUR pipeline ingested the message -- a fact about us,
+    not about the job. The WhatsApp send time was accepted as
+    `event_at`, used for sequencing, and then dropped from the result,
+    so nothing downstream could ever date a job by when it actually
+    happened. While capture was purely live the two were within
+    seconds of each other and the gap was invisible; the moment any
+    message is ingested later than it was sent -- a recovered outage, a
+    deliberate history import -- dating by ingestion silently reports
+    yesterday's work as today's.
+
+    crm_summary already prefers `event_at` and falls back to
+    `received_at`. This makes that preference reachable. The fallback
+    stays, so a message with no usable send time still appears.
+    """
+    candidate = _build_candidate_unstamped(**kwargs)
+    candidate["event_at"] = kwargs.get("event_at")
+    return candidate
 
 
 def _candidate(message_id, received_at, group_name, company, ticket, service, city, state,

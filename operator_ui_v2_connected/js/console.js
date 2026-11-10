@@ -51,7 +51,7 @@
     crm: null,            // last /api/crm/summary payload
     groups: null,         // last /api/groups payload
     groupFilter: "needs",
-    jobsQuery: { range: "month", status: "", company: "", area: "", q: "" },
+    jobsQuery: { range: "all", status: "", company: "", area: "", q: "" },
     reportRange: "today",
     candidatesAll: [],    // every evaluated candidate, for the shadow session
     quoShadow: { episodes: [] }, // read-only AGN/Lucky Quo -> WhatsApp episodes
@@ -82,14 +82,23 @@
 
      Seconds are omitted by default. An operator deciding what to do next
      does not need them; a debug view asks for them explicitly. */
+  // The one business clock. kpi_read_model and crm_summary both call
+  // this zone operational_timezone; the phone must not invent a second.
+  const OPERATIONAL_TZ = "America/New_York";
+
   function formatDisplayTime(value, opts) {
     if (value == null || value === "") return "";
     const t = value instanceof Date ? value : new Date(value);
     if (isNaN(t.getTime())) return "";
-    const o = { hour: "numeric", minute: "2-digit", hour12: true };
+    const o = { hour: "numeric", minute: "2-digit", hour12: true, timeZone: OPERATIONAL_TZ };
     if (opts && opts.seconds) o.second = "2-digit";
     // en-US pins the AM/PM rendering regardless of device locale, so the
     // owner never sees a 24-hour clock because of a phone setting.
+    // The TIMEZONE is pinned for a harder reason: the server decides
+    // which day a job belongs to in America/New_York, and a clock drawn
+    // in the device's zone disagreed with it. On a laptop two hours
+    // ahead, a 6:32am New York job read "8:32 AM", and near midnight a
+    // job could show one date while being counted under another.
     return t.toLocaleTimeString("en-US", o);
   }
 
@@ -174,14 +183,64 @@
   // This display layer only enforces the AGN/Lucky product scope and
   // deduplicates episode ids; it must not hide a job that arrived after
   // the server session began but just before this browser tab opened.
+  // The session the SERVER is observing, not when this page happened to
+  // load. A refresh used to start a brand new window and throw away the
+  // comparisons already collected.
+  function shadowSessionStart() {
+    const fromServer = state.quoShadow && state.quoShadow.session_started_at;
+    const parsed = fromServer ? new Date(fromServer) : null;
+    return parsed && !isNaN(parsed.getTime()) ? parsed : SHADOW_SESSION_START;
+  }
+
+  // Shadow covers BOTH intake channels. Quo episodes arrive already
+  // shaped as episodes; a WhatsApp job is the same thing in a different
+  // wrapper -- it carries the recommendation, the observed destination
+  // and the server's own verdict, which is everything comparison()
+  // reads. Showing only Quo meant every WhatsApp job Banna reasoned
+  // about was learned from in private and never displayed.
+  function whatsappShadowJobs(since) {
+    const all = (state.candidates || []).concat(state.candidateReviews || []);
+    const out = [];
+    for (const c of all) {
+      const when = new Date(c.event_at || c.received_at || 0);
+      if (isNaN(when.getTime()) || when < since) continue;
+      out.push({
+        episode_id: "wa:" + c.message_id,
+        channel: "WhatsApp",
+        company: c.source || c.company || null,
+        source: c.source || null,
+        ticket: c.ticket || null,
+        service: c.service || null,
+        area: [c.city, c.state].filter(Boolean).join(", ") || null,
+        received_at: c.event_at || c.received_at || null,
+        recommended_technician: c.recommended || null,
+        actual_destination: c.actual_destination || null,
+        routing_match: c.routing_match || null,
+        decision_reason: (c.why && c.why[0]) || c.detected || null,
+        decision_confidence: c.confidence || null,
+        state: c.status || null,
+        review_reason: c.review_reason || null,
+      });
+    }
+    return out;
+  }
+
   function shadowJobs() {
-    const all = (state.quoShadow && state.quoShadow.episodes) || [];
+    const since = shadowSessionStart();
+    const quo = ((state.quoShadow && state.quoShadow.episodes) || []).map(
+      (e) => Object.assign({ channel: "Quo" }, e));
     const seen = new Set();
-    return all.filter((c) => {
-      if (!c || !["AGN", "Lucky"].includes(c.company || c.source) || seen.has(c.episode_id)) return false;
+    const out = [];
+    for (const c of quo.concat(whatsappShadowJobs(since))) {
+      if (!c || seen.has(c.episode_id)) continue;
+      // Quo intake is AGN/Lucky only; WhatsApp carries every company,
+      // so the company filter applies to the Quo half alone.
+      if (c.channel === "Quo" && !["AGN", "Lucky"].includes(c.company || c.source)) continue;
       seen.add(c.episode_id);
-      return true;
-    });
+      out.push(c);
+    }
+    out.sort((a, b) => String(b.received_at || "").localeCompare(String(a.received_at || "")));
+    return out;
   }
 
   // What the human actually did, taken from evidence the system already
@@ -251,6 +310,51 @@
       if (meta) meta.setAttribute("content", theme === "night" ? "#11151B" : "#F2F4F7");
     }
     return theme;
+  }
+
+  /* ------------------------------------------------------- palettes --
+     The owner picks the look; we never pick for them. Each palette
+     redefines colour TOKENS only, so semantics are identical across all
+     of them -- green still means done, amber still means a decision is
+     owed. "auto" keeps the existing day/night pair. */
+  const PALETTES = [
+    { id: "auto", name: "Auto", note: "Bright by day, dark at night", a: "#F2F4F7", b: "#11151B" },
+    { id: "daylight", name: "Daylight", note: "White cards, warm accent", a: "#FFFFFF", b: "#E2663B" },
+    { id: "midnight", name: "Midnight", note: "Dark, low glare", a: "#161B23", b: "#6FB6A3" },
+    { id: "parchment", name: "Parchment", note: "Warm stone and sage", a: "#F1ECE4", b: "#5D7462" },
+    { id: "steel", name: "Steel", note: "Cool grey, strong blue", a: "#FFFFFF", b: "#1D4ED8" },
+    { id: "graphite", name: "Graphite", note: "Near-black, amber", a: "#16181D", b: "#D9A14A" },
+  ];
+
+  function savedPalette() {
+    try { return localStorage.getItem("banna.palette") || "auto"; } catch (e) { return "auto"; }
+  }
+
+  function applyPalette(id) {
+    const root = document.documentElement;
+    if (id && id !== "auto") {
+      root.setAttribute("data-palette", id);
+      root.removeAttribute("data-theme");       // a fixed choice outranks the clock
+    } else {
+      root.removeAttribute("data-palette");
+      applyTheme();                             // back to day/night
+    }
+    try { localStorage.setItem("banna.palette", id || "auto"); } catch (e) { /* private mode */ }
+    const note = $("appearanceNote");
+    const chosen = PALETTES.find((p) => p.id === (id || "auto"));
+    if (note && chosen) note.textContent = chosen.name;
+  }
+
+  function renderPalettes() {
+    const grid = $("palGrid");
+    if (!grid) return;
+    const current = savedPalette();
+    grid.innerHTML = PALETTES.map((p) => `
+      <button class="pal${p.id === current ? " on" : ""}" data-palette="${esc(p.id)}">
+        <span class="pal-sw" style="background:${esc(p.a)}"><i style="background:${esc(p.b)}"></i></span>
+        <span><span class="pal-name">${esc(p.name)}</span><br>
+          <span class="pal-note">${esc(p.note)}</span></span>
+      </button>`).join("");
   }
 
   function age(mins) {
@@ -360,7 +464,15 @@
       if (state.offline) setOffline(false);
 
       render();
+      // Every CRM screen refreshes on the poll, not just Today. Jobs and
+      // Reports used to load only when you navigated to them, so a job
+      // arriving while you sat on the Jobs list simply never appeared --
+      // the board behind it updated and the screen in front of you did
+      // not. A dispatcher watching a list has to be able to trust that
+      // the list is current.
       if (state.screen === "today") loadToday();
+      if (state.screen === "jobs") loadJobs();
+      if (state.screen === "reports") loadReports();
       loadDemo();
       $("updatedAt").textContent = formatDisplayTime(state.lastGood);
     } catch (e) {
@@ -542,10 +654,56 @@
     </div>`;
   }
 
+  /* ------------------------------------------------- service alarm --
+     The CRM's own data cannot tell an outage from a quiet shift: both
+     are an empty board. This is the one place Banna says out loud that
+     it is not working, so it must never cry wolf and must never stay
+     silent through a real fault.
+
+     Three states, deliberately distinct:
+       healthy          -> hidden entirely
+       a service is down-> name it, and say what is NOT being captured
+       supervisor stale -> say we do not know, which is its own fault
+     "Unknown" is never rendered as healthy. */
+  function renderServiceAlarm(health) {
+    const box = $("serviceAlarm");
+    if (!box) return;
+    if (!health || health.healthy) { box.hidden = true; return; }
+
+    let title, body;
+    if (!health.known) {
+      title = "Banna cannot confirm it is running";
+      body = "No supervisor report was found, so the services may or may not be up. "
+           + "An empty board right now does not mean a quiet shift.";
+    } else if (!health.watchdog_alive) {
+      title = "Banna may have stopped";
+      body = "The supervisor that keeps the services alive " + esc(health.reason) + ". "
+           + "Anything below may be out of date. Jobs arriving now may not be captured.";
+    } else {
+      const down = health.down || [];
+      title = down.length === 1 ? "A Banna service has stopped" : "Banna services have stopped";
+      body = "<b>" + esc(down.join(", ")) + "</b> "
+           + (down.length === 1 ? "is" : "are") + " not running. "
+           + (down.indexOf("WhatsApp capture") !== -1
+              ? "Jobs sent on WhatsApp right now are NOT being recorded. "
+              : "")
+           + (down.indexOf("Quo polling") !== -1
+              ? "Jobs arriving through Quo are NOT being recorded. " : "")
+           + "It should restart by itself within 5 minutes.";
+    }
+    if (health.checked_at) {
+      body += " Last checked " + esc(formatDisplayTime(health.checked_at)) + ".";
+    }
+    $("serviceAlarmTitle").textContent = title;
+    $("serviceAlarmBody").innerHTML = body;
+    box.hidden = false;
+  }
+
   async function loadToday() {
     try {
       const r = await Api.getCrmSummary("today");
       state.crm = r;
+      renderServiceAlarm(r.service_health);
       $("todayLabel").textContent = "Today · " + (r.range_label || "");
       $("todayTz").textContent = r.timezone;
       $("statJobs").textContent = r.jobs_received;
@@ -581,7 +739,11 @@
         ["Verified revenue", m.text],
       ].map(([k, v]) => `<div class="rank-row"><span>${esc(k)}</span><span class="rank-n">${esc(v)}</span></div>`).join("");
       $("reportCompany").innerHTML = rankRows(r.by_company, "No jobs in this range.");
-      $("reportArea").innerHTML = rankRows(r.by_area, "No areas in this range.");
+      $("reportArea").innerHTML = rankRows(r.by_area, "No areas in this range.", "area");
+      // Unassigned is shown, not hidden: it is the count of work nobody
+      // could be routed to, which is the most actionable number here.
+      $("reportTech").innerHTML = rankRows(r.by_technician, "No technicians in this range.");
+      $("reportService").innerHTML = rankRows(r.by_service, "No services in this range.");
     } catch (e) {
       if (e.authRequired) return showLogin();
       $("reportTotals").innerHTML = `<div class="empty">Reports unavailable: ${esc(e.message)}</div>`;
@@ -605,7 +767,7 @@
     const el = $("shadowBody2") || $("shadowBody");
     if (!el) return;
     const startEl = $("shadowStart2") || $("shadowStart");
-    const sessionStart = (state.quoShadow && state.quoShadow.session_started_at) || SHADOW_SESSION_START;
+    const sessionStart = shadowSessionStart();
     const jobs = shadowJobs();
     const replay = Boolean(state.quoShadow && state.quoShadow.historical_replay);
     if (startEl) startEl.textContent = replay ? "persisted real evidence" : formatDisplayTime(sessionStart);
@@ -805,7 +967,8 @@
     const map = { today: "screenToday", jobs: "screenJobs", reports: "screenReports",
                   live: "screenLive", apprentice: "screenApprentice",
                   techs: "screenTechs", shadow: "screenShadow",
-                  groups: "screenGroups", more: "screenMore" };
+                  groups: "screenGroups", appearance: "screenAppearance",
+                  more: "screenMore" };
     Object.keys(map).forEach((k) => {
       const el = $(map[k]);
       if (el) { el.hidden = k !== name; el.classList.toggle("on", k === name); }
@@ -813,7 +976,7 @@
     // Secondary screens are reached FROM More, so More stays lit while
     // one of its tools is open -- the operator is still "in" that section.
     const primary = ({ live: "more", apprentice: "more", techs: "more",
-                       shadow: "more", groups: "more" })[name] || name;
+                       shadow: "more", groups: "more", appearance: "more" })[name] || name;
     document.querySelectorAll(".tab").forEach((b) =>
       b.classList.toggle("on", b.getAttribute("data-screen") === primary));
     state.liveOpen = name === "live";
@@ -824,6 +987,7 @@
     if (name === "live") loadLive();
     if (name === "shadow") renderShadow();
     if (name === "groups") loadGroups();
+    if (name === "appearance") renderPalettes();
     if (name === "apprentice") loadApprentice();
     if (name === "techs") loadTechs();
     if (name === "more") renderMore();
@@ -936,15 +1100,24 @@
     const t = value instanceof Date ? value : new Date(value);
     if (isNaN(t.getTime())) return "";
     return t.toLocaleDateString("en-US",
-      Object.assign({ month: "short", day: "numeric" }, opts || {}));
+      Object.assign({ month: "short", day: "numeric", timeZone: OPERATIONAL_TZ }, opts || {}));
+  }
+
+  // "What day is it" has to be asked in the operational timezone too,
+  // or "Today"/"Yesterday" disagree with the counts beside them.
+  function operationalDayKey(d) {
+    const p = new Intl.DateTimeFormat("en-CA", {
+      timeZone: OPERATIONAL_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(d);
+    const get = (type) => (p.find((x) => x.type === type) || {}).value;
+    return Date.UTC(Number(get("year")), Number(get("month")) - 1, Number(get("day")));
   }
 
   function daysSince(value) {
     if (value == null || value === "") return null;
     const t = value instanceof Date ? value : new Date(value);
     if (isNaN(t.getTime())) return null;
-    const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    return Math.round((startOf(new Date()) - startOf(t)) / 86400000);
+    return Math.round((operationalDayKey(new Date()) - operationalDayKey(t)) / 86400000);
   }
 
   // "Today 6:14 PM" / "Yesterday 7:59 PM" / "Aug 16, 7:59 PM". Absolute
@@ -1077,6 +1250,18 @@
     return bits.join(" · ");
   }
 
+  // Company chips come from the data, never a hardcoded list, so a
+  // newly mapped company appears here the moment it has a job.
+  function renderCompanyChips(companies) {
+    const box = $("jobCompanies");
+    if (!box) return;
+    const current = state.jobsQuery.company || "";
+    const all = [""].concat(companies || []);
+    box.innerHTML = all.map((c) => `
+      <button class="chip-btn${c === current ? " on" : ""}" data-jco="${esc(c)}">${
+        esc(c || "All companies")}</button>`).join("");
+  }
+
   async function loadJobs() {
     if (state.screen !== "jobs") return;
     const q = state.jobsQuery;
@@ -1090,7 +1275,15 @@
     }
     try {
       const r = await Api.getCrmJobs(q);
-      $("jobsNote").textContent = `${r.total} job${r.total === 1 ? "" : "s"} · ${r.timezone}`;
+      // Say what is NOT shown. A filtered-out job that is never
+      // mentioned reads as a lost job.
+      const hidden = r.hidden_by_go_live || 0;
+      const aside = r.range === "backlog"
+        ? ` · before go-live${hidden ? ` · ${hidden} newer` : ""}`
+        : (hidden ? ` · ${hidden} older in Backlog` : "");
+      $("jobsNote").textContent =
+        `${r.total} job${r.total === 1 ? "" : "s"} · ${r.timezone}${aside}`;
+      renderCompanyChips([...new Set((r.jobs || []).map((x) => x.company).filter(Boolean))].sort());
       $("jobList").innerHTML = (r.jobs || []).length
         ? r.jobs.map(jobListRow).join("")
         : `<div class="empty">No jobs match this view.</div>`;
@@ -1103,7 +1296,7 @@
   // Tapping "AGN 9" lands on those nine rows.
   function openJobs(filter) {
     state.jobsQuery = Object.assign(
-      { range: "month", status: "", company: "", area: "", q: "" }, filter || {});
+      { range: "all", status: "", company: "", area: "", q: "" }, filter || {});
     document.querySelectorAll("[data-jrange]").forEach((b) =>
       b.classList.toggle("on", b.getAttribute("data-jrange") === state.jobsQuery.range));
     document.querySelectorAll("[data-jstatus]").forEach((b) =>
@@ -1282,6 +1475,14 @@
 
   function render() {
     const d = state.dispatch, p = state.progress, c = state.close;
+    // Candidate queues must exist before any badge/count reads them.
+    // `const` bindings are in JavaScript's temporal dead zone until their
+    // declaration executes; reading cands/reviews above these lines crashed
+    // the entire Jobs screen on mobile with "before initialization".
+    const cands = state.candidates || [];
+    const allReviews = state.candidateReviews || [];
+    const reviews = allReviews.filter((candidate) => !isStale(candidate));
+    const reconcile = allReviews.filter(isStale);
     [["countDispatch", d], ["countProgress", p], ["countClose", c],
      ["hdDispatch", d], ["hdProgress", p], ["hdClose", c],
      ["stDispatch", d], ["stProgress", p], ["stClose", c]]
@@ -1298,11 +1499,6 @@
     // Genuinely open work is NEVER filtered by age -- an open job from
     // August is still open. Only unresolved intake, which nobody can act
     // on until its company is mapped, is split out for reconciliation.
-    const cands = state.candidates || [];
-    const allReviews = state.candidateReviews || [];
-    const reviews = allReviews.filter((c) => !isStale(c));
-    const reconcile = allReviews.filter(isStale);
-
     // THE OPERATING LINE. The actionable queue is taken in the order the
     // backend already returned -- committed jobs first, then understood
     // WhatsApp candidates -- and the FIRST one is promoted to NEXT
@@ -1588,6 +1784,24 @@
       ? `<button class="btn primary" data-act="copy-closing" data-id="${esc(item.id)}">Copy closing</button>` : "";
   }
 
+  // A row the current projection holds in memory opens instantly; one
+  // it does not (any range beyond what the board loaded) is fetched.
+  // Without this, every Jobs-list row outside today silently did
+  // nothing when tapped.
+  async function openDetailFetched(col, id) {
+    try {
+      const r = await Api.getCrmJob(id);
+      if (!r || !r.job) return;
+      state.candidates = (state.candidates || []).concat([r.job]);
+      openDetail(col, id);
+    } catch (e) {
+      $("detailTitle").textContent = "Job";
+      $("detailBody").innerHTML =
+        `<div class="sec"><div class="missing">This job could not be loaded: ${esc(e.message || e)}</div></div>`;
+      $("detail").hidden = false;
+    }
+  }
+
   function openDetail(col, id) {
     state.selected = { col, id };
     state.paused = true;                       // never re-render under the operator
@@ -1608,7 +1822,12 @@
       item = state.close.find((e) => String(e.id) === String(id));
       if (item) { html = renderCloseDetail(item); title = item.ticket || "#" + item.id; }
     }
-    if (!item) return;
+    // Not in memory -- fetch it rather than failing silently, which is
+    // exactly what "I press a job and nothing happens" looked like.
+    if (!item) {
+      if (col === "candidate") openDetailFetched(col, id);
+      return;
+    }
     state.detail = item;
     $("detailTitle").textContent = title;
     $("detailBody").innerHTML = html;
@@ -1728,6 +1947,11 @@
       if (card) card.classList.toggle("open");
       return;
     }
+    const palEl = ev.target.closest("[data-palette]");
+    if (palEl && palEl.classList.contains("pal")) {
+      applyPalette(palEl.getAttribute("data-palette"));
+      return renderPalettes();
+    }
     const gfilterEl = ev.target.closest("[data-gfilter]");
     if (gfilterEl) {
       state.groupFilter = gfilterEl.getAttribute("data-gfilter");
@@ -1760,6 +1984,12 @@
       document.querySelectorAll("[data-jrange]").forEach((b) => b.classList.toggle("on", b === jrangeEl));
       return loadJobs();
     }
+    const jcoEl = ev.target.closest("[data-jco]");
+    if (jcoEl) {
+      state.jobsQuery.company = jcoEl.getAttribute("data-jco");
+      document.querySelectorAll("[data-jco]").forEach((b) => b.classList.toggle("on", b === jcoEl));
+      return loadJobs();
+    }
     const jstatusEl = ev.target.closest("[data-jstatus]");
     if (jstatusEl) {
       state.jobsQuery.status = jstatusEl.getAttribute("data-jstatus");
@@ -1768,7 +1998,11 @@
     }
     const evEl = ev.target.closest("[data-ev]");
     if (evEl) { evEl.classList.toggle("open"); return; }
-    const card = ev.target.closest(".card");
+    // Matches on the data attributes, not on a class name. The Jobs
+    // list renders .job-row and the board renders .card; keying this to
+    // .card alone meant every row in the Jobs list was dead to the
+    // touch -- the list looked like a product and behaved like a poster.
+    const card = ev.target.closest("[data-col][data-id]");
     if (card) return openDetail(card.getAttribute("data-col"), card.getAttribute("data-id"));
   }
 
@@ -1840,8 +2074,8 @@
   function showApp() {
     $("loginScreen").hidden = true;
     $("app").hidden = false;
-    applyTheme();
-    setInterval(applyTheme, 60000);   // a shift outlives one render
+    applyPalette(savedPalette());
+    setInterval(() => { if (savedPalette() === "auto") applyTheme(); }, 60000);   // a shift outlives one render
     setStage(state.stage);
     setScreen(state.screen);
     loadToday();
